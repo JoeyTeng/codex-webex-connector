@@ -8,10 +8,11 @@
 - The control room now supports local-thread discovery and attachment: `list local`, `list local page <n>`, `list all`, and `resume local <thread_id>` are implemented and deployed.
 - Session rooms now support history browsing: `resume local <thread_id>` imports the newest history page automatically, and `/history` plus `/history page <n>` can page back through older turns on demand.
 - The deployed sidecar now has a Mercury watchdog: if Webex realtime ingress falls into an unrecoverable disconnect state, the sidecar exits non-zero so supervisor restarts the bridge instead of leaving it falsely "up but deaf".
+- The deployed sidecar now uses unique Webex webhook/message ids for ingress deduplication, so consecutive control-room commands like `/help` then `/list` are not incorrectly dropped as duplicates.
 
 ## Active Handoff
 - Phase: deployed
-- Summary: The bridge can create Webex session rooms, start Codex threads, attach existing local-only threads, and page through prior Codex turn history inside the session room. Data Space recovery no longer depends on the old group room; the deployed launch agent now replays state from the bot-owner 1:1 direct room, and the Webex sidecar now self-recovers from the observed Mercury disconnect failure mode.
+- Summary: The bridge can create Webex session rooms, start Codex threads, attach existing local-only threads, and page through prior Codex turn history inside the session room. Data Space recovery no longer depends on the old group room; the deployed launch agent now replays state from the bot-owner 1:1 direct room, the Webex sidecar now self-recovers from the observed Mercury disconnect failure mode, and control-room commands are no longer deduplicated on the non-unique SDK event label.
 - Next Steps:
   - Verify one real user-originated `/history` or `/history page <n>` command from Webex proper, now that synthetic ingress plus user-token room replay confirmed the full path.
   - Decide whether to keep or archive the earlier failed recovery sessions in the existing control/session spaces.
@@ -29,6 +30,7 @@
   - Local-thread attach proof: a synthetic control ingress `resume local 019d6f03-3ed0-7163-95ff-c8c547af7525` created session `ses_20260409_zgstv4bkto`, reached `idle`, and Webex `GET /v1/memberships?roomId=<session_room_id>` returned both `hoteng@cisco.com` and `codex-webex-connector@webex.bot`.
   - History import + paging proof: after deploying release `2026-04-09T08-06-40`, a synthetic control ingress `resume local 019aa68d-8a8f-7ca1-812e-674711f9cf60` created session `ses_20260409_3xo2dzciw5`; using a temporary user token for `hoteng@cisco.com`, `GET /v1/messages?roomId=<session_room_id>` confirmed both the auto-import banner `Imported local Codex history... Showing latest 10 of 108 turns.` and a later `/history page 2` response `Showing turns 89-98 of 108`.
   - Mercury watchdog recovery proof: on `2026-04-17`, deployed bot token `GET /v1/people/me` still returned `HTTP/2 200`, but sidecar stderr showed repeated Mercury `connection_failed` / `ERR_INVALID_ARG_TYPE` (`url` undefined) and the control-room `/help` path was dead. After deploying release `2026-04-17T21-25-02` with a sidecar watchdog that exits on `connection_failed` / `offline.permanent`, a real user-originated `/help` succeeded again.
+  - Control-room dedupe proof: on `2026-04-17`, Webex REST replay for the control room showed consecutive real user messages `Codex-Webex-Connector /help`, `Codex-Webex-Connector list`, and `Codex-Webex-Connector /list`; the sidecar had still been using `payload.event` ahead of the unique message id for `event_id`, which could collapse multiple commands onto one dedupe key. Release `2026-04-17T21-37-54` now prefers `payload.id` / `payload.data.id` for ingress dedupe.
 
 ## Recent Updates
 - Replaced the broken aggregate `webex` package path with modular `@webex/*` SDK packages and added the missing `@babel/runtime-corejs2` runtime dependency.
@@ -41,6 +43,7 @@
 - Added session-room history browsing with `/history` and `/history page <n>`, backed by `thread/read` extraction of prior user/final-answer turns and newest-first paging.
 - Changed `resume local <thread_id>` so the newly created session room immediately receives the newest history page plus hints for `/history page <n>`.
 - Added a Mercury watchdog to the Node sidecar so unrecoverable realtime disconnects force a non-zero exit and let supervisor restart the bridge.
+- Fixed sidecar ingress deduplication so control-room commands use the unique webhook/message id instead of the non-unique SDK event label.
 
 ## Next Steps
 - Confirm one real Webex `/history` or `/history page <n>` command against a deployed session room, now that synthetic ingress and direct room replay are covered.

@@ -62,6 +62,16 @@ function sendEnvelope(envelope) {
   });
 }
 
+function ingressEventId(payload) {
+  return (
+    payload?.id ||
+    payload?.data?.id ||
+    payload?.data?.messageId ||
+    payload?.event ||
+    `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  );
+}
+
 function exitForSupervisorRestart(label, details) {
   if (exitingForRestart) {
     return;
@@ -108,7 +118,7 @@ async function forwardMessage(payload) {
   }
   await sendEnvelope({
     kind: "message_created",
-    event_id: payload.event || payload.id || payload.data.id,
+    event_id: ingressEventId(payload),
     room_id: message.roomId,
     message_id: message.id,
     person_email: personEmail,
@@ -125,7 +135,7 @@ async function forwardAttachmentAction(payload) {
   }
   await sendEnvelope({
     kind: "attachment_action_created",
-    event_id: payload.event || payload.id || payload.data.id,
+    event_id: ingressEventId(payload),
     room_id: action.roomId,
     attachment_action_id: action.id,
     person_email: personEmail,
