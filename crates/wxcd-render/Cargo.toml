@@ -1,0 +1,12 @@
+[package]
+name = "wxcd-render"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde_json.workspace = true
+wxcd-proto.workspace = true
+wxcd-webex.workspace = true
+

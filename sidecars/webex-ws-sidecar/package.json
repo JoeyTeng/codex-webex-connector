@@ -1,0 +1,19 @@
+{
+  "name": "webex-ws-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Webex websocket ingress sidecar for wxcd",
+  "main": "index.cjs",
+  "packageManager": "pnpm@10.15.0",
+  "license": "MIT",
+  "dependencies": {
+    "@babel/runtime-corejs2": "7.29.2",
+    "@webex/internal-plugin-device": "3.12.0",
+    "@webex/plugin-attachment-actions": "3.12.0",
+    "@webex/plugin-logger": "3.12.0",
+    "@webex/plugin-messages": "3.12.0",
+    "@webex/plugin-people": "3.12.0",
+    "@webex/plugin-rooms": "3.12.0",
+    "@webex/webex-core": "3.12.0"
+  }
+}

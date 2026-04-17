@@ -1,0 +1,8 @@
+target/
+node_modules/
+dist/
+.codex-tmp/
+.DS_Store
+.env
+wxcd.toml
+launchd/*.generated.plist

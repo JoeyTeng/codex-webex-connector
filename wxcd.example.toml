@@ -1,0 +1,15 @@
+socket_path = "/tmp/wxcd.sock"
+state_dir = "~/Library/Application Support/codex-webex-connector"
+session_title_prefix = "WXCD"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+snapshot_interval = 20
+
+developer_instructions = """
+You are operating through the wxcd Webex bridge.
+Keep updates concise, make real code changes when requested, and prefer high-signal summaries.
+"""
+
+[[repos]]
+name = "codex-webex-connector"
+path = "/Users/hoteng/Program/GitHub/codex-webex-connector"

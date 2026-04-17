@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.example.wxcd.supervisor</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>__WXCD_HOME__/current/bin/wxcd-supervisor</string>
+      <string>run</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>WXCD_CONFIG_PATH</key>
+      <string>__WXCD_CONFIG__</string>
+      <key>WXCD_ENV_PATH</key>
+      <string>__WXCD_ENV__</string>
+      <key>WXCD_NODE_PATH</key>
+      <string>__WXCD_NODE__</string>
+      <key>WXCD_CODEX_PATH</key>
+      <string>__WXCD_CODEX__</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__WXCD_HOME__/logs/supervisor.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__WXCD_HOME__/logs/supervisor.err.log</string>
+  </dict>
+</plist>
