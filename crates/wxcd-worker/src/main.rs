@@ -26,7 +26,7 @@ use wxcd_render::{
     render_control_list, render_final_summary, render_help, render_history_page,
     render_imported_history, render_local_thread_list, render_status_summary,
 };
-use wxcd_webex::{CreateMessageRequest, UpdateMessageRequest, WebexClient};
+use wxcd_webex::{CreateMessageRequest, EnsureMembership, UpdateMessageRequest, WebexClient};
 
 const LOCAL_THREAD_PAGE_SIZE: usize = 20;
 const HISTORY_PAGE_SIZE: usize = 10;
@@ -342,6 +342,37 @@ async fn handle_control_message(
             ),
         )
         .await?;
+        return Ok(());
+    }
+    if let Some(session_id) = parse_attach_session_id(text) {
+        let session = state
+            .sessions
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown session `{session_id}`"))?;
+        let attached = webex
+            .ensure_membership(&session.session_room_id, &owner_email)
+            .await?;
+        let status_line = match attached {
+            EnsureMembership::Created => {
+                format!(
+                    "Attached `{owner_email}` to session `{session_id}` in room `{}`.",
+                    session.title
+                )
+            }
+            EnsureMembership::AlreadyPresent => {
+                format!(
+                    "`{owner_email}` is already in session `{session_id}` room `{}`.",
+                    session.title
+                )
+            }
+        };
+        let response = if let Some(web_link) = session.session_room_web_link.as_deref() {
+            format!("{status_line}\nOpen: {web_link}")
+        } else {
+            status_line
+        };
+        send_plain_message(webex, &message.room_id, &response).await?;
         return Ok(());
     }
     if let Some(session_id) = text
@@ -1265,6 +1296,13 @@ fn parse_resume_local_thread_id(text: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn parse_attach_session_id(text: &str) -> Option<&str> {
+    text.strip_prefix("attach ")
+        .or_else(|| text.strip_prefix("/attach "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 fn parse_session_history_page(text: &str) -> Option<usize> {
     if text.eq_ignore_ascii_case("/history") {
         return Some(1);
@@ -1297,6 +1335,7 @@ fn is_control_command(text: &str) -> bool {
     matches_help_command(text)
         || parse_list_command(text).is_some()
         || parse_resume_local_thread_id(text).is_some()
+        || parse_attach_session_id(text).is_some()
         || text.starts_with("new ")
         || text.starts_with("/new ")
         || text.starts_with("archive ")
@@ -1571,8 +1610,8 @@ fn slice_thread_history_page(
 mod tests {
     use super::{
         ListCommand, ListMode, extract_thread_history_turns, normalize_control_command_text,
-        parse_list_command, parse_resume_local_thread_id, parse_session_history_page,
-        repo_name_for_cwd, slice_thread_history_page,
+        parse_attach_session_id, parse_list_command, parse_resume_local_thread_id,
+        parse_session_history_page, repo_name_for_cwd, slice_thread_history_page,
     };
     use serde_json::json;
     use wxcd_proto::{AppConfig, BridgeConfig, RepoConfig, WebexConfig};
@@ -1603,6 +1642,10 @@ mod tests {
         assert_eq!(
             normalize_control_command_text("Codex-Webex-Connector resume local 019d6eff"),
             "resume local 019d6eff"
+        );
+        assert_eq!(
+            normalize_control_command_text("Codex-Webex-Connector attach ses_20260417_abc123"),
+            "attach ses_20260417_abc123"
         );
     }
 
@@ -1664,6 +1707,19 @@ mod tests {
             Some("019d6eff")
         );
         assert_eq!(parse_resume_local_thread_id("resume local "), None);
+    }
+
+    #[test]
+    fn parses_attach_session_command() {
+        assert_eq!(
+            parse_attach_session_id("attach ses_20260417_abc123"),
+            Some("ses_20260417_abc123")
+        );
+        assert_eq!(
+            parse_attach_session_id("/attach ses_20260417_abc123"),
+            Some("ses_20260417_abc123")
+        );
+        assert_eq!(parse_attach_session_id("attach "), None);
     }
 
     #[test]

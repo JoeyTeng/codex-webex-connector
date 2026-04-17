@@ -8,6 +8,7 @@
 - [done] Add session-room history browsing so `resume local <thread_id>` can expose prior turns and `/history page <n>` can page back through older history.
 - [done] Add a sidecar watchdog so unrecoverable Webex Mercury disconnects restart the local bridge instead of leaving control-room commands offline.
 - [done] Fix control-room ingress deduplication so consecutive commands are keyed by unique Webex message/webhook ids instead of the SDK event label.
+- [done] Add control-room `attach <session_id>` so a user can rejoin an existing bridge session room after leaving it.
 - [pending] Verify one real user-originated `/history` or `/history page <n>` command against the deployed launchd-managed session room.
 - [pending] Decide how to handle stale failed sessions left behind during bring-up.
 - [pending] Improve recovery for previously created Codex threads that are not reloaded by `thread/read` after process restart.

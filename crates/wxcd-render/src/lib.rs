@@ -6,7 +6,7 @@ use wxcd_proto::{PendingApproval, SessionRecord, SessionState};
 use wxcd_webex::MessageAttachment;
 
 pub fn render_help() -> &'static str {
-    "Control room commands:\n- `help` or `/help`\n- `list` or `/list`\n- `list local` or `/list local`\n- `list local page <n>` or `/list local page <n>`\n- `list all` or `/list all`\n- `list all page <n>` or `/list all page <n>`\n- `resume local <thread_id>` or `/resume local <thread_id>`\n- `new <repo> :: <task>` or `/new <repo> :: <task>`\n- `archive <session_id>` or `/archive <session_id>`\n- In a group space, mention the bot before the command.\n\nInside a session room:\n- `help` or `/help`\n- plain text: send a new turn\n- `/status`\n- `/history`\n- `/history page <n>`\n- `/resume`\n- `/pause`\n- `/stop`"
+    "Control room commands:\n- `help` or `/help`\n- `list` or `/list`\n- `list local` or `/list local`\n- `list local page <n>` or `/list local page <n>`\n- `list all` or `/list all`\n- `list all page <n>` or `/list all page <n>`\n- `attach <session_id>` or `/attach <session_id>`\n- `resume local <thread_id>` or `/resume local <thread_id>`\n- `new <repo> :: <task>` or `/new <repo> :: <task>`\n- `archive <session_id>` or `/archive <session_id>`\n- In a group space, mention the bot before the command.\n\nInside a session room:\n- `help` or `/help`\n- plain text: send a new turn\n- `/status`\n- `/history`\n- `/history page <n>`\n- `/resume`\n- `/pause`\n- `/stop`"
 }
 
 #[derive(Debug, Clone)]
@@ -29,7 +29,7 @@ pub fn render_control_list(sessions: &[SessionRecord]) -> String {
         return "No bridge sessions found.".to_string();
     }
 
-    let mut lines = Vec::with_capacity(sessions.len() + 1);
+    let mut lines = Vec::with_capacity(sessions.len() + 2);
     lines.push("Bridge sessions:".to_string());
     for session in sessions {
         lines.push(format!(
@@ -40,6 +40,9 @@ pub fn render_control_list(sessions: &[SessionRecord]) -> String {
             session.owner_email
         ));
     }
+    lines.push(
+        "Use `attach <session_id>` to add yourself back to a listed Webex space.".to_string(),
+    );
     lines.join("\n")
 }
 

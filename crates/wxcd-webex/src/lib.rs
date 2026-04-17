@@ -59,6 +59,12 @@ pub struct MessageAttachment {
     pub content: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureMembership {
+    Created,
+    AlreadyPresent,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateMessageRequest {
@@ -156,11 +162,8 @@ impl WebexClient {
     }
 
     pub async fn create_room(&self, title: &str) -> Result<Room> {
-        self.post(
-            &format!("{BASE_URL}/rooms"),
-            &CreateRoomRequest { title },
-        )
-        .await
+        self.post(&format!("{BASE_URL}/rooms"), &CreateRoomRequest { title })
+            .await
     }
 
     pub async fn update_room_title(&self, room_id: &str, title: &str) -> Result<Room> {
@@ -182,21 +185,43 @@ impl WebexClient {
         .await
     }
 
+    pub async fn ensure_membership(
+        &self,
+        room_id: &str,
+        person_email: &str,
+    ) -> Result<EnsureMembership> {
+        let response = self
+            .inner
+            .post(&format!("{BASE_URL}/memberships"))
+            .json(&CreateMembershipRequest {
+                room_id,
+                person_email,
+            })
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("failed to read response body")?;
+        decode_membership_response(status, body)
+    }
+
     pub async fn create_message(&self, request: &CreateMessageRequest) -> Result<Message> {
         let url = format!("{BASE_URL}/messages");
         let mut delay = Duration::from_millis(250);
         for attempt in 0..5 {
             let response = self.inner.post(&url).json(request).send().await?;
             let status = response.status();
-            let body = response.text().await.context("failed to read response body")?;
+            let body = response
+                .text()
+                .await
+                .context("failed to read response body")?;
             if status.is_success() {
                 return serde_json::from_str(&body)
                     .with_context(|| format!("failed to decode Webex response body: {body}"));
             }
-            if status == StatusCode::BAD_REQUEST
-                && body.contains("Invalid roomId")
-                && attempt < 4
-            {
+            if status == StatusCode::BAD_REQUEST && body.contains("Invalid roomId") && attempt < 4 {
                 sleep(delay).await;
                 delay *= 2;
                 continue;
@@ -207,8 +232,13 @@ impl WebexClient {
         unreachable!("create_message retry loop exhausted unexpectedly")
     }
 
-    pub async fn update_message(&self, message_id: &str, request: &UpdateMessageRequest) -> Result<Message> {
-        self.put(&format!("{BASE_URL}/messages/{message_id}"), request).await
+    pub async fn update_message(
+        &self,
+        message_id: &str,
+        request: &UpdateMessageRequest,
+    ) -> Result<Message> {
+        self.put(&format!("{BASE_URL}/messages/{message_id}"), request)
+            .await
     }
 
     pub async fn list_messages(&self, room_id: &str, max: usize) -> Result<Vec<Message>> {
@@ -219,7 +249,10 @@ impl WebexClient {
         Ok(response.items)
     }
 
-    pub async fn get_attachment_action(&self, attachment_action_id: &str) -> Result<AttachmentAction> {
+    pub async fn get_attachment_action(
+        &self,
+        attachment_action_id: &str,
+    ) -> Result<AttachmentAction> {
         self.get(&format!(
             "{BASE_URL}/attachment/actions/{attachment_action_id}"
         ))
@@ -231,12 +264,20 @@ impl WebexClient {
         decode_response(response).await
     }
 
-    async fn post<T: DeserializeOwned, B: Serialize + ?Sized>(&self, url: &str, body: &B) -> Result<T> {
+    async fn post<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<T> {
         let response = self.inner.post(url).json(body).send().await?;
         decode_response(response).await
     }
 
-    async fn put<T: DeserializeOwned, B: Serialize + ?Sized>(&self, url: &str, body: &B) -> Result<T> {
+    async fn put<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<T> {
         let response = self.inner.put(url).json(body).send().await?;
         decode_response(response).await
     }
@@ -244,7 +285,10 @@ impl WebexClient {
 
 async fn decode_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
     let status = response.status();
-    let body = response.text().await.context("failed to read response body")?;
+    let body = response
+        .text()
+        .await
+        .context("failed to read response body")?;
     decode_response_body(status, body)
 }
 
@@ -257,4 +301,57 @@ fn decode_response_body<T: DeserializeOwned>(status: StatusCode, body: String) -
     }
     serde_json::from_str(&body)
         .with_context(|| format!("failed to decode Webex response body: {body}"))
+}
+
+fn decode_membership_response(status: StatusCode, body: String) -> Result<EnsureMembership> {
+    if status == StatusCode::CONFLICT {
+        return Ok(EnsureMembership::AlreadyPresent);
+    }
+
+    let lower_body = body.to_ascii_lowercase();
+    if status == StatusCode::BAD_REQUEST
+        && lower_body.contains("already")
+        && (lower_body.contains("member") || lower_body.contains("membership"))
+    {
+        return Ok(EnsureMembership::AlreadyPresent);
+    }
+
+    let _: Membership = decode_response_body(status, body)?;
+    Ok(EnsureMembership::Created)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EnsureMembership, decode_membership_response};
+    use reqwest::StatusCode;
+
+    #[test]
+    fn decodes_membership_success() {
+        let result = decode_membership_response(
+            StatusCode::OK,
+            r#"{"id":"membership","roomId":"room","personEmail":"user@example.com"}"#.to_string(),
+        )
+        .expect("membership success should decode");
+        assert_eq!(result, EnsureMembership::Created);
+    }
+
+    #[test]
+    fn treats_conflict_as_existing_membership() {
+        let result = decode_membership_response(
+            StatusCode::CONFLICT,
+            r#"{"message":"person is already a member"}"#.to_string(),
+        )
+        .expect("membership conflict should be idempotent");
+        assert_eq!(result, EnsureMembership::AlreadyPresent);
+    }
+
+    #[test]
+    fn treats_already_member_bad_request_as_existing_membership() {
+        let result = decode_membership_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"message":"Membership already exists"}"#.to_string(),
+        )
+        .expect("already-member bad request should be idempotent");
+        assert_eq!(result, EnsureMembership::AlreadyPresent);
+    }
 }
