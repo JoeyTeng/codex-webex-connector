@@ -6,7 +6,7 @@ use wxcd_proto::{PendingApproval, SessionRecord, SessionState};
 use wxcd_webex::MessageAttachment;
 
 pub fn render_help() -> &'static str {
-    "Control room commands:\n- `help` or `/help`\n- `list` or `/list`\n- `list local` or `/list local`\n- `list local page <n>` or `/list local page <n>`\n- `list all` or `/list all`\n- `list all page <n>` or `/list all page <n>`\n- `attach <session_id>` or `/attach <session_id>`\n- `resume local <thread_id>` or `/resume local <thread_id>`\n- `new <repo> :: <task>` or `/new <repo> :: <task>`\n- `archive <session_id>` or `/archive <session_id>`\n- In a group space, mention the bot before the command.\n\nInside a session room:\n- `help` or `/help`\n- plain text: send a new turn\n- `/status`\n- `/history`\n- `/history page <n>`\n- `/resume`\n- `/pause`\n- `/stop`"
+    "Control room commands:\n- `help` or `/help`\n- `list` or `/list`\n- `list local` or `/list local`\n- `list local page <n>` or `/list local page <n>`\n- `list all` or `/list all`\n- `list all page <n>` or `/list all page <n>`\n- `diagnose sessions` or `/diagnose sessions`\n- `diagnose <session_id>` or `/diagnose <session_id>`\n- `cleanup failed` or `/cleanup failed`\n- `cleanup failed <session_id>` or `/cleanup failed <session_id>`\n- `cleanup failed all` or `/cleanup failed all`\n- `purge archived <session_id>` or `/purge archived <session_id>`\n- `purge archived <session_id> confirm` or `/purge archived <session_id> confirm`\n- `attach <session_id>` or `/attach <session_id>`\n- `resume local <thread_id>` or `/resume local <thread_id>`\n- `new <repo> :: <task>` or `/new <repo> :: <task>`\n- `archive <session_id>` or `/archive <session_id>`\n- In a group space, mention the bot before the command.\n\nInside a session room:\n- `help` or `/help`\n- plain text: send a new turn\n- `/status`\n- `/history`\n- `/history page <n>`\n- `/resume`\n- `/pause`\n- `/stop`"
 }
 
 #[derive(Debug, Clone)]
@@ -32,18 +32,92 @@ pub fn render_control_list(sessions: &[SessionRecord]) -> String {
     let mut lines = Vec::with_capacity(sessions.len() + 2);
     lines.push("Bridge sessions:".to_string());
     for session in sessions {
-        lines.push(format!(
+        let mut line = format!(
             "- `{}` {} {} ({})",
             session.session_id,
             state_emoji(&session.state),
             session.title,
             session.owner_email
-        ));
+        );
+        if session.state == SessionState::Failed
+            && let Some(failure) = &session.failure
+        {
+            line.push_str(&format!(" - {:?}", failure.kind));
+        }
+        if session.state == SessionState::Failed && !session.archived {
+            line.push_str("; use `diagnose <session_id>` or `cleanup failed <session_id>`");
+        } else if session.archived || session.state == SessionState::Archived {
+            line.push_str("; use `purge archived <session_id>` to preview deletion");
+        }
+        lines.push(line);
     }
     lines.push(
         "Use `attach <session_id>` to add yourself back to a listed Webex space.".to_string(),
     );
     lines.join("\n")
+}
+
+pub fn render_failed_session_diagnostics(sessions: &[SessionRecord]) -> String {
+    let total = sessions.len();
+    let failed = sessions
+        .iter()
+        .filter(|session| session.state == SessionState::Failed && !session.archived)
+        .count();
+    let archived = sessions.iter().filter(|session| session.archived).count();
+    let mut lines = vec![format!(
+        "Session diagnostics: {total} total, {failed} failed, {archived} archived."
+    )];
+    if failed == 0 {
+        lines.push("No failed active sessions found.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push("Failed active sessions:".to_string());
+    for session in sessions
+        .iter()
+        .filter(|session| session.state == SessionState::Failed && !session.archived)
+    {
+        lines.push(format_failed_session_line(session));
+    }
+    lines.push("Use `cleanup failed <session_id>` to soft-archive one failed session.".to_string());
+    lines.push("Use `cleanup failed all` to soft-archive all failed sessions.".to_string());
+    lines.join("\n")
+}
+
+pub fn render_cleanup_failed_preview(sessions: &[SessionRecord]) -> String {
+    let failed = sessions
+        .iter()
+        .filter(|session| session.state == SessionState::Failed && !session.archived)
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        return "No failed active sessions found.".to_string();
+    }
+
+    let mut lines = vec!["Failed sessions eligible for soft archive:".to_string()];
+    for session in failed {
+        lines.push(format!(
+            "{}\n  Preview only. Use `cleanup failed {}` to soft-archive this session.",
+            format_failed_session_line(session),
+            session.session_id
+        ));
+    }
+    lines.join("\n")
+}
+
+pub fn render_purge_archived_warning(session: &SessionRecord) -> String {
+    format!(
+        "Destructive purge preview for archived session `{}`.\nThis will delete Webex room `{}` and remove the bridge session from active state.\nThis cannot be undone from wxcd.\nTo confirm, send `purge archived {} confirm`.",
+        session.session_id, session.title, session.session_id
+    )
+}
+
+fn format_failed_session_line(session: &SessionRecord) -> String {
+    let failure = session
+        .failure
+        .as_ref()
+        .map(|failure| format!("{:?}: {}", failure.kind, failure.message))
+        .unwrap_or_else(|| "No failure metadata captured.".to_string());
+    format!("- `{}` {} - {}", session.session_id, session.title, failure)
 }
 
 pub fn render_local_thread_list(

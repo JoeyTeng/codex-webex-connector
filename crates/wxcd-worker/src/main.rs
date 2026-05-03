@@ -17,14 +17,15 @@ use tracing_subscriber::EnvFilter;
 use wxcd_codex::{CodexClient, CodexEvent, CodexThreadSummary};
 use wxcd_eventlog::{EventLog, ReplayState};
 use wxcd_proto::{
-    AppConfig, ApprovalDecision, ApprovalKind, BridgeEvent, PendingApproval, SessionRecord,
-    SessionState, WebexAttachmentActionEvent, WebexIngressAck, WebexIngressEnvelope,
-    WebexMessageEvent, generate_session_id,
+    AppConfig, ApprovalDecision, ApprovalKind, BridgeEvent, PendingApproval, SessionFailure,
+    SessionFailureKind, SessionRecord, SessionState, WebexAttachmentActionEvent, WebexIngressAck,
+    WebexIngressEnvelope, WebexMessageEvent, generate_session_id,
 };
 use wxcd_render::{
     ImportedHistoryTurn, LocalThreadListItem, build_approval_attachment, build_overview_attachment,
-    render_control_list, render_final_summary, render_help, render_history_page,
-    render_imported_history, render_local_thread_list, render_status_summary,
+    render_cleanup_failed_preview, render_control_list, render_failed_session_diagnostics,
+    render_final_summary, render_help, render_history_page, render_imported_history,
+    render_local_thread_list, render_purge_archived_warning, render_status_summary,
 };
 use wxcd_webex::{CreateMessageRequest, EnsureMembership, UpdateMessageRequest, WebexClient};
 
@@ -58,6 +59,39 @@ enum ListMode {
 struct ListCommand {
     mode: ListMode,
     page: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiagnoseCommand {
+    Sessions,
+    Session(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CleanupFailedCommand {
+    Preview,
+    Session(String),
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PurgeArchivedCommand {
+    session_id: String,
+    confirmed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadProbeKind {
+    Readable,
+    MissingThread,
+    UnreadableThread,
+    ProbeUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadProbe {
+    kind: ThreadProbeKind,
+    message: String,
 }
 
 struct LocalOnlyThreads {
@@ -420,6 +454,24 @@ async fn handle_control_message(
         send_plain_message(webex, &message.room_id, &response).await?;
         return Ok(());
     }
+    if let Some(command) = parse_diagnose_command(text) {
+        let response =
+            handle_diagnose_command(config, webex, event_log, state, codex, command).await?;
+        send_plain_message(webex, &message.room_id, &response).await?;
+        return Ok(());
+    }
+    if let Some(command) = parse_cleanup_failed_command(text) {
+        let response =
+            handle_cleanup_failed_command(config, webex, event_log, state, codex, command).await?;
+        send_plain_message(webex, &message.room_id, &response).await?;
+        return Ok(());
+    }
+    if let Some(command) = parse_purge_archived_command(text) {
+        let response =
+            handle_purge_archived_command(config, webex, event_log, state, command).await?;
+        send_plain_message(webex, &message.room_id, &response).await?;
+        return Ok(());
+    }
     if let Some(session_id) = text
         .strip_prefix("archive ")
         .or_else(|| text.strip_prefix("/archive "))
@@ -576,6 +628,7 @@ async fn create_bridge_session(
         active_turn_buffer: String::new(),
         updated_at: Utc::now(),
         archived: false,
+        failure: None,
     };
     state.upsert_session(session.clone());
     persist_event(
@@ -677,6 +730,7 @@ async fn handle_session_message(
         }
         "/resume" => {
             codex.thread_resume(&session.thread_id).await?;
+            session.failure = None;
             session.state = SessionState::Idle;
             session.updated_at = Utc::now();
             state.upsert_session(session.clone());
@@ -722,6 +776,7 @@ async fn handle_session_message(
         .pointer("/turn/id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    session.failure = None;
     session.active_turn_buffer.clear();
     session.last_checkpoint = Some(format!("Submitted turn: {}", abbreviate(text, 80)));
     session.state = SessionState::Running;
@@ -831,6 +886,7 @@ async fn handle_codex_event(
                         "idle" if session.last_final.is_some() => SessionState::Completed,
                         _ => SessionState::Idle,
                     };
+                    session.failure = None;
                     session.updated_at = Utc::now();
                     let updated = session.clone();
                     let _ = session;
@@ -854,6 +910,7 @@ async fn handle_codex_event(
                     && let Some(session) = state.sessions.get_mut(&session_id)
                 {
                     session.active_turn_id = Some(turn_id.to_string());
+                    session.failure = None;
                     session.active_turn_buffer.clear();
                     session.state = SessionState::Running;
                     session.updated_at = Utc::now();
@@ -890,6 +947,7 @@ async fn handle_codex_event(
                     && let Some(session) = state.sessions.get_mut(&session_id)
                 {
                     session.state = SessionState::Completed;
+                    session.failure = None;
                     session.last_final = Some(session.active_turn_buffer.trim().to_string());
                     session.active_turn_id = None;
                     session.updated_at = Utc::now();
@@ -1097,6 +1155,7 @@ async fn resolve_approval(
 
     if let Some(mut session) = state.sessions.get(&approval.session_id).cloned() {
         session.state = SessionState::Running;
+        session.failure = None;
         session.updated_at = Utc::now();
         state.upsert_session(session.clone());
         persist_event(
@@ -1120,6 +1179,168 @@ async fn resolve_approval(
     Ok(())
 }
 
+async fn handle_diagnose_command(
+    config: &AppConfig,
+    webex: &WebexClient,
+    event_log: &EventLog<'_>,
+    state: &mut WorkerState,
+    codex: &mut CodexClient,
+    command: DiagnoseCommand,
+) -> Result<String> {
+    match command {
+        DiagnoseCommand::Sessions => {
+            let mut sessions = state.sessions.values().cloned().collect::<Vec<_>>();
+            sessions.sort_by_key(|session| session.updated_at);
+            sessions.reverse();
+            Ok(render_failed_session_diagnostics(&sessions))
+        }
+        DiagnoseCommand::Session(session_id) => {
+            let session = state
+                .sessions
+                .get(&session_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown session `{session_id}`"))?;
+            if session.archived || session.state == SessionState::Archived {
+                return Ok(format!(
+                    "Session `{}` is archived; diagnosis will not mutate it. Use `purge archived {}` to preview Webex room deletion.",
+                    session.session_id, session.session_id
+                ));
+            }
+            let probe = probe_session_thread(codex, &session).await;
+            if let Some(updated) = apply_thread_probe(&session, &probe, Utc::now()) {
+                state.upsert_session(updated.clone());
+                persist_event(
+                    event_log,
+                    state,
+                    BridgeEvent::SessionUpdated {
+                        session: updated.clone(),
+                    },
+                    config,
+                )
+                .await?;
+                refresh_overview(webex, &updated).await.ok();
+                return Ok(format!(
+                    "Diagnosed session `{}`: {:?}. {}",
+                    updated.session_id, probe.kind, probe.message
+                ));
+            }
+
+            Ok(format!(
+                "Diagnosed session `{}`: {:?}. {}",
+                session.session_id, probe.kind, probe.message
+            ))
+        }
+    }
+}
+
+async fn handle_cleanup_failed_command(
+    config: &AppConfig,
+    webex: &WebexClient,
+    event_log: &EventLog<'_>,
+    state: &mut WorkerState,
+    codex: &mut CodexClient,
+    command: CleanupFailedCommand,
+) -> Result<String> {
+    match command {
+        CleanupFailedCommand::Preview => {
+            let mut sessions = state.sessions.values().cloned().collect::<Vec<_>>();
+            sessions.sort_by_key(|session| session.updated_at);
+            sessions.reverse();
+            Ok(render_cleanup_failed_preview(&sessions))
+        }
+        CleanupFailedCommand::Session(session_id) => {
+            ensure_failed_cleanup_target(state, &session_id)?;
+            archive_session(config, webex, event_log, state, codex, &session_id).await?;
+            Ok(format!(
+                "Soft-archived failed session `{session_id}`. Use `purge archived {session_id}` to preview Webex room deletion."
+            ))
+        }
+        CleanupFailedCommand::All => {
+            let mut session_ids = state
+                .sessions
+                .values()
+                .filter(|session| session.state == SessionState::Failed && !session.archived)
+                .map(|session| session.session_id.clone())
+                .collect::<Vec<_>>();
+            session_ids.sort();
+            if session_ids.is_empty() {
+                return Ok("No failed active sessions found.".to_string());
+            }
+            let mut archived = Vec::new();
+            for session_id in session_ids {
+                archive_session(config, webex, event_log, state, codex, &session_id).await?;
+                archived.push(session_id);
+            }
+            Ok(format!(
+                "Soft-archived {} failed sessions: {}.",
+                archived.len(),
+                archived
+                    .iter()
+                    .map(|session_id| format!("`{session_id}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+    }
+}
+
+async fn handle_purge_archived_command(
+    config: &AppConfig,
+    webex: &WebexClient,
+    event_log: &EventLog<'_>,
+    state: &mut WorkerState,
+    command: PurgeArchivedCommand,
+) -> Result<String> {
+    let session = validate_purge_archived_session(state, &command.session_id)?;
+    if !command.confirmed {
+        return Ok(render_purge_archived_warning(&session));
+    }
+
+    webex.delete_room(&session.session_room_id).await?;
+    state.remove_session(&session.session_id);
+    persist_event(
+        event_log,
+        state,
+        BridgeEvent::SessionPurged {
+            session_id: session.session_id.clone(),
+            purged_at: Utc::now(),
+        },
+        config,
+    )
+    .await?;
+    persist_snapshot(event_log, state, config).await?;
+    Ok(format!(
+        "Purged archived session `{}` and deleted Webex room `{}`.",
+        session.session_id, session.title
+    ))
+}
+
+fn ensure_failed_cleanup_target(state: &WorkerState, session_id: &str) -> Result<()> {
+    let session = state
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow!("unknown session `{session_id}`"))?;
+    if session.archived || session.state == SessionState::Archived {
+        bail!("session `{session_id}` is already archived");
+    }
+    if session.state != SessionState::Failed {
+        bail!("session `{session_id}` is not failed");
+    }
+    Ok(())
+}
+
+fn validate_purge_archived_session(state: &WorkerState, session_id: &str) -> Result<SessionRecord> {
+    let session = state
+        .sessions
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("unknown session `{session_id}`"))?;
+    if !session.archived && session.state != SessionState::Archived {
+        bail!("session `{session_id}` is not archived; run `archive {session_id}` first");
+    }
+    Ok(session)
+}
+
 async fn archive_session(
     config: &AppConfig,
     webex: &WebexClient,
@@ -1133,7 +1354,14 @@ async fn archive_session(
         .get(session_id)
         .cloned()
         .ok_or_else(|| anyhow!("unknown session `{session_id}`"))?;
-    codex.thread_archive(&session.thread_id).await?;
+    if session_requires_codex_archive(&session) {
+        codex.thread_archive(&session.thread_id).await?;
+    } else if let Err(error) = codex.thread_archive(&session.thread_id).await {
+        warn!(
+            "failed to archive missing local Codex thread {} for failed session {}: {error:#}",
+            session.thread_id, session.session_id
+        );
+    }
     session.archived = true;
     session.state = SessionState::Archived;
     session.updated_at = Utc::now();
@@ -1145,6 +1373,7 @@ async fn archive_session(
         .await
         .ok();
     state.upsert_session(session.clone());
+    state.remove_pending_approvals_for_session(session_id);
     persist_event(
         event_log,
         state,
@@ -1157,6 +1386,10 @@ async fn archive_session(
     .await?;
     refresh_overview(webex, &session).await?;
     Ok(())
+}
+
+fn session_requires_codex_archive(session: &SessionRecord) -> bool {
+    session.state != SessionState::Failed
 }
 
 async fn refresh_overview(webex: &WebexClient, session: &SessionRecord) -> Result<()> {
@@ -1197,44 +1430,164 @@ async fn reconcile_sessions(
         if session.archived {
             continue;
         }
-        match codex.thread_read(&session.thread_id, false).await {
-            Ok(_) => {
-                codex.thread_resume(&session.thread_id).await.ok();
-            }
-            Err(error) => {
-                warn!(
-                    "failed to reconcile thread {} for session {}: {error:#}",
-                    session.thread_id, session_id
-                );
-                if let Some(session_mut) = state.sessions.get_mut(&session_id) {
-                    session_mut.state = SessionState::Failed;
-                    session_mut.last_checkpoint = Some(
-                        "Local Codex thread is missing and could not be recovered.".to_string(),
-                    );
-                    session_mut.updated_at = Utc::now();
-                    let updated = session_mut.clone();
-                    let room_id = updated.session_room_id.clone();
-                    let _ = session_mut;
-                    state.upsert_session(updated.clone());
-                    persist_event(
-                        event_log,
-                        state,
-                        BridgeEvent::SessionUpdated { session: updated },
-                        config,
-                    )
-                    .await?;
-                    send_plain_message(
-                        webex,
-                        &room_id,
-                        "Remote metadata exists, but the local Codex thread is missing.",
-                    )
-                    .await
-                    .ok();
-                }
+        let probe = probe_session_thread(codex, &session).await;
+        if probe.kind == ThreadProbeKind::Readable {
+            codex.thread_resume(&session.thread_id).await.ok();
+        }
+        if let Some(updated) = apply_thread_probe(&session, &probe, Utc::now()) {
+            let room_id = updated.session_room_id.clone();
+            let send_failure_message =
+                updated.state == SessionState::Failed && session.state != SessionState::Failed;
+            state.upsert_session(updated.clone());
+            persist_event(
+                event_log,
+                state,
+                BridgeEvent::SessionUpdated {
+                    session: updated.clone(),
+                },
+                config,
+            )
+            .await?;
+            if send_failure_message {
+                send_plain_message(
+                    webex,
+                    &room_id,
+                    &format!(
+                        "Remote metadata exists, but the local Codex thread could not be recovered: {}",
+                        probe.message
+                    ),
+                )
+                .await
+                .ok();
             }
         }
     }
     Ok(())
+}
+
+async fn probe_session_thread(codex: &mut CodexClient, session: &SessionRecord) -> ThreadProbe {
+    match codex.thread_read(&session.thread_id, false).await {
+        Ok(_) => {
+            return ThreadProbe {
+                kind: ThreadProbeKind::Readable,
+                message: "Local Codex thread is readable.".to_string(),
+            };
+        }
+        Err(read_error) => {
+            warn!(
+                "failed to read thread {} for session {}: {read_error:#}",
+                session.thread_id, session.session_id
+            );
+        }
+    }
+
+    match codex.thread_resume(&session.thread_id).await {
+        Ok(_) => match codex.thread_read(&session.thread_id, false).await {
+            Ok(_) => {
+                return ThreadProbe {
+                    kind: ThreadProbeKind::Readable,
+                    message: "Local Codex thread became readable after resume.".to_string(),
+                };
+            }
+            Err(read_error) => {
+                warn!(
+                    "failed to read thread {} after resume for session {}: {read_error:#}",
+                    session.thread_id, session.session_id
+                );
+            }
+        },
+        Err(resume_error) => {
+            warn!(
+                "failed to resume thread {} for session {}: {resume_error:#}",
+                session.thread_id, session.session_id
+            );
+        }
+    }
+
+    match codex_thread_exists(codex, &session.thread_id).await {
+        Ok(true) => ThreadProbe {
+            kind: ThreadProbeKind::UnreadableThread,
+            message: format!(
+                "Local Codex thread `{}` is listed but `thread/read` still fails.",
+                session.thread_id
+            ),
+        },
+        Ok(false) => ThreadProbe {
+            kind: ThreadProbeKind::MissingThread,
+            message: format!(
+                "Local Codex thread `{}` is missing from `thread/list`.",
+                session.thread_id
+            ),
+        },
+        Err(error) => ThreadProbe {
+            kind: ThreadProbeKind::ProbeUnavailable,
+            message: format!("Could not list local Codex threads: {error:#}"),
+        },
+    }
+}
+
+async fn codex_thread_exists(codex: &mut CodexClient, thread_id: &str) -> Result<bool> {
+    let mut cursor = None;
+    loop {
+        let page = codex.thread_list_page(false, cursor.as_deref()).await?;
+        if page.data.iter().any(|thread| thread.id == thread_id) {
+            return Ok(true);
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(false);
+        };
+        cursor = Some(next_cursor);
+    }
+}
+
+fn apply_thread_probe(
+    session: &SessionRecord,
+    probe: &ThreadProbe,
+    detected_at: chrono::DateTime<Utc>,
+) -> Option<SessionRecord> {
+    if session.archived || session.state == SessionState::Archived {
+        return None;
+    }
+    match probe.kind {
+        ThreadProbeKind::Readable => {
+            if session.failure.is_none() && session.state != SessionState::Failed {
+                return None;
+            }
+            let mut updated = session.clone();
+            updated.failure = None;
+            if updated.state == SessionState::Failed {
+                updated.state = SessionState::Idle;
+            }
+            updated.last_checkpoint = Some(probe.message.clone());
+            updated.updated_at = detected_at;
+            Some(updated)
+        }
+        ThreadProbeKind::MissingThread | ThreadProbeKind::UnreadableThread => {
+            let failure_kind = match probe.kind {
+                ThreadProbeKind::MissingThread => SessionFailureKind::MissingThread,
+                ThreadProbeKind::UnreadableThread => SessionFailureKind::UnreadableThread,
+                _ => unreachable!(),
+            };
+            if session.state == SessionState::Failed
+                && session.failure.as_ref().is_some_and(|failure| {
+                    failure.kind == failure_kind && failure.message == probe.message
+                })
+            {
+                return None;
+            }
+            let mut updated = session.clone();
+            updated.state = SessionState::Failed;
+            updated.failure = Some(SessionFailure {
+                kind: failure_kind,
+                message: probe.message.clone(),
+                detected_at,
+            });
+            updated.last_checkpoint = Some(probe.message.clone());
+            updated.updated_at = detected_at;
+            Some(updated)
+        }
+        ThreadProbeKind::ProbeUnavailable => None,
+    }
 }
 
 async fn persist_event(
@@ -1248,15 +1601,30 @@ async fn persist_event(
     }
     state.events_since_snapshot += 1;
     if state.events_since_snapshot >= config.bridge.snapshot_interval {
-        let snapshot = state.to_replay_state().to_snapshot();
-        if let Err(error) = event_log.append_snapshot(&snapshot).await {
-            warn!("failed to append Data Space snapshot: {error:#}");
-        }
-        state.events_since_snapshot = 0;
+        persist_snapshot(event_log, state, config).await?;
+        return Ok(());
     }
     persist_local_snapshot(
         &config.bridge.state_dir.join("bridge-state.json"),
         &state.to_replay_state().to_snapshot(),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn persist_snapshot(
+    event_log: &EventLog<'_>,
+    state: &mut WorkerState,
+    config: &AppConfig,
+) -> Result<()> {
+    let snapshot = state.to_replay_state().to_snapshot();
+    if let Err(error) = event_log.append_snapshot(&snapshot).await {
+        warn!("failed to append Data Space snapshot: {error:#}");
+    }
+    state.events_since_snapshot = 0;
+    persist_local_snapshot(
+        &config.bridge.state_dir.join("bridge-state.json"),
+        &snapshot,
     )
     .await?;
     Ok(())
@@ -1382,6 +1750,49 @@ fn parse_attach_session_id(text: &str) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn parse_diagnose_command(text: &str) -> Option<DiagnoseCommand> {
+    let rest = text
+        .strip_prefix("diagnose ")
+        .or_else(|| text.strip_prefix("/diagnose "))?
+        .trim();
+    if rest.eq_ignore_ascii_case("sessions") {
+        return Some(DiagnoseCommand::Sessions);
+    }
+    (!rest.is_empty()).then(|| DiagnoseCommand::Session(rest.to_string()))
+}
+
+fn parse_cleanup_failed_command(text: &str) -> Option<CleanupFailedCommand> {
+    if text.eq_ignore_ascii_case("cleanup failed") || text.eq_ignore_ascii_case("/cleanup failed") {
+        return Some(CleanupFailedCommand::Preview);
+    }
+    let rest = text
+        .strip_prefix("cleanup failed ")
+        .or_else(|| text.strip_prefix("/cleanup failed "))?;
+    let rest = rest.trim();
+    if rest.eq_ignore_ascii_case("all") {
+        return Some(CleanupFailedCommand::All);
+    }
+    (!rest.is_empty()).then(|| CleanupFailedCommand::Session(rest.to_string()))
+}
+
+fn parse_purge_archived_command(text: &str) -> Option<PurgeArchivedCommand> {
+    let rest = text
+        .strip_prefix("purge archived ")
+        .or_else(|| text.strip_prefix("/purge archived "))?
+        .trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let (session_id, confirmed) = match rest.strip_suffix(" confirm") {
+        Some(session_id) => (session_id.trim(), true),
+        None => (rest, false),
+    };
+    (!session_id.is_empty()).then(|| PurgeArchivedCommand {
+        session_id: session_id.to_string(),
+        confirmed,
+    })
+}
+
 fn parse_session_history_page(text: &str) -> Option<usize> {
     if text.eq_ignore_ascii_case("/history") {
         return Some(1);
@@ -1465,6 +1876,9 @@ fn is_control_command(text: &str) -> bool {
         || parse_list_command(text).is_some()
         || parse_resume_local_thread_id(text).is_some()
         || parse_attach_session_id(text).is_some()
+        || parse_diagnose_command(text).is_some()
+        || parse_cleanup_failed_command(text).is_some()
+        || parse_purge_archived_command(text).is_some()
         || text.starts_with("new ")
         || text.starts_with("/new ")
         || text.starts_with("archive ")
@@ -1882,6 +2296,19 @@ impl WorkerState {
         self.thread_to_session
             .insert(session.thread_id.clone(), session.session_id.clone());
         self.sessions.insert(session.session_id.clone(), session);
+    }
+
+    fn remove_session(&mut self, session_id: &str) -> Option<SessionRecord> {
+        let session = self.sessions.remove(session_id)?;
+        self.room_to_session.remove(&session.session_room_id);
+        self.thread_to_session.remove(&session.thread_id);
+        self.remove_pending_approvals_for_session(session_id);
+        Some(session)
+    }
+
+    fn remove_pending_approvals_for_session(&mut self, session_id: &str) {
+        self.pending_approvals
+            .retain(|_, approval| approval.session_id != session_id);
     }
 
     fn remember_event(&mut self, event_id: &str) -> bool {

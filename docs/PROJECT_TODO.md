@@ -14,7 +14,7 @@
 - [done] Run the isolated live Webex E2E procedure with local developer auth from `token.txt`, including dedicated local-only thread creation, `resume local`, `/history`, ordinary session turn, `attach`, and cleanup.
 - [done] Verify real user-originated `/history` and `/history page <n>` commands against a deployed session room.
 - [done] Fix session-room slash command handling for Webex mention-prefixed messages.
-- [pending] Decide how to handle stale failed sessions left behind during bring-up.
+- [done] Add session recovery cleanup commands for stale failed sessions: `diagnose`, `cleanup failed`, and two-step `purge archived ... confirm`.
 - [pending] Improve recovery for previously created Codex threads that are not reloaded by `thread/read` after process restart.
 - [pending] Decide whether to keep the 1:1 direct room as the long-term Data Space shape or switch to a credential model that can replay a shared/group room.
 - [pending] Investigate whether Webex overview cards can be refreshed reliably, or replace them with a safer update strategy.

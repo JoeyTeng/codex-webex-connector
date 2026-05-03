@@ -151,6 +151,13 @@ E2E_MARKER_<shortid> turn 01. Reply with exactly: E2E_MARKER_<shortid> turn 01 o
    - 向临时 control room 发送 `attach <session_id>`。
    - 期望回复显示用户已加入或已在 room 中，并且 session room memberships 再次包含测试用户。
 
+9. Session recovery cleanup：
+   - 向临时 Data Space 写入一个指向不存在 Codex `thread_id` 的测试 session event，或用 runner 预置等价的本地 snapshot。
+   - 启动临时 worker 后发送 `diagnose sessions`，期望回复列出该 failed session 和 missing/unreadable 原因。
+   - 发送 `cleanup failed <session_id>`，期望该 session 被 soft-archive，Webex room 标题变为 `[ARCHIVED] ...`，且 `list` 中状态更新。
+   - 发送 `purge archived <session_id>`，期望只返回 destructive preview，不删除 room。
+   - 发送 `purge archived <session_id> confirm`，期望测试 session room 被删除，且该 session 不再出现在 `list`。
+
 ## 清理
 
 清理顺序：

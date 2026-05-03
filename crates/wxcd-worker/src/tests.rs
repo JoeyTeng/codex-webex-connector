@@ -1,11 +1,19 @@
 use super::{
-    ListCommand, ListMode, RECENT_EVENT_ID_LIMIT, WorkerState, abbreviate,
-    extract_thread_history_turns, normalize_control_command_text, normalize_session_command_text,
-    parse_attach_session_id, parse_list_command, parse_resume_local_thread_id,
-    parse_session_history_page, repo_name_for_cwd, slice_thread_history_page,
+    CleanupFailedCommand, DiagnoseCommand, ListCommand, ListMode, PurgeArchivedCommand,
+    RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerState, abbreviate,
+    apply_thread_probe, ensure_failed_cleanup_target, extract_thread_history_turns,
+    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
+    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
+    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
+    repo_name_for_cwd, session_requires_codex_archive, slice_thread_history_page,
+    validate_purge_archived_session,
 };
+use chrono::Utc;
 use serde_json::json;
-use wxcd_proto::{AppConfig, BridgeConfig, RepoConfig, WebexConfig};
+use wxcd_proto::{
+    AppConfig, BridgeConfig, RepoConfig, SessionFailure, SessionFailureKind, SessionRecord,
+    SessionState, WebexConfig,
+};
 use wxcd_render::ImportedHistoryTurn;
 
 const BOT_EMAIL: &str = "codex-webex-connector@webex.bot";
@@ -48,6 +56,22 @@ fn strips_single_word_mention_prefix() {
             None
         ),
         "attach ses_20260417_abc123"
+    );
+    assert_eq!(
+        normalize_control_command_text("Codex-Webex-Connector diagnose sessions", BOT_EMAIL, None),
+        "diagnose sessions"
+    );
+    assert_eq!(
+        normalize_control_command_text("Codex-Webex-Connector cleanup failed all", BOT_EMAIL, None),
+        "cleanup failed all"
+    );
+    assert_eq!(
+        normalize_control_command_text(
+            "Codex-Webex-Connector purge archived ses_20260417_abc123 confirm",
+            BOT_EMAIL,
+            None
+        ),
+        "purge archived ses_20260417_abc123 confirm"
     );
 }
 
@@ -137,6 +161,46 @@ fn parses_attach_session_command() {
         Some("ses_20260417_abc123")
     );
     assert_eq!(parse_attach_session_id("attach "), None);
+}
+
+#[test]
+fn parses_diagnose_cleanup_and_purge_commands() {
+    assert_eq!(
+        parse_diagnose_command("diagnose sessions"),
+        Some(DiagnoseCommand::Sessions)
+    );
+    assert_eq!(
+        parse_diagnose_command("/diagnose ses_1"),
+        Some(DiagnoseCommand::Session("ses_1".to_string()))
+    );
+    assert_eq!(
+        parse_cleanup_failed_command("cleanup failed"),
+        Some(CleanupFailedCommand::Preview)
+    );
+    assert_eq!(
+        parse_cleanup_failed_command("/cleanup failed all"),
+        Some(CleanupFailedCommand::All)
+    );
+    assert_eq!(
+        parse_cleanup_failed_command("cleanup failed ses_1"),
+        Some(CleanupFailedCommand::Session("ses_1".to_string()))
+    );
+    assert_eq!(
+        parse_purge_archived_command("purge archived ses_1"),
+        Some(PurgeArchivedCommand {
+            session_id: "ses_1".to_string(),
+            confirmed: false
+        })
+    );
+    assert_eq!(
+        parse_purge_archived_command("/purge archived ses_1 confirm"),
+        Some(PurgeArchivedCommand {
+            session_id: "ses_1".to_string(),
+            confirmed: true
+        })
+    );
+    assert_eq!(parse_cleanup_failed_command("cleanup failedness"), None);
+    assert_eq!(parse_purge_archived_command("purge archived "), None);
 }
 
 #[test]
@@ -336,4 +400,127 @@ fn slices_thread_history_pages_newest_first() {
     let page_four = slice_thread_history_page(&turns, 4, 2);
     assert!(page_four.turns.is_empty());
     assert_eq!(page_four.total_turns, 5);
+}
+
+#[test]
+fn failed_sessions_do_not_require_codex_archive() {
+    let failed = session_record("ses_failed", SessionState::Failed, false);
+    let idle = session_record("ses_idle", SessionState::Idle, false);
+
+    assert!(!session_requires_codex_archive(&failed));
+    assert!(session_requires_codex_archive(&idle));
+}
+
+#[test]
+fn validates_failed_cleanup_targets() {
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_failed", SessionState::Failed, false));
+    state.upsert_session(session_record("ses_idle", SessionState::Idle, false));
+    state.upsert_session(session_record("ses_archived", SessionState::Archived, true));
+
+    assert!(ensure_failed_cleanup_target(&state, "ses_failed").is_ok());
+    assert!(ensure_failed_cleanup_target(&state, "ses_idle").is_err());
+    assert!(ensure_failed_cleanup_target(&state, "ses_archived").is_err());
+    assert!(ensure_failed_cleanup_target(&state, "ses_missing").is_err());
+}
+
+#[test]
+fn validates_archived_purge_targets() {
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_archived", SessionState::Archived, true));
+    state.upsert_session(session_record("ses_idle", SessionState::Idle, false));
+
+    assert!(validate_purge_archived_session(&state, "ses_archived").is_ok());
+    assert!(validate_purge_archived_session(&state, "ses_idle").is_err());
+    assert!(validate_purge_archived_session(&state, "ses_missing").is_err());
+}
+
+#[test]
+fn applies_thread_probe_state_transitions() {
+    let idle = session_record("ses_idle", SessionState::Idle, false);
+    let missing = ThreadProbe {
+        kind: ThreadProbeKind::MissingThread,
+        message: "missing".to_string(),
+    };
+    let updated = apply_thread_probe(&idle, &missing, Utc::now()).unwrap();
+    assert_eq!(updated.state, SessionState::Failed);
+    assert_eq!(
+        updated.failure.as_ref().map(|failure| &failure.kind),
+        Some(&SessionFailureKind::MissingThread)
+    );
+
+    let readable = ThreadProbe {
+        kind: ThreadProbeKind::Readable,
+        message: "readable".to_string(),
+    };
+    let recovered = apply_thread_probe(&updated, &readable, Utc::now()).unwrap();
+    assert_eq!(recovered.state, SessionState::Idle);
+    assert!(recovered.failure.is_none());
+
+    let unavailable = ThreadProbe {
+        kind: ThreadProbeKind::ProbeUnavailable,
+        message: "probe unavailable".to_string(),
+    };
+    assert!(apply_thread_probe(&recovered, &unavailable, Utc::now()).is_none());
+
+    let archived = session_record("ses_archived", SessionState::Archived, true);
+    assert!(apply_thread_probe(&archived, &missing, Utc::now()).is_none());
+}
+
+#[test]
+fn remove_session_cleans_indexes_and_approvals() {
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Archived, true));
+    state.pending_approvals.insert(
+        "apr_1".to_string(),
+        wxcd_proto::PendingApproval {
+            approval_id: "apr_1".to_string(),
+            session_id: "ses_1".to_string(),
+            thread_id: "thread-ses_1".to_string(),
+            turn_id: "turn".to_string(),
+            codex_request_id: json!(1),
+            item_id: "item".to_string(),
+            kind: wxcd_proto::ApprovalKind::CommandExecution,
+            reason: None,
+            command: None,
+            cwd: None,
+            requested_permissions: None,
+            card_message_id: None,
+            requested_at: Utc::now(),
+        },
+    );
+
+    let removed = state.remove_session("ses_1").unwrap();
+    assert_eq!(removed.session_id, "ses_1");
+    assert!(state.sessions.is_empty());
+    assert!(state.room_to_session.is_empty());
+    assert!(state.thread_to_session.is_empty());
+    assert!(state.pending_approvals.is_empty());
+}
+
+fn session_record(session_id: &str, state: SessionState, archived: bool) -> SessionRecord {
+    let failure = (state == SessionState::Failed).then(|| SessionFailure {
+        kind: SessionFailureKind::MissingThread,
+        message: "missing".to_string(),
+        detected_at: Utc::now(),
+    });
+    SessionRecord {
+        session_id: session_id.to_string(),
+        title: format!("WXCD {session_id} repo"),
+        repo_name: "repo".to_string(),
+        repo_path: "/tmp/repo".to_string(),
+        owner_email: "user@example.com".to_string(),
+        session_room_id: format!("room-{session_id}"),
+        session_room_web_link: None,
+        thread_id: format!("thread-{session_id}"),
+        overview_message_id: None,
+        state,
+        last_checkpoint: None,
+        last_final: None,
+        active_turn_id: None,
+        active_turn_buffer: String::new(),
+        updated_at: Utc::now(),
+        archived,
+        failure,
+    }
 }

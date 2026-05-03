@@ -5,7 +5,7 @@ use chrono::Utc;
 use tracing::warn;
 use wxcd_proto::{
     ApprovalDecision, BridgeEvent, BridgeEventEnvelope, BridgeSnapshot, PendingApproval,
-    SessionRecord,
+    SessionRecord, SessionState,
 };
 use wxcd_webex::{CreateMessageRequest, Message, WebexClient};
 
@@ -201,7 +201,15 @@ impl ReplayState {
             BridgeEvent::SessionArchived { session_id, .. } => {
                 if let Some(session) = self.sessions.get_mut(&session_id) {
                     session.archived = true;
+                    session.state = SessionState::Archived;
                 }
+                self.pending_approvals
+                    .retain(|_, approval| approval.session_id != session_id);
+            }
+            BridgeEvent::SessionPurged { session_id, .. } => {
+                self.sessions.remove(&session_id);
+                self.pending_approvals
+                    .retain(|_, approval| approval.session_id != session_id);
             }
             BridgeEvent::ApprovalRequested { approval } => {
                 self.pending_approvals
@@ -366,6 +374,41 @@ mod tests {
         assert!(!replay_page_exceeds_limit(100, 49, 50));
     }
 
+    #[test]
+    fn replay_purge_removes_session_and_related_approvals() {
+        let mut replay = ReplayState::default();
+        replay.sessions.insert(
+            "ses_1".to_string(),
+            session_record("ses_1", "Example", "thread", SessionState::Archived),
+        );
+        replay.pending_approvals.insert(
+            "apr_1".to_string(),
+            PendingApproval {
+                approval_id: "apr_1".to_string(),
+                session_id: "ses_1".to_string(),
+                thread_id: "thread".to_string(),
+                turn_id: "turn".to_string(),
+                codex_request_id: serde_json::json!(1),
+                item_id: "item".to_string(),
+                kind: ApprovalKind::CommandExecution,
+                reason: None,
+                command: None,
+                cwd: None,
+                requested_permissions: None,
+                card_message_id: None,
+                requested_at: Utc::now(),
+            },
+        );
+
+        replay.apply(BridgeEvent::SessionPurged {
+            session_id: "ses_1".to_string(),
+            purged_at: Utc::now(),
+        });
+
+        assert!(replay.sessions.is_empty());
+        assert!(replay.pending_approvals.is_empty());
+    }
+
     fn session_record(
         session_id: &str,
         title: &str,
@@ -389,6 +432,7 @@ mod tests {
             active_turn_buffer: String::new(),
             updated_at: Utc::now(),
             archived: false,
+            failure: None,
         }
     }
 

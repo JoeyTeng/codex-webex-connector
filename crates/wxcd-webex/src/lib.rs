@@ -350,6 +350,13 @@ async fn decode_empty_response(response: reqwest::Response) -> Result<()> {
         .text()
         .await
         .context("failed to read response body")?;
+    decode_empty_response_body(status, body)
+}
+
+fn decode_empty_response_body(status: StatusCode, body: String) -> Result<()> {
+    if status == StatusCode::NOT_FOUND {
+        return Ok(());
+    }
     if !status.is_success() {
         if status == StatusCode::UNAUTHORIZED {
             bail!("webex API returned 401 unauthorized");
@@ -393,7 +400,7 @@ fn decode_membership_response(status: StatusCode, body: String) -> Result<Ensure
 
 #[cfg(test)]
 mod tests {
-    use super::{EnsureMembership, decode_membership_response};
+    use super::{EnsureMembership, decode_empty_response_body, decode_membership_response};
     use reqwest::StatusCode;
 
     #[test]
@@ -434,6 +441,15 @@ mod tests {
         )
         .expect_err("non-idempotent membership errors should be returned");
         assert!(error.to_string().contains("403"));
+    }
+
+    #[test]
+    fn treats_delete_room_not_found_as_success() {
+        decode_empty_response_body(
+            StatusCode::NOT_FOUND,
+            r#"{"message":"Not Found"}"#.to_string(),
+        )
+        .expect("delete room should be idempotent");
     }
 
     #[test]

@@ -15,6 +15,21 @@ pub enum SessionState {
     Archived,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionFailureKind {
+    MissingThread,
+    UnreadableThread,
+    ProbeUnavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionFailure {
+    pub kind: SessionFailureKind,
+    pub message: String,
+    pub detected_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub session_id: String,
@@ -33,6 +48,8 @@ pub struct SessionRecord {
     pub active_turn_buffer: String,
     pub updated_at: DateTime<Utc>,
     pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<SessionFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +98,10 @@ pub enum BridgeEvent {
     SessionArchived {
         session_id: String,
         archived_at: DateTime<Utc>,
+    },
+    SessionPurged {
+        session_id: String,
+        purged_at: DateTime<Utc>,
     },
     ApprovalRequested {
         approval: PendingApproval,
@@ -157,8 +178,9 @@ pub fn generate_session_id(now: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
+    use serde_json::json;
 
-    use super::generate_session_id;
+    use super::{SessionRecord, generate_session_id};
 
     #[test]
     fn session_id_has_expected_shape() {
@@ -170,5 +192,30 @@ mod tests {
         );
         assert!(id.starts_with("ses_20260408_"));
         assert_eq!(id.len(), "ses_20260408_".len() + 10);
+    }
+
+    #[test]
+    fn session_record_failure_metadata_is_backward_compatible() {
+        let value = json!({
+            "session_id": "ses_1",
+            "title": "WXCD ses_1 repo",
+            "repo_name": "repo",
+            "repo_path": "/tmp/repo",
+            "owner_email": "user@example.com",
+            "session_room_id": "room",
+            "session_room_web_link": null,
+            "thread_id": "thread",
+            "overview_message_id": null,
+            "state": "idle",
+            "last_checkpoint": null,
+            "last_final": null,
+            "active_turn_id": null,
+            "active_turn_buffer": "",
+            "updated_at": "2026-04-08T12:00:00Z",
+            "archived": false
+        });
+
+        let session: SessionRecord = serde_json::from_value(value).unwrap();
+        assert!(session.failure.is_none());
     }
 }
