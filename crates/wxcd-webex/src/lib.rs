@@ -44,6 +44,14 @@ pub struct Membership {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Person {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub emails: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AttachmentAction {
     pub id: String,
     pub message_id: Option<String>,
@@ -131,6 +139,10 @@ impl WebexClient {
             .build()
             .context("failed to build webex client")?;
         Ok(Self { inner })
+    }
+
+    pub async fn get_me(&self) -> Result<Person> {
+        self.get(&format!("{BASE_URL}/people/me")).await
     }
 
     pub async fn resolve_room_reference(&self, room_ref: &str) -> Result<Room> {

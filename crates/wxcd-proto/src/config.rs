@@ -23,6 +23,7 @@ pub struct AppConfig {
 pub struct WebexConfig {
     pub bot_token: String,
     pub bot_email: String,
+    pub bot_display_name: Option<String>,
     pub control_room_ref: String,
     pub data_room_ref: String,
     pub allowed_user_emails: Vec<String>,
@@ -55,8 +56,12 @@ struct FileConfig {
 impl AppConfig {
     pub fn load() -> Result<Self> {
         if let Some(env_path) = env::var_os("WXCD_ENV_PATH") {
-            dotenvy::from_path(&env_path)
-                .with_context(|| format!("failed to load env file {}", PathBuf::from(&env_path).display()))?;
+            dotenvy::from_path(&env_path).with_context(|| {
+                format!(
+                    "failed to load env file {}",
+                    PathBuf::from(&env_path).display()
+                )
+            })?;
         } else {
             dotenvy::dotenv().ok();
         }
@@ -74,6 +79,7 @@ impl AppConfig {
 
         let bot_token = required_env("WEBEX_BOT_TOKEN")?;
         let bot_email = required_env("WEBEX_BOT_EMAIL")?;
+        let bot_display_name = optional_env("WEBEX_BOT_DISPLAY_NAME");
         let control_room_ref = required_env("WEBEX_CONTROL_ROOM_SPACE_LINK")?;
         let data_room_ref = required_env("WEBEX_DATA_ROOM_SPACE_LINK")?;
         let allowed_user_emails = required_env("WEBEX_ALLOWED_USER_EMAILS")?
@@ -86,13 +92,10 @@ impl AppConfig {
             bail!("WEBEX_ALLOWED_USER_EMAILS must contain at least one email");
         }
 
-        let state_dir = expand_tilde(
-            file_config
-                .state_dir
-                .unwrap_or_else(|| {
-                    "~/Library/Application Support/codex-webex-connector".to_string()
-                }),
-        )?;
+        let state_dir =
+            expand_tilde(file_config.state_dir.unwrap_or_else(|| {
+                "~/Library/Application Support/codex-webex-connector".to_string()
+            }))?;
         let socket_path = expand_tilde(
             file_config
                 .socket_path
@@ -107,7 +110,10 @@ impl AppConfig {
                     .and_then(|value| value.to_str())
                     .unwrap_or("codex-webex-connector")
                     .to_string();
-                vec![RepoConfig { name: repo_name, path: cwd }]
+                vec![RepoConfig {
+                    name: repo_name,
+                    path: cwd,
+                }]
             }
         };
 
@@ -115,6 +121,7 @@ impl AppConfig {
             webex: WebexConfig {
                 bot_token,
                 bot_email: bot_email.to_ascii_lowercase(),
+                bot_display_name,
                 control_room_ref,
                 data_room_ref,
                 allowed_user_emails,
@@ -151,6 +158,10 @@ impl AppConfig {
 
 fn required_env(name: &str) -> Result<String> {
     env::var(name).with_context(|| format!("missing required environment variable {name}"))
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn discover_config_path() -> Result<Option<PathBuf>> {

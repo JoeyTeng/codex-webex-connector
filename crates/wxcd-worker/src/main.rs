@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    let config = AppConfig::load()?;
+    let mut config = AppConfig::load()?;
     tokio::fs::create_dir_all(&config.bridge.state_dir)
         .await
         .with_context(|| {
@@ -105,6 +105,16 @@ async fn run() -> Result<()> {
     remove_stale_socket(&config.bridge.socket_path).await?;
 
     let webex = WebexClient::new(&config.webex.bot_token)?;
+    if config.webex.bot_display_name.is_none() {
+        match webex.get_me().await {
+            Ok(person) => {
+                config.webex.bot_display_name = person.display_name;
+            }
+            Err(error) => {
+                warn!("failed to resolve Webex bot display name: {error:#}");
+            }
+        }
+    }
     let control_room = webex
         .resolve_room_reference(&config.webex.control_room_ref)
         .await
@@ -244,7 +254,11 @@ async fn handle_control_message(
     codex: &mut CodexClient,
     message: &WebexMessageEvent,
 ) -> Result<()> {
-    let text = normalize_control_command_text(message.text.trim());
+    let text = normalize_control_command_text(
+        message.text.trim(),
+        &config.webex.bot_email,
+        config.webex.bot_display_name.as_deref(),
+    );
     let owner_email = message.person_email.to_ascii_lowercase();
     if matches_help_command(text) {
         send_plain_message(webex, &message.room_id, render_help()).await?;
@@ -612,8 +626,13 @@ async fn handle_session_message(
         bail!("unknown session `{session_id}`");
     };
     let trimmed = text.trim();
+    let command_text = normalize_session_command_text(
+        trimmed,
+        &config.webex.bot_email,
+        config.webex.bot_display_name.as_deref(),
+    );
 
-    if let Some(page) = parse_session_history_page(trimmed) {
+    if let Some(page) = parse_session_history_page(command_text) {
         match read_thread_history(codex, &session.thread_id).await {
             Ok(turns) => {
                 let history = slice_thread_history_page(&turns, page, HISTORY_PAGE_SIZE);
@@ -642,7 +661,7 @@ async fn handle_session_message(
         return Ok(());
     }
 
-    match trimmed {
+    match command_text {
         "help" | "/help" => {
             send_plain_message(webex, &session.session_room_id, render_help()).await?;
             return Ok(());
@@ -1372,9 +1391,38 @@ fn parse_session_history_page(text: &str) -> Option<usize> {
     (page > 0).then_some(page)
 }
 
-fn normalize_control_command_text(text: &str) -> &str {
+fn normalize_session_command_text<'a>(
+    text: &'a str,
+    bot_email: &str,
+    bot_display_name: Option<&str>,
+) -> &'a str {
+    normalize_prefixed_command_text(text, bot_email, bot_display_name, is_session_command)
+}
+
+fn is_session_command(text: &str) -> bool {
+    parse_session_history_page(text).is_some()
+        || matches!(
+            text,
+            "help" | "/help" | "/status" | "/resume" | "/pause" | "/stop"
+        )
+}
+
+fn normalize_control_command_text<'a>(
+    text: &'a str,
+    bot_email: &str,
+    bot_display_name: Option<&str>,
+) -> &'a str {
+    normalize_prefixed_command_text(text, bot_email, bot_display_name, is_control_command)
+}
+
+fn normalize_prefixed_command_text<'a>(
+    text: &'a str,
+    bot_email: &str,
+    bot_display_name: Option<&str>,
+    is_command: fn(&str) -> bool,
+) -> &'a str {
     let trimmed = text.trim();
-    if is_control_command(trimmed) {
+    if is_command(trimmed) {
         return trimmed;
     }
 
@@ -1383,12 +1431,33 @@ fn normalize_control_command_text(text: &str) -> &str {
             continue;
         }
         let candidate = trimmed[index..].trim_start();
-        if is_control_command(candidate) {
+        let prefix = trimmed[..index].trim();
+        if is_bot_mention_prefix(prefix, bot_email, bot_display_name) && is_command(candidate) {
             return candidate;
         }
     }
 
     trimmed
+}
+
+fn is_bot_mention_prefix(prefix: &str, bot_email: &str, bot_display_name: Option<&str>) -> bool {
+    let Some(local_part) = bot_email.split('@').next() else {
+        return false;
+    };
+    let normalized_prefix = normalize_mention_name(prefix);
+    if normalized_prefix.is_empty() {
+        return false;
+    }
+    normalized_prefix == normalize_mention_name(local_part)
+        || bot_display_name.is_some_and(|name| normalized_prefix == normalize_mention_name(name))
+}
+
+fn normalize_mention_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn is_control_command(text: &str) -> bool {

@@ -140,7 +140,10 @@ async fn wait_for_worker_health(socket_path: &Path) -> Result<()> {
                     }
                 }
                 Err(error) => {
-                    warn!("waiting for worker socket {}: {error:#}", socket_path.display());
+                    warn!(
+                        "waiting for worker socket {}: {error:#}",
+                        socket_path.display()
+                    );
                 }
             }
             sleep(Duration::from_secs(1)).await;

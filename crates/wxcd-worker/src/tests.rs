@@ -1,41 +1,52 @@
 use super::{
     ListCommand, ListMode, RECENT_EVENT_ID_LIMIT, WorkerState, abbreviate,
-    extract_thread_history_turns, normalize_control_command_text, parse_attach_session_id,
-    parse_list_command, parse_resume_local_thread_id, parse_session_history_page,
-    repo_name_for_cwd, slice_thread_history_page,
+    extract_thread_history_turns, normalize_control_command_text, normalize_session_command_text,
+    parse_attach_session_id, parse_list_command, parse_resume_local_thread_id,
+    parse_session_history_page, repo_name_for_cwd, slice_thread_history_page,
 };
 use serde_json::json;
 use wxcd_proto::{AppConfig, BridgeConfig, RepoConfig, WebexConfig};
 use wxcd_render::ImportedHistoryTurn;
 
+const BOT_EMAIL: &str = "codex-webex-connector@webex.bot";
+const BOT_DISPLAY_NAME: &str = "Codex Webex Connector";
+
 #[test]
 fn strips_single_word_mention_prefix() {
     assert_eq!(
-        normalize_control_command_text("Codex-Webex-Connector list"),
+        normalize_control_command_text("Codex-Webex-Connector list", BOT_EMAIL, None),
         "list"
     );
     assert_eq!(
-        normalize_control_command_text("Codex-Webex-Connector list local"),
+        normalize_control_command_text("Codex-Webex-Connector list local", BOT_EMAIL, None),
         "list local"
     );
     assert_eq!(
-        normalize_control_command_text("Codex-Webex-Connector list local page 2"),
+        normalize_control_command_text("Codex-Webex-Connector list local page 2", BOT_EMAIL, None),
         "list local page 2"
     );
     assert_eq!(
-        normalize_control_command_text("Codex-Webex-Connector /help"),
+        normalize_control_command_text("Codex-Webex-Connector /help", BOT_EMAIL, None),
         "/help"
     );
     assert_eq!(
-        normalize_control_command_text("Codex-Webex-Connector new repo :: task"),
+        normalize_control_command_text("Codex-Webex-Connector new repo :: task", BOT_EMAIL, None),
         "new repo :: task"
     );
     assert_eq!(
-        normalize_control_command_text("Codex-Webex-Connector resume local 019d6eff"),
+        normalize_control_command_text(
+            "Codex-Webex-Connector resume local 019d6eff",
+            BOT_EMAIL,
+            None
+        ),
         "resume local 019d6eff"
     );
     assert_eq!(
-        normalize_control_command_text("Codex-Webex-Connector attach ses_20260417_abc123"),
+        normalize_control_command_text(
+            "Codex-Webex-Connector attach ses_20260417_abc123",
+            BOT_EMAIL,
+            None
+        ),
         "attach ses_20260417_abc123"
     );
 }
@@ -43,14 +54,29 @@ fn strips_single_word_mention_prefix() {
 #[test]
 fn strips_multi_word_mention_prefix() {
     assert_eq!(
-        normalize_control_command_text("Codex Webex Connector /list"),
+        normalize_control_command_text("Codex Webex Connector /list", BOT_EMAIL, None),
+        "/list"
+    );
+    assert_eq!(
+        normalize_control_command_text(
+            "Bridge Controller /list",
+            BOT_EMAIL,
+            Some("Bridge Controller")
+        ),
         "/list"
     );
 }
 
 #[test]
 fn leaves_non_commands_untouched() {
-    assert_eq!(normalize_control_command_text("hello there"), "hello there");
+    assert_eq!(
+        normalize_control_command_text("hello there", BOT_EMAIL, None),
+        "hello there"
+    );
+    assert_eq!(
+        normalize_control_command_text("please list", BOT_EMAIL, None),
+        "please list"
+    );
 }
 
 #[test]
@@ -122,6 +148,38 @@ fn parses_session_history_command() {
 }
 
 #[test]
+fn normalizes_session_commands_with_bot_mention_prefix() {
+    assert_eq!(
+        normalize_session_command_text("Codex-Webex-Connector /history", BOT_EMAIL, None),
+        "/history"
+    );
+    assert_eq!(
+        normalize_session_command_text("Codex Webex Connector /history page 2", BOT_EMAIL, None),
+        "/history page 2"
+    );
+    assert_eq!(
+        normalize_session_command_text("Codex-Webex-Connector /status", BOT_EMAIL, None),
+        "/status"
+    );
+    assert_eq!(
+        normalize_session_command_text(
+            "Bridge Controller /history",
+            BOT_EMAIL,
+            Some("Bridge Controller")
+        ),
+        "/history"
+    );
+    assert_eq!(
+        normalize_session_command_text("hello there", BOT_EMAIL, Some(BOT_DISPLAY_NAME)),
+        "hello there"
+    );
+    assert_eq!(
+        normalize_session_command_text("please /status", BOT_EMAIL, Some(BOT_DISPLAY_NAME)),
+        "please /status"
+    );
+}
+
+#[test]
 fn abbreviates_utf8_text_on_character_boundaries() {
     let input = "\u{4f60}\u{597d}".repeat(60);
     let abbreviated = abbreviate(&input, 80);
@@ -149,6 +207,7 @@ fn derives_repo_name_from_configured_path() {
         webex: WebexConfig {
             bot_token: "token".to_string(),
             bot_email: "bot@example.com".to_string(),
+            bot_display_name: Some("Test Bot".to_string()),
             control_room_ref: "control".to_string(),
             data_room_ref: "data".to_string(),
             allowed_user_emails: vec!["user@example.com".to_string()],

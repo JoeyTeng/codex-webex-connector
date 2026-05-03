@@ -104,6 +104,16 @@ E2E_MARKER_<shortid> turn 01. Reply with exactly: E2E_MARKER_<shortid> turn 01 o
 
 所有用户消息都通过 developer bearer 发送到临时 Webex rooms，等待 bot 真实 Webex 回复并用 Webex REST 读取确认。
 
+通过 Webex REST 发 group-room 测试消息时，应同时发送 plain `text` 和带 bot mention 的 `markdown`。`markdown` 用于触发 bot realtime 事件，`text` 用于让 worker 看到不带 mention 前缀的原始命令或 prompt。Worker 会在启动时用 bot token 读取 Webex bot display name，并在 command 解析前接受 display-name 或 bot-email local-part 形式的 mention 前缀。
+
+```json
+{
+  "roomId": "<room_id>",
+  "text": "/history",
+  "markdown": "<@personId:<bot_id>|<bot_display_name>> /history"
+}
+```
+
 1. Control help：
    - 向临时 control room 发送 `/help`。
    - 期望 bot 回复包含 `Control room commands:` 和 `resume local <thread_id>`。

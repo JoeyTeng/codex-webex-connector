@@ -72,10 +72,19 @@ pub struct PendingApproval {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BridgeEvent {
-    SessionCreated { session: SessionRecord },
-    SessionUpdated { session: SessionRecord },
-    SessionArchived { session_id: String, archived_at: DateTime<Utc> },
-    ApprovalRequested { approval: PendingApproval },
+    SessionCreated {
+        session: SessionRecord,
+    },
+    SessionUpdated {
+        session: SessionRecord,
+    },
+    SessionArchived {
+        session_id: String,
+        archived_at: DateTime<Utc>,
+    },
+    ApprovalRequested {
+        approval: PendingApproval,
+    },
     ApprovalResolved {
         approval_id: String,
         session_id: String,
