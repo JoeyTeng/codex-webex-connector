@@ -11,11 +11,13 @@
 - The deployed sidecar now has a Mercury watchdog: if Webex realtime ingress falls into an unrecoverable disconnect state, the sidecar exits non-zero so supervisor restarts the bridge instead of leaving it falsely "up but deaf".
 - The deployed sidecar now uses unique Webex webhook/message ids for ingress deduplication, so consecutive control-room commands like `/help` then `/list` are not incorrectly dropped as duplicates.
 - Reliability hardening is deployed in release `2026-05-03T17-25-10`: worker turn checkpoints are UTF-8 safe, new/resumed session creation fails visibly if the user cannot be added to the Webex session room, transient `Invalid roomId` membership errors retry before failing, membership failure cleanup removes the just-created Webex room and archives an unbound new Codex thread, Data Space replay pages back until it finds the latest snapshot or exhausts the room, ingress deduplication keeps only the most recent 1024 event ids, and strict workspace clippy is back to green.
+- The isolated live Webex E2E procedure is documented in `docs/WEBEX_E2E_TEST_PLAN.md`, covering temporary rooms, temporary worker/sidecar, dedicated local-only Codex thread creation, `resume local`, `/history`, ordinary session turns, `attach`, and cleanup.
 
 ## Active Handoff
 - Phase: deployed
 - Summary: The bridge can create Webex session rooms, start Codex threads, attach existing local-only threads, re-attach a user to an existing bridge session room, and page through prior Codex turn history inside the session room. Data Space recovery no longer depends on the old group room; the deployed launch agent now replays state from the bot-owner 1:1 direct room, pages through older Data Space messages when needed, falls back to the local snapshot if replay fails, and bounds ingress deduplication memory. Session creation now fails closed on real membership errors while retrying transient new-room propagation failures. The Webex sidecar now self-recovers from the observed Mercury disconnect failure mode, and control-room commands are no longer deduplicated on the non-unique SDK event label.
 - Next Steps:
+  - Run the isolated live E2E flow documented in `docs/WEBEX_E2E_TEST_PLAN.md` using the developer auth in local `token.txt`, without committing or printing credentials.
   - Verify one real user-originated `/history` or `/history page <n>` command from Webex proper, now that synthetic ingress plus user-token room replay confirmed the full path.
   - Decide whether to keep or archive the earlier failed recovery sessions in the existing control/session spaces.
   - Improve session recovery for previously created threads that `codex app-server` does not reload by `thread/read`.
@@ -50,8 +52,10 @@
 - Fixed sidecar ingress deduplication so control-room commands use the unique webhook/message id instead of the non-unique SDK event label.
 - Added control-room `attach <session_id>` so the command sender can rejoin an existing bridge session room, with idempotent Webex membership handling for already-present users.
 - Hardened bridge reliability: made worker checkpoint abbreviation safe for non-ASCII input, made session-room membership failures propagate as command-visible errors, retried transient new-room membership propagation, cleaned up failed room/thread side effects, added bounded paginated Data Space replay before falling back to the local snapshot, bounded worker ingress dedupe to the latest 1024 event ids, and cleaned strict clippy warnings.
+- Documented the isolated live Webex E2E runbook for future validation without touching production rooms or committing local credentials.
 
 ## Next Steps
+- Run `docs/WEBEX_E2E_TEST_PLAN.md` end to end with the local developer auth in `token.txt`.
 - Confirm one real Webex `/history` or `/history page <n>` command against a deployed session room, now that synthetic ingress and direct room replay are covered.
 - Decide whether to add cleanup or archival handling for stale failed sessions left behind during bring-up.
 

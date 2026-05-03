@@ -10,6 +10,8 @@
 - [done] Fix control-room ingress deduplication so consecutive commands are keyed by unique Webex message/webhook ids instead of the SDK event label.
 - [done] Add control-room `attach <session_id>` so a user can rejoin an existing bridge session room after leaving it.
 - [done] Harden bridge replay and session handling: UTF-8-safe checkpoint abbreviation, visible new/resume membership failures with transient membership retry and cleanup, paginated Data Space replay, bounded ingress dedupe, and restored strict workspace clippy.
+- [done] Document the isolated live Webex E2E procedure in `docs/WEBEX_E2E_TEST_PLAN.md`.
+- [pending] Run the isolated live Webex E2E procedure with local developer auth from `token.txt`, including dedicated local-only thread creation, `resume local`, `/history`, ordinary session turn, `attach`, and cleanup.
 - [pending] Verify one real user-originated `/history` or `/history page <n>` command against the deployed launchd-managed session room.
 - [pending] Decide how to handle stale failed sessions left behind during bring-up.
 - [pending] Improve recovery for previously created Codex threads that are not reloaded by `thread/read` after process restart.
