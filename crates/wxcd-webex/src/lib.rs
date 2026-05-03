@@ -4,6 +4,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::time::{Duration, sleep};
+use url::Url;
 
 const BASE_URL: &str = "https://webexapis.com/v1";
 
@@ -174,6 +175,15 @@ impl WebexClient {
         .await
     }
 
+    pub async fn delete_room(&self, room_id: &str) -> Result<()> {
+        let response = self
+            .inner
+            .delete(format!("{BASE_URL}/rooms/{room_id}"))
+            .send()
+            .await?;
+        decode_empty_response(response).await
+    }
+
     pub async fn create_membership(&self, room_id: &str, person_email: &str) -> Result<Membership> {
         self.post(
             &format!("{BASE_URL}/memberships"),
@@ -190,21 +200,32 @@ impl WebexClient {
         room_id: &str,
         person_email: &str,
     ) -> Result<EnsureMembership> {
-        let response = self
-            .inner
-            .post(&format!("{BASE_URL}/memberships"))
-            .json(&CreateMembershipRequest {
-                room_id,
-                person_email,
-            })
-            .send()
-            .await?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("failed to read response body")?;
-        decode_membership_response(status, body)
+        let url = format!("{BASE_URL}/memberships");
+        let mut delay = Duration::from_millis(250);
+        for attempt in 0..5 {
+            let response = self
+                .inner
+                .post(&url)
+                .json(&CreateMembershipRequest {
+                    room_id,
+                    person_email,
+                })
+                .send()
+                .await?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .context("failed to read response body")?;
+            if is_transient_invalid_room(status, &body) && attempt < 4 {
+                sleep(delay).await;
+                delay *= 2;
+                continue;
+            }
+            return decode_membership_response(status, body);
+        }
+
+        unreachable!("ensure_membership retry loop exhausted unexpectedly")
     }
 
     pub async fn create_message(&self, request: &CreateMessageRequest) -> Result<Message> {
@@ -221,7 +242,7 @@ impl WebexClient {
                 return serde_json::from_str(&body)
                     .with_context(|| format!("failed to decode Webex response body: {body}"));
             }
-            if status == StatusCode::BAD_REQUEST && body.contains("Invalid roomId") && attempt < 4 {
+            if is_transient_invalid_room(status, &body) && attempt < 4 {
                 sleep(delay).await;
                 delay *= 2;
                 continue;
@@ -242,8 +263,27 @@ impl WebexClient {
     }
 
     pub async fn list_messages(&self, room_id: &str, max: usize) -> Result<Vec<Message>> {
+        self.list_messages_page(room_id, max, None).await
+    }
+
+    pub async fn list_messages_page(
+        &self,
+        room_id: &str,
+        max: usize,
+        before_message: Option<&str>,
+    ) -> Result<Vec<Message>> {
+        let mut url = Url::parse(&format!("{BASE_URL}/messages"))
+            .context("failed to build messages list URL")?;
+        url.query_pairs_mut()
+            .append_pair("roomId", room_id)
+            .append_pair("max", &max.to_string());
+        if let Some(before_message) = before_message {
+            url.query_pairs_mut()
+                .append_pair("beforeMessage", before_message);
+        }
+
         let response: ItemsResponse<Message> = self
-            .get(&format!("{BASE_URL}/messages?roomId={room_id}&max={max}"))
+            .get(url.as_str())
             .await
             .context("failed to list room messages")?;
         Ok(response.items)
@@ -292,6 +332,21 @@ async fn decode_response<T: DeserializeOwned>(response: reqwest::Response) -> Re
     decode_response_body(status, body)
 }
 
+async fn decode_empty_response(response: reqwest::Response) -> Result<()> {
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read response body")?;
+    if !status.is_success() {
+        if status == StatusCode::UNAUTHORIZED {
+            bail!("webex API returned 401 unauthorized");
+        }
+        bail!("webex API returned {status}: {body}");
+    }
+    Ok(())
+}
+
 fn decode_response_body<T: DeserializeOwned>(status: StatusCode, body: String) -> Result<T> {
     if !status.is_success() {
         if status == StatusCode::UNAUTHORIZED {
@@ -301,6 +356,10 @@ fn decode_response_body<T: DeserializeOwned>(status: StatusCode, body: String) -
     }
     serde_json::from_str(&body)
         .with_context(|| format!("failed to decode Webex response body: {body}"))
+}
+
+fn is_transient_invalid_room(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::BAD_REQUEST && body.contains("Invalid roomId")
 }
 
 fn decode_membership_response(status: StatusCode, body: String) -> Result<EnsureMembership> {
@@ -353,5 +412,27 @@ mod tests {
         )
         .expect("already-member bad request should be idempotent");
         assert_eq!(result, EnsureMembership::AlreadyPresent);
+    }
+
+    #[test]
+    fn returns_other_membership_errors() {
+        let error = decode_membership_response(
+            StatusCode::FORBIDDEN,
+            r#"{"message":"Forbidden"}"#.to_string(),
+        )
+        .expect_err("non-idempotent membership errors should be returned");
+        assert!(error.to_string().contains("403"));
+    }
+
+    #[test]
+    fn detects_transient_invalid_room_errors() {
+        assert!(super::is_transient_invalid_room(
+            StatusCode::BAD_REQUEST,
+            r#"{"message":"Invalid roomId"}"#
+        ));
+        assert!(!super::is_transient_invalid_room(
+            StatusCode::BAD_REQUEST,
+            r#"{"message":"Membership already exists"}"#
+        ));
     }
 }

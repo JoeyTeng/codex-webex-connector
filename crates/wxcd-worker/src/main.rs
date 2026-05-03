@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -31,6 +31,7 @@ use wxcd_webex::{CreateMessageRequest, EnsureMembership, UpdateMessageRequest, W
 const LOCAL_THREAD_PAGE_SIZE: usize = 20;
 const HISTORY_PAGE_SIZE: usize = 10;
 const IMPORTED_HISTORY_TURN_LIMIT: usize = HISTORY_PAGE_SIZE;
+const RECENT_EVENT_ID_LIMIT: usize = 1024;
 
 #[derive(Parser)]
 struct Args {}
@@ -42,6 +43,7 @@ struct WorkerState {
     thread_to_session: HashMap<String, String>,
     pending_approvals: HashMap<String, PendingApproval>,
     recent_event_ids: HashSet<String>,
+    recent_event_queue: VecDeque<String>,
     events_since_snapshot: usize,
 }
 
@@ -69,6 +71,14 @@ struct LocalOnlyThreads {
 struct ImportedThreadHistory {
     turns: Vec<ImportedHistoryTurn>,
     total_turns: usize,
+}
+
+struct CreateBridgeSessionInput<'a> {
+    owner_email: &'a str,
+    repo_name: &'a str,
+    repo_path: &'a str,
+    thread_id: &'a str,
+    checkpoint: &'a str,
 }
 
 #[tokio::main]
@@ -307,18 +317,39 @@ async fn handle_control_message(
             .ok_or_else(|| anyhow!("local Codex thread `{thread_id}` is missing cwd"))?;
         let repo_name = repo_name_for_cwd(config, &cwd);
         let checkpoint = format!("Attached local Codex thread `{thread_id}`.");
-        let session = create_bridge_session(
+        let session = match create_bridge_session(
             config,
             webex,
             event_log,
             state,
-            &owner_email,
-            &repo_name,
-            &cwd,
-            thread_id,
-            &checkpoint,
+            CreateBridgeSessionInput {
+                owner_email: &owner_email,
+                repo_name: &repo_name,
+                repo_path: &cwd,
+                thread_id,
+                checkpoint: &checkpoint,
+            },
         )
-        .await?;
+        .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                if let Err(archive_error) = codex.thread_archive(thread_id).await {
+                    warn!(
+                        "failed to archive unbound Codex thread {} after session creation failed: {archive_error:#}",
+                        thread_id
+                    );
+                }
+                send_plain_message(
+                    webex,
+                    &message.room_id,
+                    &format!("Failed to create session room or add `{owner_email}`: {error:#}"),
+                )
+                .await
+                .ok();
+                return Err(error);
+            }
+        };
         if let Err(error) = import_local_thread_history(
             webex,
             &session.session_room_id,
@@ -419,18 +450,33 @@ async fn handle_control_message(
         )
         .await?;
     let thread_id = json_str(&thread, "/thread/id")?;
-    let session = create_bridge_session(
+    let session = match create_bridge_session(
         config,
         webex,
         event_log,
         state,
-        &owner_email,
-        &repo.name,
-        cwd,
-        thread_id,
-        "Session created.",
+        CreateBridgeSessionInput {
+            owner_email: &owner_email,
+            repo_name: &repo.name,
+            repo_path: cwd,
+            thread_id,
+            checkpoint: "Session created.",
+        },
     )
-    .await?;
+    .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            send_plain_message(
+                webex,
+                &message.room_id,
+                &format!("Failed to create session room or add `{owner_email}`: {error:#}"),
+            )
+            .await
+            .ok();
+            return Err(error);
+        }
+    };
 
     if let Err(error) = send_plain_message(
         webex,
@@ -469,34 +515,48 @@ async fn create_bridge_session(
     webex: &WebexClient,
     event_log: &EventLog<'_>,
     state: &mut WorkerState,
-    owner_email: &str,
-    repo_name: &str,
-    repo_path: &str,
-    thread_id: &str,
-    checkpoint: &str,
+    input: CreateBridgeSessionInput<'_>,
 ) -> Result<SessionRecord> {
     let session_id = generate_session_id(Utc::now());
     let title = format!(
         "{} {} {}",
-        config.bridge.session_title_prefix, session_id, repo_name
+        config.bridge.session_title_prefix, session_id, input.repo_name
     );
     let room = webex.create_room(&title).await?;
-    if !owner_email.eq_ignore_ascii_case(&config.webex.bot_email) {
-        webex.create_membership(&room.id, owner_email).await.ok();
+    if !input
+        .owner_email
+        .eq_ignore_ascii_case(&config.webex.bot_email)
+        && let Err(error) = webex
+            .ensure_membership(&room.id, input.owner_email)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to add `{}` to Webex session room `{}`",
+                    input.owner_email, room.id
+                )
+            })
+    {
+        if let Err(cleanup_error) = webex.delete_room(&room.id).await {
+            warn!(
+                "failed to delete Webex room {} after membership failure: {cleanup_error:#}",
+                room.id
+            );
+        }
+        return Err(error);
     }
 
     let mut session = SessionRecord {
         session_id,
         title,
-        repo_name: repo_name.to_string(),
-        repo_path: repo_path.to_string(),
-        owner_email: owner_email.to_string(),
+        repo_name: input.repo_name.to_string(),
+        repo_path: input.repo_path.to_string(),
+        owner_email: input.owner_email.to_string(),
         session_room_id: room.id.clone(),
         session_room_web_link: room.web_link.clone(),
-        thread_id: thread_id.to_string(),
+        thread_id: input.thread_id.to_string(),
         overview_message_id: None,
         state: SessionState::Creating,
-        last_checkpoint: Some(checkpoint.to_string()),
+        last_checkpoint: Some(input.checkpoint.to_string()),
         last_final: None,
         active_turn_id: None,
         active_turn_buffer: String::new(),
@@ -739,58 +799,58 @@ async fn handle_codex_event(
         CodexEvent::Notification { method, params } => match method.as_str() {
             "thread/status/changed" => {
                 let thread_id = json_str(&params, "/threadId")?;
-                if let Some(session_id) = state.thread_to_session.get(thread_id).cloned() {
-                    if let Some(session) = state.sessions.get_mut(&session_id) {
-                        let status = params
-                            .pointer("/status/type")
-                            .and_then(Value::as_str)
-                            .unwrap_or("idle");
-                        session.state = match status {
-                            "active" => SessionState::Running,
-                            "idle" if session.archived => SessionState::Archived,
-                            "idle" if session.last_final.is_some() => SessionState::Completed,
-                            _ => SessionState::Idle,
-                        };
-                        session.updated_at = Utc::now();
-                        let updated = session.clone();
-                        let _ = session;
-                        state.upsert_session(updated.clone());
-                        persist_event(
-                            event_log,
-                            state,
-                            BridgeEvent::SessionUpdated {
-                                session: updated.clone(),
-                            },
-                            config,
-                        )
-                        .await?;
-                        refresh_overview(webex, &updated).await?;
-                    }
+                if let Some(session_id) = state.thread_to_session.get(thread_id).cloned()
+                    && let Some(session) = state.sessions.get_mut(&session_id)
+                {
+                    let status = params
+                        .pointer("/status/type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("idle");
+                    session.state = match status {
+                        "active" => SessionState::Running,
+                        "idle" if session.archived => SessionState::Archived,
+                        "idle" if session.last_final.is_some() => SessionState::Completed,
+                        _ => SessionState::Idle,
+                    };
+                    session.updated_at = Utc::now();
+                    let updated = session.clone();
+                    let _ = session;
+                    state.upsert_session(updated.clone());
+                    persist_event(
+                        event_log,
+                        state,
+                        BridgeEvent::SessionUpdated {
+                            session: updated.clone(),
+                        },
+                        config,
+                    )
+                    .await?;
+                    refresh_overview(webex, &updated).await?;
                 }
             }
             "turn/started" => {
                 let thread_id = json_str(&params, "/threadId")?;
                 let turn_id = json_str(&params, "/turn/id")?;
-                if let Some(session_id) = state.thread_to_session.get(thread_id).cloned() {
-                    if let Some(session) = state.sessions.get_mut(&session_id) {
-                        session.active_turn_id = Some(turn_id.to_string());
-                        session.active_turn_buffer.clear();
-                        session.state = SessionState::Running;
-                        session.updated_at = Utc::now();
-                        let updated = session.clone();
-                        let _ = session;
-                        state.upsert_session(updated.clone());
-                        persist_event(
-                            event_log,
-                            state,
-                            BridgeEvent::SessionUpdated {
-                                session: updated.clone(),
-                            },
-                            config,
-                        )
-                        .await?;
-                        refresh_overview(webex, &updated).await?;
-                    }
+                if let Some(session_id) = state.thread_to_session.get(thread_id).cloned()
+                    && let Some(session) = state.sessions.get_mut(&session_id)
+                {
+                    session.active_turn_id = Some(turn_id.to_string());
+                    session.active_turn_buffer.clear();
+                    session.state = SessionState::Running;
+                    session.updated_at = Utc::now();
+                    let updated = session.clone();
+                    let _ = session;
+                    state.upsert_session(updated.clone());
+                    persist_event(
+                        event_log,
+                        state,
+                        BridgeEvent::SessionUpdated {
+                            session: updated.clone(),
+                        },
+                        config,
+                    )
+                    .await?;
+                    refresh_overview(webex, &updated).await?;
                 }
             }
             "item/agentMessage/delta" => {
@@ -799,36 +859,36 @@ async fn handle_codex_event(
                     .get("delta")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if let Some(session_id) = state.thread_to_session.get(thread_id).cloned() {
-                    if let Some(session) = state.sessions.get_mut(&session_id) {
-                        session.active_turn_buffer.push_str(delta);
-                    }
+                if let Some(session_id) = state.thread_to_session.get(thread_id).cloned()
+                    && let Some(session) = state.sessions.get_mut(&session_id)
+                {
+                    session.active_turn_buffer.push_str(delta);
                 }
             }
             "turn/completed" => {
                 let thread_id = json_str(&params, "/threadId")?;
-                if let Some(session_id) = state.thread_to_session.get(thread_id).cloned() {
-                    if let Some(session) = state.sessions.get_mut(&session_id) {
-                        session.state = SessionState::Completed;
-                        session.last_final = Some(session.active_turn_buffer.trim().to_string());
-                        session.active_turn_id = None;
-                        session.updated_at = Utc::now();
-                        let updated = session.clone();
-                        let summary = render_final_summary(&updated);
-                        let _ = session;
-                        state.upsert_session(updated.clone());
-                        send_plain_message(webex, &updated.session_room_id, &summary).await?;
-                        persist_event(
-                            event_log,
-                            state,
-                            BridgeEvent::SessionUpdated {
-                                session: updated.clone(),
-                            },
-                            config,
-                        )
-                        .await?;
-                        refresh_overview(webex, &updated).await?;
-                    }
+                if let Some(session_id) = state.thread_to_session.get(thread_id).cloned()
+                    && let Some(session) = state.sessions.get_mut(&session_id)
+                {
+                    session.state = SessionState::Completed;
+                    session.last_final = Some(session.active_turn_buffer.trim().to_string());
+                    session.active_turn_id = None;
+                    session.updated_at = Utc::now();
+                    let updated = session.clone();
+                    let summary = render_final_summary(&updated);
+                    let _ = session;
+                    state.upsert_session(updated.clone());
+                    send_plain_message(webex, &updated.session_room_id, &summary).await?;
+                    persist_event(
+                        event_log,
+                        state,
+                        BridgeEvent::SessionUpdated {
+                            session: updated.clone(),
+                        },
+                        config,
+                    )
+                    .await?;
+                    refresh_overview(webex, &updated).await?;
                 }
             }
             _ => {}
@@ -1382,7 +1442,7 @@ async fn collect_local_only_threads(
         cursor = Some(next_cursor);
     }
 
-    local_only.sort_by(|lhs, rhs| rhs.updated_at.cmp(&lhs.updated_at));
+    local_only.sort_by_key(|thread| std::cmp::Reverse(thread.updated_at));
     let total_count = local_only.len();
     let offset = (page - 1) * LOCAL_THREAD_PAGE_SIZE;
     let items = if offset < local_only.len() {
@@ -1606,267 +1666,6 @@ fn slice_thread_history_page(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        ListCommand, ListMode, extract_thread_history_turns, normalize_control_command_text,
-        parse_attach_session_id, parse_list_command, parse_resume_local_thread_id,
-        parse_session_history_page, repo_name_for_cwd, slice_thread_history_page,
-    };
-    use serde_json::json;
-    use wxcd_proto::{AppConfig, BridgeConfig, RepoConfig, WebexConfig};
-    use wxcd_render::ImportedHistoryTurn;
-
-    #[test]
-    fn strips_single_word_mention_prefix() {
-        assert_eq!(
-            normalize_control_command_text("Codex-Webex-Connector list"),
-            "list"
-        );
-        assert_eq!(
-            normalize_control_command_text("Codex-Webex-Connector list local"),
-            "list local"
-        );
-        assert_eq!(
-            normalize_control_command_text("Codex-Webex-Connector list local page 2"),
-            "list local page 2"
-        );
-        assert_eq!(
-            normalize_control_command_text("Codex-Webex-Connector /help"),
-            "/help"
-        );
-        assert_eq!(
-            normalize_control_command_text("Codex-Webex-Connector new repo :: task"),
-            "new repo :: task"
-        );
-        assert_eq!(
-            normalize_control_command_text("Codex-Webex-Connector resume local 019d6eff"),
-            "resume local 019d6eff"
-        );
-        assert_eq!(
-            normalize_control_command_text("Codex-Webex-Connector attach ses_20260417_abc123"),
-            "attach ses_20260417_abc123"
-        );
-    }
-
-    #[test]
-    fn strips_multi_word_mention_prefix() {
-        assert_eq!(
-            normalize_control_command_text("Codex Webex Connector /list"),
-            "/list"
-        );
-    }
-
-    #[test]
-    fn leaves_non_commands_untouched() {
-        assert_eq!(normalize_control_command_text("hello there"), "hello there");
-    }
-
-    #[test]
-    fn parses_list_commands() {
-        assert_eq!(
-            parse_list_command("list"),
-            Some(ListCommand {
-                mode: ListMode::Bridge,
-                page: 1
-            })
-        );
-        assert_eq!(
-            parse_list_command("/list"),
-            Some(ListCommand {
-                mode: ListMode::Bridge,
-                page: 1
-            })
-        );
-        assert_eq!(
-            parse_list_command("list local"),
-            Some(ListCommand {
-                mode: ListMode::Local,
-                page: 1
-            })
-        );
-        assert_eq!(
-            parse_list_command("/list all page 3"),
-            Some(ListCommand {
-                mode: ListMode::All,
-                page: 3
-            })
-        );
-        assert_eq!(parse_list_command("list whatever"), None);
-        assert_eq!(parse_list_command("list local page 0"), None);
-    }
-
-    #[test]
-    fn parses_resume_local_command() {
-        assert_eq!(
-            parse_resume_local_thread_id("resume local 019d6eff"),
-            Some("019d6eff")
-        );
-        assert_eq!(
-            parse_resume_local_thread_id("/resume local 019d6eff"),
-            Some("019d6eff")
-        );
-        assert_eq!(parse_resume_local_thread_id("resume local "), None);
-    }
-
-    #[test]
-    fn parses_attach_session_command() {
-        assert_eq!(
-            parse_attach_session_id("attach ses_20260417_abc123"),
-            Some("ses_20260417_abc123")
-        );
-        assert_eq!(
-            parse_attach_session_id("/attach ses_20260417_abc123"),
-            Some("ses_20260417_abc123")
-        );
-        assert_eq!(parse_attach_session_id("attach "), None);
-    }
-
-    #[test]
-    fn parses_session_history_command() {
-        assert_eq!(parse_session_history_page("/history"), Some(1));
-        assert_eq!(parse_session_history_page("/history page 3"), Some(3));
-        assert_eq!(parse_session_history_page("/history page 0"), None);
-        assert_eq!(parse_session_history_page("history"), None);
-    }
-
-    #[test]
-    fn derives_repo_name_from_configured_path() {
-        let config = AppConfig {
-            webex: WebexConfig {
-                bot_token: "token".to_string(),
-                bot_email: "bot@example.com".to_string(),
-                control_room_ref: "control".to_string(),
-                data_room_ref: "data".to_string(),
-                allowed_user_emails: vec!["user@example.com".to_string()],
-            },
-            bridge: BridgeConfig {
-                socket_path: "/tmp/wxcd.sock".into(),
-                state_dir: "/tmp".into(),
-                session_title_prefix: "WXCD".to_string(),
-                approval_policy: "on-request".to_string(),
-                sandbox_mode: "workspace-write".to_string(),
-                snapshot_interval: 20,
-                developer_instructions: "test".to_string(),
-                config_path: None,
-            },
-            repos: vec![RepoConfig {
-                name: "codex-webex-connector".to_string(),
-                path: "/Users/hoteng/Program/GitHub/codex-webex-connector".into(),
-            }],
-        };
-
-        assert_eq!(
-            repo_name_for_cwd(
-                &config,
-                "/Users/hoteng/Program/GitHub/codex-webex-connector/subdir"
-            ),
-            "codex-webex-connector"
-        );
-        assert_eq!(
-            repo_name_for_cwd(&config, "/tmp/random-repo"),
-            "random-repo"
-        );
-    }
-
-    #[test]
-    fn extracts_thread_history_turns_from_thread_read() {
-        let thread = json!({
-            "thread": {
-                "turns": [
-                    {
-                        "items": [
-                            {
-                                "type": "userMessage",
-                                "content": [
-                                    { "type": "text", "text": "first prompt" }
-                                ]
-                            },
-                            {
-                                "type": "agentMessage",
-                                "phase": "commentary",
-                                "text": "working"
-                            },
-                            {
-                                "type": "agentMessage",
-                                "phase": "final_answer",
-                                "text": "first answer"
-                            }
-                        ]
-                    },
-                    {
-                        "items": [
-                            {
-                                "type": "userMessage",
-                                "content": [
-                                    { "type": "text", "text": "second prompt" }
-                                ]
-                            },
-                            {
-                                "type": "agentMessage",
-                                "phase": "final_answer",
-                                "text": "second answer"
-                            }
-                        ]
-                    }
-                ]
-            }
-        });
-
-        let history = extract_thread_history_turns(&thread);
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].user_text, "first prompt");
-        assert_eq!(history[0].assistant_text.as_deref(), Some("first answer"));
-        assert_eq!(history[1].user_text, "second prompt");
-        assert_eq!(history[1].assistant_text.as_deref(), Some("second answer"));
-    }
-
-    #[test]
-    fn slices_thread_history_pages_newest_first() {
-        let turns = vec![
-            ImportedHistoryTurn {
-                user_text: "turn 1".to_string(),
-                assistant_text: Some("answer 1".to_string()),
-            },
-            ImportedHistoryTurn {
-                user_text: "turn 2".to_string(),
-                assistant_text: Some("answer 2".to_string()),
-            },
-            ImportedHistoryTurn {
-                user_text: "turn 3".to_string(),
-                assistant_text: Some("answer 3".to_string()),
-            },
-            ImportedHistoryTurn {
-                user_text: "turn 4".to_string(),
-                assistant_text: Some("answer 4".to_string()),
-            },
-            ImportedHistoryTurn {
-                user_text: "turn 5".to_string(),
-                assistant_text: Some("answer 5".to_string()),
-            },
-        ];
-
-        let page_one = slice_thread_history_page(&turns, 1, 2);
-        assert_eq!(page_one.total_turns, 5);
-        assert_eq!(page_one.turns.len(), 2);
-        assert_eq!(page_one.turns[0].user_text, "turn 4");
-        assert_eq!(page_one.turns[1].user_text, "turn 5");
-
-        let page_two = slice_thread_history_page(&turns, 2, 2);
-        assert_eq!(page_two.turns.len(), 2);
-        assert_eq!(page_two.turns[0].user_text, "turn 2");
-        assert_eq!(page_two.turns[1].user_text, "turn 3");
-
-        let page_three = slice_thread_history_page(&turns, 3, 2);
-        assert_eq!(page_three.turns.len(), 1);
-        assert_eq!(page_three.turns[0].user_text, "turn 1");
-
-        let page_four = slice_thread_history_page(&turns, 4, 2);
-        assert!(page_four.turns.is_empty());
-        assert_eq!(page_four.total_turns, 5);
-    }
-}
-
 fn build_pending_approval(
     state: &WorkerState,
     codex_request_id: Value,
@@ -1943,10 +1742,13 @@ fn json_str<'a>(value: &'a Value, pointer: &str) -> Result<&'a str> {
 }
 
 fn abbreviate(value: &str, limit: usize) -> String {
-    if value.len() <= limit {
-        return value.to_string();
+    let mut chars = value.chars();
+    let abbreviated = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        format!("{abbreviated}...")
+    } else {
+        abbreviated
     }
-    format!("{}...", &value[..limit])
 }
 
 fn is_ignored_sender(config: &AppConfig, person_email: &str) -> bool {
@@ -2014,7 +1816,19 @@ impl WorkerState {
     }
 
     fn remember_event(&mut self, event_id: &str) -> bool {
-        self.recent_event_ids.insert(event_id.to_string())
+        if self.recent_event_ids.contains(event_id) {
+            return false;
+        }
+
+        let event_id = event_id.to_string();
+        self.recent_event_ids.insert(event_id.clone());
+        self.recent_event_queue.push_back(event_id);
+        while self.recent_event_queue.len() > RECENT_EVENT_ID_LIMIT {
+            if let Some(evicted) = self.recent_event_queue.pop_front() {
+                self.recent_event_ids.remove(&evicted);
+            }
+        }
+        true
     }
 
     fn to_replay_state(&self) -> ReplayState {
@@ -2025,3 +1839,6 @@ impl WorkerState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

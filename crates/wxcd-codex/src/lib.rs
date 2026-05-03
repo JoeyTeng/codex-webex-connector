@@ -292,23 +292,23 @@ async fn read_stdout(
                     continue;
                 };
 
-                if let Some(id) = value.get("id").and_then(Value::as_u64) {
-                    if value.get("result").is_some() || value.get("error").is_some() {
-                        let sender = pending.lock().await.remove(&id);
-                        if let Some(sender) = sender {
-                            let result = if let Some(result) = value.get("result") {
-                                Ok(result.clone())
-                            } else {
-                                let error = value
-                                    .get("error")
-                                    .cloned()
-                                    .unwrap_or_else(|| json!({"message":"unknown JSON-RPC error"}));
-                                Err(anyhow!("JSON-RPC error: {error}"))
-                            };
-                            let _ = sender.send(result);
-                        }
-                        continue;
+                if let Some(id) = value.get("id").and_then(Value::as_u64)
+                    && (value.get("result").is_some() || value.get("error").is_some())
+                {
+                    let sender = pending.lock().await.remove(&id);
+                    if let Some(sender) = sender {
+                        let result = if let Some(result) = value.get("result") {
+                            Ok(result.clone())
+                        } else {
+                            let error = value
+                                .get("error")
+                                .cloned()
+                                .unwrap_or_else(|| json!({"message":"unknown JSON-RPC error"}));
+                            Err(anyhow!("JSON-RPC error: {error}"))
+                        };
+                        let _ = sender.send(result);
                     }
+                    continue;
                 }
 
                 let Some(method) = value.get("method").and_then(Value::as_str) else {
