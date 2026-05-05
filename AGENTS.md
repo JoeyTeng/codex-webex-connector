@@ -11,9 +11,11 @@
 
 ## 项目记录文档
 
-* TODO 列表：`docs/PROJECT_TODO.md`
-* 当前状态与下一步：`docs/PROJECT_STATE.md`
-* 每次会话结束后更新上述文档，并在每次提交时同步提交到仓库。
+* `docs/PROJECT_STATE.md` 和 `docs/PROJECT_TODO.md` 是简短入口，只保留当前状态、下一步和跨任务 backlog。
+* 持久的 per-workstream 状态、历史证据和迁移快照放在 `docs/project_journal/YYYY/MM/*.md`。
+* `docs/project_journal/INDEX.md` 是本地生成的 ignored 索引，不能提交。
+* 不要把 top-level trackers 重新扩张成长篇状态文件；需要更多上下文时，在入口文件中链接到对应 journal。
+* 每次会话结束后更新最小必要的记录层，并在每次提交时同步提交相关文档。
 
 ---
 
