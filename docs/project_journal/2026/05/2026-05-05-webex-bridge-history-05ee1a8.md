@@ -3,9 +3,9 @@ id: 20260505-webex-bridge-history-05ee1a8
 title: Webex Bridge Completed History
 status: completed
 created: 2026-05-05
-updated: 2026-05-05
+updated: 2026-05-06
 branch: codex/project-journal-migration-review
-pr:
+pr: https://github.com/JoeyTeng/codex-webex-connector/pull/1
 supersedes: []
 superseded_by:
 ---
@@ -49,6 +49,7 @@ superseded_by:
 - Recovery cleanup proof: `cargo test`, `cargo clippy --workspace --all-targets -- -D warnings`, and `bash scripts/smoke-test.sh` passed on `2026-05-03`; helper-backed review findings were fixed; isolated recovery E2E on release `2026-05-03T23-45-56` verified `diagnose sessions`, `cleanup failed`, archived-session diagnosis no-mutation, purge preview, confirmed purge, and final `list`; release `2026-05-03T23-53-10` was installed and production health stayed healthy.
 
 ## Related Docs
+- Migration PR: https://github.com/JoeyTeng/codex-webex-connector/pull/1
 - Commands reference: `docs/COMMANDS.md`
 - Isolated live E2E runbook: `docs/WEBEX_E2E_TEST_PLAN.md`
 - Original design pointer from legacy tracker: `plan.md`

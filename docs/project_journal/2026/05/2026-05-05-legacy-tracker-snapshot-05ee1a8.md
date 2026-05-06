@@ -3,9 +3,9 @@ id: 20260505-legacy-tracker-snapshot-05ee1a8
 title: Legacy Tracker Snapshot
 status: completed
 created: 2026-05-05
-updated: 2026-05-05
+updated: 2026-05-06
 branch: codex/project-journal-migration-review
-pr:
+pr: https://github.com/JoeyTeng/codex-webex-connector/pull/1
 supersedes: []
 superseded_by:
 ---
@@ -14,6 +14,7 @@ superseded_by:
 
 ## Summary
 - This entry preserves the complete pre-migration contents of `docs/PROJECT_STATE.md` and `docs/PROJECT_TODO.md` from commit `05ee1a8`.
+- Evidence: https://github.com/JoeyTeng/codex-webex-connector/pull/1
 
 ## Original docs/PROJECT_STATE.md
 
