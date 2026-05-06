@@ -11,9 +11,14 @@
 
 ## 项目记录文档
 
-* TODO 列表：`docs/PROJECT_TODO.md`
-* 当前状态与下一步：`docs/PROJECT_STATE.md`
-* 每次会话结束后更新上述文档，并在每次提交时同步提交到仓库。
+* `docs/PROJECT_STATE.md` 和 `docs/PROJECT_TODO.md` 是简短入口，只保留当前状态、下一步和跨任务 backlog。
+* 持久的 per-workstream 状态、历史证据和迁移快照放在 `docs/project_journal/YYYY/MM/*.md`。
+* `docs/project_journal/INDEX.md` 是本地生成的 ignored 索引，不能提交。
+* 不要把 top-level trackers 重新扩张成长篇状态文件；需要更多上下文时，在入口文件中链接到对应 journal。
+* 本仓库是 squash-merge-only；tracked journal docs 应描述 PR 落地后的目标分支状态，而不是 PR 过程中的临时状态。
+* 如果 PR 完整结束某个 workstream，merge 前将对应 journal `status` 标为 `completed`，并把 PR link 作为 evidence；不要在 tracked docs 中留下 “waiting for merge”、“not merged yet” 或 “ready for review” 等状态。
+* PR 过程状态放在 PR body/checklist/comments；如果 PR 只完成较大 workstream 的一部分，journal 保持 `active` 或 `blocked`，并记录真实剩余 next steps。
+* 每次会话结束后更新最小必要的记录层，并在每次提交时同步提交相关文档。
 
 ---
 
