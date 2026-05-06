@@ -4,7 +4,7 @@ title: Legacy Tracker Snapshot
 status: completed
 created: 2026-05-05
 updated: 2026-05-06
-branch: codex/project-journal-migration-review
+branch: master
 pr: https://github.com/JoeyTeng/codex-webex-connector/pull/1
 supersedes: []
 superseded_by:

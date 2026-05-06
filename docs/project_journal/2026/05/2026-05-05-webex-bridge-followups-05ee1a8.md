@@ -4,7 +4,7 @@ title: Webex Bridge Follow-ups
 status: active
 created: 2026-05-05
 updated: 2026-05-05
-branch: codex/project-journal-migration-review
+branch: master
 pr:
 supersedes: []
 superseded_by:
