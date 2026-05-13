@@ -29,3 +29,4 @@ superseded_by:
 - Final review: helper-backed `codex-review` on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..30ec21f` found missing runtime handshake and missing `CBTH_*` env support; the follow-up fix adds supervisor startup hello and cbth env derivation.
 - Final review follow-up: clear-context review on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..0b1daa2` found the runtime supervisor hello still lacked a timeout; the follow-up fix bounds startup plugin RPC hello.
 - Final review follow-up: clear-context review on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..de1d5c7` found installed manifest paths could become stale across releases; the follow-up fix uses stable `current/plugin/manifest.json` resolution.
+- Final review follow-up: clear-context review on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..4703e98` found cbth runtime identity was shadowed by installed `plugin_instance_id = "standalone"`; the follow-up fix lets `CBTH_PLUGIN_STARTED_AT` override file config.

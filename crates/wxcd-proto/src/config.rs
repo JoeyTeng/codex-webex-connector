@@ -254,8 +254,8 @@ fn build_cbth_plugin_config(
         .transpose()?
         .unwrap_or_else(|| state_dir.join("plugin"));
     let plugin_instance_id = optional_env("WXCD_PLUGIN_INSTANCE_ID")
-        .or_else(|| file_config.and_then(|config| config.plugin_instance_id.clone()))
         .or_else(|| optional_env("CBTH_PLUGIN_STARTED_AT").map(|value| format!("cbth-{value}")))
+        .or_else(|| file_config.and_then(|config| config.plugin_instance_id.clone()))
         .unwrap_or_else(|| "standalone".to_string());
     let plugin_release_id = optional_env("CBTH_PLUGIN_RELEASE_ID")
         .or_else(|| optional_env("WXCD_PLUGIN_RELEASE_ID"))
@@ -489,6 +489,29 @@ manifest_path = "plugin/manifest.json"
         remove_env("CBTH_PLUGIN_RPC_SOCKET");
         remove_env("CBTH_PLUGIN_HOME");
         remove_env("CBTH_PLUGIN_RELEASE_ID");
+        remove_env("CBTH_PLUGIN_STARTED_AT");
+    }
+
+    #[test]
+    fn cbth_environment_instance_id_overrides_installed_config() {
+        let _guard = env_guard();
+        clear_cbth_env();
+        set_env("CBTH_PLUGIN_RPC_SOCKET", "/tmp/cbth.sock");
+        set_env("CBTH_PLUGIN_STARTED_AT", "456");
+        let file_config: FileConfig = toml::from_str(
+            r#"
+[cbth_plugin]
+plugin_instance_id = "standalone"
+"#,
+        )
+        .unwrap();
+
+        let config = build_bridge_config(&file_config, None).unwrap();
+
+        assert!(config.cbth_plugin.enabled);
+        assert_eq!(config.cbth_plugin.plugin_instance_id, "cbth-456");
+
+        remove_env("CBTH_PLUGIN_RPC_SOCKET");
         remove_env("CBTH_PLUGIN_STARTED_AT");
     }
 
