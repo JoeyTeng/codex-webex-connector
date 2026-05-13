@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
+use tokio::time::{Duration, timeout};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use wxcd_cbth_rpc::{
@@ -39,6 +40,7 @@ const HISTORY_PAGE_SIZE: usize = 10;
 const IMPORTED_HISTORY_TURN_LIMIT: usize = HISTORY_PAGE_SIZE;
 const RECENT_EVENT_ID_LIMIT: usize = 1024;
 const INSTALLATION_IDENTITY_FILE: &str = "installation-identity.json";
+const PLUGIN_RPC_DOCTOR_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Parser)]
 struct Args {
@@ -425,10 +427,6 @@ async fn diagnose_plugin_rpc(config: &CbthPluginConfig) -> RpcStatus {
         return RpcStatus::MissingSocketPath;
     };
 
-    let mut client = match PluginRpcClient::connect(socket_path).await {
-        Ok(client) => client,
-        Err(error) => return RpcStatus::HelloFailed(format!("{error:#}")),
-    };
     let request = PluginHelloRequest {
         plugin_name: "webex-connector".to_string(),
         plugin_instance_id: config.plugin_instance_id.clone(),
@@ -441,11 +439,20 @@ async fn diagnose_plugin_rpc(config: &CbthPluginConfig) -> RpcStatus {
         plugin_home: config.plugin_home.display().to_string(),
         pid: std::process::id(),
     };
-    match client.plugin_hello(request).await {
-        Ok(response) => RpcStatus::HelloOk {
+    match timeout(PLUGIN_RPC_DOCTOR_TIMEOUT, async {
+        let mut client = PluginRpcClient::connect(socket_path).await?;
+        client.plugin_hello(request).await
+    })
+    .await
+    {
+        Ok(Ok(response)) => RpcStatus::HelloOk {
             protocol_version: response.protocol_version,
         },
-        Err(error) => RpcStatus::HelloFailed(format!("{error:#}")),
+        Ok(Err(error)) => RpcStatus::HelloFailed(format!("{error:#}")),
+        Err(_) => RpcStatus::HelloFailed(format!(
+            "plugin hello timed out after {}s",
+            PLUGIN_RPC_DOCTOR_TIMEOUT.as_secs()
+        )),
     }
 }
 

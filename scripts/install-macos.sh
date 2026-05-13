@@ -16,7 +16,7 @@ if [[ ! -f "${repo_root}/.env" ]]; then
   exit 1
 fi
 
-mkdir -p "${release_dir}/bin" "${release_dir}/sidecars/webex-ws-sidecar" "${config_dir}" "${state_dir}/logs" "${HOME}/Library/LaunchAgents"
+mkdir -p "${release_dir}/bin" "${release_dir}/plugin" "${release_dir}/sidecars/webex-ws-sidecar" "${config_dir}" "${state_dir}/logs" "${HOME}/Library/LaunchAgents"
 
 pushd "${repo_root}" >/dev/null
 cargo build --release --package wxcd-worker --package wxcd-supervisor
@@ -26,11 +26,15 @@ popd >/dev/null
 
 cp "${target_dir}/release/wxcd-worker" "${release_dir}/bin/"
 cp "${target_dir}/release/wxcd-supervisor" "${release_dir}/bin/"
+rsync -a "${repo_root}/plugin/" "${release_dir}/plugin/"
 rsync -a "${repo_root}/sidecars/webex-ws-sidecar/" "${release_dir}/sidecars/webex-ws-sidecar/"
 
 if [[ ! -f "${config_dir}/wxcd.toml" ]]; then
-  sed "s|/Users/hoteng/Program/GitHub/codex-webex-connector|${repo_root}|g" \
-    "${repo_root}/wxcd.example.toml" > "${config_dir}/wxcd.toml"
+  sed \
+    -e "s|/Users/hoteng/Program/GitHub/codex-webex-connector|${repo_root}|g" \
+    -e "s|manifest_path = \"plugin/manifest.json\"|manifest_path = \"${release_dir}/plugin/manifest.json\"|g" \
+    "${repo_root}/wxcd.example.toml" \
+    > "${config_dir}/wxcd.toml"
 fi
 
 cp "${repo_root}/.env" "${env_path}"

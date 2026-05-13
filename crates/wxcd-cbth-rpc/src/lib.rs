@@ -397,8 +397,8 @@ mod tests {
     }
 
     fn test_socket_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "wxcd-cbth-rpc-{name}-{}-{}.sock",
+        PathBuf::from("/tmp").join(format!(
+            "wxcd-{name}-{}-{}.sock",
             std::process::id(),
             rand_suffix()
         ))

@@ -204,7 +204,11 @@ fn build_bridge_config(
             .clone()
             .unwrap_or_else(|| "/tmp/wxcd.sock".to_string()),
     )?;
-    let cbth_plugin = build_cbth_plugin_config(file_config.cbth_plugin.as_ref(), &state_dir)?;
+    let cbth_plugin = build_cbth_plugin_config(
+        file_config.cbth_plugin.as_ref(),
+        &state_dir,
+        config_path.as_deref(),
+    )?;
 
     Ok(BridgeConfig {
         socket_path,
@@ -234,6 +238,7 @@ fn build_bridge_config(
 fn build_cbth_plugin_config(
     file_config: Option<&FileCbthPluginConfig>,
     state_dir: &Path,
+    config_path: Option<&Path>,
 ) -> Result<CbthPluginConfig> {
     let enabled = env_bool("WXCD_CBTH_PLUGIN")
         .or_else(|| file_config.and_then(|config| config.enabled))
@@ -258,6 +263,14 @@ fn build_cbth_plugin_config(
         .map(expand_tilde)
         .transpose()?
         .unwrap_or_else(|| PathBuf::from("plugin/manifest.json"));
+    let manifest_path = if manifest_path.is_relative() {
+        config_path
+            .and_then(Path::parent)
+            .map(|parent| parent.join(&manifest_path))
+            .unwrap_or(manifest_path)
+    } else {
+        manifest_path
+    };
 
     Ok(CbthPluginConfig {
         enabled,
@@ -407,5 +420,24 @@ manifest_path = "plugin/manifest.json"
         );
         assert_eq!(config.cbth_plugin.plugin_instance_id, "instance-1");
         assert_eq!(config.cbth_plugin.plugin_release_id, "release-1");
+    }
+
+    #[test]
+    fn relative_manifest_path_resolves_from_config_directory() {
+        let file_config: FileConfig = toml::from_str(
+            r#"
+[cbth_plugin]
+manifest_path = "plugin/manifest.json"
+"#,
+        )
+        .unwrap();
+
+        let config =
+            build_bridge_config(&file_config, Some("/tmp/wxcd/config/wxcd.toml".into())).unwrap();
+
+        assert_eq!(
+            config.cbth_plugin.manifest_path.to_string_lossy(),
+            "/tmp/wxcd/config/plugin/manifest.json"
+        );
     }
 }
