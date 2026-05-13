@@ -2709,7 +2709,7 @@ impl WorkerState {
     ) -> bool {
         let mut changed = false;
         for local_session in local_replay.sessions.into_values() {
-            if !session_is_claimable_local_mirror(&local_session, installation_id) {
+            if !local_session_is_claimable_mirror_evidence(&local_session, installation_id) {
                 continue;
             }
             if !claim_scope.allows(&local_session) {
@@ -2718,6 +2718,9 @@ impl WorkerState {
             let Some(session) = self.sessions.get_mut(&local_session.session_id) else {
                 continue;
             };
+            if !remote_session_accepts_local_mirror_claim(session, installation_id) {
+                continue;
+            }
             if session.authority.is_none() {
                 session.authority = Some(SessionAuthority {
                     installation_id: installation_id.to_string(),
@@ -2842,14 +2845,24 @@ impl LocalMirrorClaimScope<'_> {
     }
 }
 
-fn session_is_claimable_local_mirror(session: &SessionRecord, installation_id: &str) -> bool {
-    session.authority.as_ref().is_none_or(|authority| {
-        authority.installation_id == installation_id
-            || session
-                .local_mirror
-                .as_ref()
-                .is_some_and(|mirror| mirror.installation_id == installation_id)
-    })
+fn local_session_is_claimable_mirror_evidence(
+    session: &SessionRecord,
+    installation_id: &str,
+) -> bool {
+    session
+        .authority
+        .as_ref()
+        .is_none_or(|authority| authority.installation_id == installation_id)
+}
+
+fn remote_session_accepts_local_mirror_claim(
+    session: &SessionRecord,
+    installation_id: &str,
+) -> bool {
+    session
+        .authority
+        .as_ref()
+        .is_none_or(|authority| authority.installation_id == installation_id)
 }
 
 #[cfg(test)]

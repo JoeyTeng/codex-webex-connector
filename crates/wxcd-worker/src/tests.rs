@@ -15,8 +15,8 @@ use super::{
 use chrono::Utc;
 use serde_json::json;
 use wxcd_proto::{
-    AppConfig, BridgeConfig, BridgeSnapshot, RepoConfig, SessionAuthority, SessionFailure,
-    SessionFailureKind, SessionRecord, SessionState, WebexConfig,
+    AppConfig, BridgeConfig, BridgeSnapshot, LocalSessionMirror, RepoConfig, SessionAuthority,
+    SessionFailure, SessionFailureKind, SessionRecord, SessionState, WebexConfig,
 };
 use wxcd_render::ImportedHistoryTurn;
 
@@ -581,6 +581,10 @@ fn local_mirror_does_not_claim_foreign_authority() {
     local.authority = Some(SessionAuthority {
         installation_id: "ins_other".to_string(),
     });
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
     let mut local_replay = wxcd_eventlog::ReplayState::default();
     local_replay.sessions.insert("ses_1".to_string(), local);
 
@@ -592,6 +596,36 @@ fn local_mirror_does_not_claim_foreign_authority() {
     ));
     let session = state.sessions.get("ses_1").unwrap();
     assert!(!session_belongs_to_installation(session, installation_id));
+    assert!(session.local_mirror.is_none());
+}
+
+#[test]
+fn stale_local_mirror_does_not_claim_legacy_remote_session() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+
+    let mut local = session_record("ses_1", SessionState::Idle, false);
+    local.authority = Some(SessionAuthority {
+        installation_id: "ins_other".to_string(),
+    });
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_1".to_string(), local);
+
+    assert!(!state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::TrustedSnapshot
+    ));
+    let session = state.sessions.get("ses_1").unwrap();
+    assert!(!session_belongs_to_installation(session, installation_id));
+    assert!(session.authority.is_none());
+    assert!(session.local_mirror.is_none());
 }
 
 #[test]
