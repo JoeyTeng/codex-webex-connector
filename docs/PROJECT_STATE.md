@@ -2,6 +2,7 @@
 
 ## Current State
 - Webex-Codex Bridge 已部署在 macOS launchd 管理形态下，当前能力包括 session 创建、local thread attach、history paging、user reattach、failed-session diagnosis、soft archive，以及 archived room purge。
+- GitHub pull requests run `codex/review-gate` through the repository workflow.
 - 详细历史、验证证据和迁移前 tracker 原文已移入 `docs/project_journal/`：
   - 当前后续事项：`docs/project_journal/2026/05/2026-05-05-webex-bridge-followups-05ee1a8.md`
   - 已完成历史：`docs/project_journal/2026/05/2026-05-05-webex-bridge-history-05ee1a8.md`

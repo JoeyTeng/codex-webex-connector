@@ -1,0 +1,59 @@
+name: Codex Review Gate
+
+"on":
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Pull request number to review
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: codex-review-gate-${{ github.event.pull_request.number || inputs.pull_request }}
+  cancel-in-progress: true
+
+jobs:
+  review-gate:
+    name: codex/review-gate runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    steps:
+      - name: Resolve pull request
+        id: pull_request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pull_request }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${EVENT_HEAD_SHA}" ]; then
+            head_sha="${EVENT_HEAD_SHA}"
+          else
+            head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq ".head.sha")"
+          fi
+
+          {
+            echo "number=${PR_NUMBER}"
+            echo "head_sha=${head_sha}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Run Codex Review Gate
+        uses: JoeyTeng/codex-review-gate@b6a2fc7d011ba60d9220e6f881c8d5e7c733fc2d
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request: ${{ steps.pull_request.outputs.number }}
+          head-sha: ${{ steps.pull_request.outputs.head_sha }}
