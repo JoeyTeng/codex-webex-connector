@@ -8,8 +8,8 @@ use super::{
     normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
     parse_diagnose_command, parse_list_command, parse_purge_archived_command,
     parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
-    session_belongs_to_installation, session_requires_codex_archive, slice_thread_history_page,
-    validate_purge_archived_session,
+    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
+    slice_thread_history_page, validate_purge_archived_session,
 };
 use chrono::Utc;
 use serde_json::json;
@@ -638,6 +638,29 @@ fn executable_indexes_only_include_current_installation_sessions() {
     assert!(!state.thread_to_session.contains_key("thread-ses_failed"));
     assert!(!state.room_to_session.contains_key("room-ses_foreign"));
     assert!(!state.thread_to_session.contains_key("thread-ses_foreign"));
+}
+
+#[test]
+fn diagnose_summary_filters_foreign_sessions() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(managed_session_record(
+        "ses_current",
+        SessionState::Failed,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_foreign",
+        SessionState::Failed,
+        false,
+        "ins_other",
+    ));
+
+    let sessions = sessions_for_diagnostics(&state, installation_id);
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "ses_current");
 }
 
 #[test]

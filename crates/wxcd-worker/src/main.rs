@@ -215,11 +215,7 @@ async fn run() -> Result<()> {
             }
         }
     } else {
-        let changed = state.claim_legacy_local_sessions(&installation.installation_id, Utc::now());
-        if changed {
-            persist_local_snapshot(&local_snapshot_path, &state.to_replay_state().to_snapshot())
-                .await?;
-        }
+        state.rebuild_session_indexes();
     }
     reconcile_sessions(
         &config,
@@ -1306,7 +1302,7 @@ async fn handle_diagnose_command(
 ) -> Result<String> {
     match command {
         DiagnoseCommand::Sessions => {
-            let mut sessions = state.sessions.values().cloned().collect::<Vec<_>>();
+            let mut sessions = sessions_for_diagnostics(state, &installation.installation_id);
             sessions.sort_by_key(|session| session.updated_at);
             sessions.reverse();
             Ok(render_failed_session_diagnostics(&sessions))
@@ -1549,6 +1545,15 @@ fn cleanup_failed_sessions(state: &WorkerState, installation_id: &str) -> Vec<Se
         .sessions
         .values()
         .filter(|session| is_cleanup_failed_session(session, installation_id))
+        .cloned()
+        .collect()
+}
+
+fn sessions_for_diagnostics(state: &WorkerState, installation_id: &str) -> Vec<SessionRecord> {
+    state
+        .sessions
+        .values()
+        .filter(|session| session_belongs_to_installation(session, installation_id))
         .cloned()
         .collect()
 }
@@ -2612,33 +2617,6 @@ impl WorkerState {
                 });
             if session.local_mirror.as_ref() != Some(&desired_mirror) {
                 session.local_mirror = Some(desired_mirror);
-                changed = true;
-            }
-        }
-        if changed {
-            self.rebuild_session_indexes();
-        }
-        changed
-    }
-
-    fn claim_legacy_local_sessions(
-        &mut self,
-        installation_id: &str,
-        mirrored_at: chrono::DateTime<Utc>,
-    ) -> bool {
-        let mut changed = false;
-        for session in self.sessions.values_mut() {
-            if session.authority.is_none() {
-                session.authority = Some(SessionAuthority {
-                    installation_id: installation_id.to_string(),
-                });
-                changed = true;
-            }
-            if session.local_mirror.is_none() {
-                session.local_mirror = Some(LocalSessionMirror {
-                    installation_id: installation_id.to_string(),
-                    mirrored_at,
-                });
                 changed = true;
             }
         }
