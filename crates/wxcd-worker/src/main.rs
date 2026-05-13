@@ -217,10 +217,22 @@ async fn run() -> Result<()> {
         if local_snapshot_metadata
             .is_some_and(|metadata| metadata.existed && metadata.writer_installation_id.is_none())
         {
-            let changed =
-                state.claim_legacy_local_sessions(&installation.installation_id, Utc::now());
-            if changed {
-                persist_local_snapshot(&local_snapshot_path, &state.to_snapshot()).await?;
+            match collect_local_thread_ids(&mut codex).await {
+                Ok(local_thread_ids) => {
+                    let changed = state.claim_legacy_local_sessions(
+                        &installation.installation_id,
+                        Utc::now(),
+                        &local_thread_ids,
+                    );
+                    if changed {
+                        persist_local_snapshot(&local_snapshot_path, &state.to_snapshot()).await?;
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        "failed to list local Codex threads before legacy snapshot claim, leaving sessions unclaimed: {error:#}"
+                    );
+                }
             }
         }
         state.rebuild_session_indexes();
@@ -1772,6 +1784,19 @@ async fn codex_thread_exists(codex: &mut CodexClient, thread_id: &str) -> Result
     }
 }
 
+async fn collect_local_thread_ids(codex: &mut CodexClient) -> Result<HashSet<String>> {
+    let mut cursor = None;
+    let mut thread_ids = HashSet::new();
+    loop {
+        let page = codex.thread_list_page(false, cursor.as_deref()).await?;
+        thread_ids.extend(page.data.into_iter().map(|thread| thread.id));
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(thread_ids);
+        };
+        cursor = Some(next_cursor);
+    }
+}
+
 fn apply_thread_probe(
     session: &SessionRecord,
     probe: &ThreadProbe,
@@ -2669,10 +2694,14 @@ impl WorkerState {
         &mut self,
         installation_id: &str,
         mirrored_at: chrono::DateTime<Utc>,
+        local_thread_ids: &HashSet<String>,
     ) -> bool {
         let mut changed = false;
         for session in self.sessions.values_mut() {
             if session.authority.is_some() || session.local_mirror.is_some() {
+                continue;
+            }
+            if !local_thread_ids.contains(&session.thread_id) {
                 continue;
             }
             session.authority = Some(SessionAuthority {

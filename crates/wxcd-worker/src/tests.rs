@@ -601,9 +601,10 @@ fn legacy_local_snapshot_sessions_are_claimed_on_fallback() {
     let mut state = WorkerState::default();
     state.upsert_session(session_record("ses_1", SessionState::Idle, false));
     state.set_executable_installation(installation_id);
+    let local_thread_ids = std::iter::once("thread-ses_1".to_string()).collect();
 
     assert!(state.thread_to_session.is_empty());
-    assert!(state.claim_legacy_local_sessions(installation_id, Utc::now()));
+    assert!(state.claim_legacy_local_sessions(installation_id, Utc::now(), &local_thread_ids));
 
     let session = state.sessions.get("ses_1").unwrap();
     assert!(session_belongs_to_installation(session, installation_id));
@@ -611,6 +612,21 @@ fn legacy_local_snapshot_sessions_are_claimed_on_fallback() {
         state.thread_to_session.get(&session.thread_id),
         Some(&session.session_id)
     );
+}
+
+#[test]
+fn legacy_local_snapshot_claim_requires_listed_thread() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+    state.set_executable_installation(installation_id);
+    let local_thread_ids = std::collections::HashSet::new();
+
+    assert!(!state.claim_legacy_local_sessions(installation_id, Utc::now(), &local_thread_ids));
+
+    let session = state.sessions.get("ses_1").unwrap();
+    assert!(!session_belongs_to_installation(session, installation_id));
+    assert!(state.thread_to_session.is_empty());
 }
 
 #[test]
