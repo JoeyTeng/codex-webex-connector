@@ -4,18 +4,18 @@ use super::{
     apply_thread_probe, attached_session_for_thread, ensure_approval_belongs_to_installation,
     ensure_failed_cleanup_target, ensure_session_id_belongs_to_installation,
     extract_thread_history_turns, generate_installation_id, is_default_list_session,
-    load_or_create_installation_identity, normalize_control_command_text,
-    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
-    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
-    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
-    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
-    slice_thread_history_page, validate_purge_archived_session,
+    load_local_snapshot_with_metadata, load_or_create_installation_identity,
+    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
+    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
+    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
+    repo_name_for_cwd, session_belongs_to_installation, session_requires_codex_archive,
+    sessions_for_diagnostics, slice_thread_history_page, validate_purge_archived_session,
 };
 use chrono::Utc;
 use serde_json::json;
 use wxcd_proto::{
-    AppConfig, BridgeConfig, RepoConfig, SessionAuthority, SessionFailure, SessionFailureKind,
-    SessionRecord, SessionState, WebexConfig,
+    AppConfig, BridgeConfig, BridgeSnapshot, RepoConfig, SessionAuthority, SessionFailure,
+    SessionFailureKind, SessionRecord, SessionState, WebexConfig,
 };
 use wxcd_render::ImportedHistoryTurn;
 
@@ -593,6 +593,68 @@ fn foreign_authority_takes_precedence_over_stale_local_mirror() {
     });
 
     assert!(!session_belongs_to_installation(&session, installation_id));
+}
+
+#[test]
+fn legacy_local_snapshot_sessions_are_claimed_on_fallback() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+    state.set_executable_installation(installation_id);
+
+    assert!(state.thread_to_session.is_empty());
+    assert!(state.claim_legacy_local_sessions(installation_id, Utc::now()));
+
+    let session = state.sessions.get("ses_1").unwrap();
+    assert!(session_belongs_to_installation(session, installation_id));
+    assert_eq!(
+        state.thread_to_session.get(&session.thread_id),
+        Some(&session.session_id)
+    );
+}
+
+#[test]
+fn local_snapshot_records_writer_installation() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.set_executable_installation(installation_id);
+
+    let snapshot = state.to_snapshot();
+
+    assert_eq!(
+        snapshot.writer_installation_id.as_deref(),
+        Some(installation_id)
+    );
+}
+
+#[tokio::test]
+async fn local_snapshot_writer_metadata_round_trips() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-snapshot-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+    let snapshot_path = state_dir.join("bridge-state.json");
+    let snapshot = BridgeSnapshot {
+        created_at: Utc::now(),
+        writer_installation_id: Some("ins_current".to_string()),
+        sessions: Vec::new(),
+        pending_approvals: Vec::new(),
+    };
+    tokio::fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap())
+        .await
+        .unwrap();
+
+    let local_snapshot = load_local_snapshot_with_metadata(&snapshot_path)
+        .await
+        .unwrap();
+
+    assert!(local_snapshot.metadata.existed);
+    assert_eq!(
+        local_snapshot.metadata.writer_installation_id.as_deref(),
+        Some("ins_current")
+    );
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 
 #[test]

@@ -172,6 +172,7 @@ impl ReplayState {
     pub fn to_snapshot(&self) -> BridgeSnapshot {
         BridgeSnapshot {
             created_at: Utc::now(),
+            writer_installation_id: None,
             sessions: self.sessions.values().cloned().collect(),
             pending_approvals: self.pending_approvals.values().cloned().collect(),
         }
@@ -322,6 +323,7 @@ mod tests {
         let stale = session_record("ses_1", "Stale", "thread", SessionState::Failed);
         let snapshot = BridgeSnapshot {
             created_at: Utc::now(),
+            writer_installation_id: None,
             sessions: vec![session_record(
                 "ses_1",
                 "Snapshot",
@@ -359,6 +361,7 @@ mod tests {
             "snapshot",
             BridgeSnapshot {
                 created_at: Utc::now(),
+                writer_installation_id: None,
                 sessions: Vec::new(),
                 pending_approvals: Vec::new(),
             },

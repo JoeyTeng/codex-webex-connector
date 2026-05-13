@@ -138,6 +138,8 @@ pub struct BridgeEventEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BridgeSnapshot {
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_installation_id: Option<String>,
     pub sessions: Vec<SessionRecord>,
     pub pending_approvals: Vec<PendingApproval>,
 }
@@ -265,6 +267,7 @@ mod tests {
 
         let snapshot: BridgeSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(snapshot.sessions.len(), 1);
+        assert!(snapshot.writer_installation_id.is_none());
         assert!(snapshot.sessions[0].authority.is_none());
         assert!(snapshot.sessions[0].local_mirror.is_none());
     }

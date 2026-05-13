@@ -186,9 +186,12 @@ async fn run() -> Result<()> {
         }
     };
     let replayed_data_space = remote_replay.is_some();
-    let replay = match remote_replay {
-        Some(replay) => replay,
-        None => load_local_snapshot(&local_snapshot_path).await?,
+    let (replay, local_snapshot_metadata) = match remote_replay {
+        Some(replay) => (replay, None),
+        None => {
+            let local_snapshot = load_local_snapshot_with_metadata(&local_snapshot_path).await?;
+            (local_snapshot.replay, Some(local_snapshot.metadata))
+        }
     };
     let mut state = WorkerState::from_replay(replay);
     state.set_executable_installation(&installation.installation_id);
@@ -201,11 +204,7 @@ async fn run() -> Result<()> {
                     Utc::now(),
                 );
                 if changed {
-                    persist_local_snapshot(
-                        &local_snapshot_path,
-                        &state.to_replay_state().to_snapshot(),
-                    )
-                    .await?;
+                    persist_local_snapshot(&local_snapshot_path, &state.to_snapshot()).await?;
                 }
             }
             Err(error) => {
@@ -215,6 +214,15 @@ async fn run() -> Result<()> {
             }
         }
     } else {
+        if local_snapshot_metadata
+            .is_some_and(|metadata| metadata.existed && metadata.writer_installation_id.is_none())
+        {
+            let changed =
+                state.claim_legacy_local_sessions(&installation.installation_id, Utc::now());
+            if changed {
+                persist_local_snapshot(&local_snapshot_path, &state.to_snapshot()).await?;
+            }
+        }
         state.rebuild_session_indexes();
     }
     reconcile_sessions(
@@ -1832,7 +1840,7 @@ async fn persist_event(
     }
     persist_local_snapshot(
         &config.bridge.state_dir.join("bridge-state.json"),
-        &state.to_replay_state().to_snapshot(),
+        &state.to_snapshot(),
     )
     .await?;
     Ok(())
@@ -1843,7 +1851,7 @@ async fn persist_snapshot(
     state: &mut WorkerState,
     config: &AppConfig,
 ) -> Result<()> {
-    let snapshot = state.to_replay_state().to_snapshot();
+    let snapshot = state.to_snapshot();
     if let Err(error) = event_log.append_snapshot(&snapshot).await {
         warn!("failed to append Data Space snapshot: {error:#}");
     }
@@ -2488,15 +2496,46 @@ async fn remove_stale_socket(socket_path: &Path) -> Result<()> {
 }
 
 async fn load_local_snapshot(path: &Path) -> Result<ReplayState> {
+    load_local_snapshot_with_metadata(path)
+        .await
+        .map(|snapshot| snapshot.replay)
+}
+
+#[derive(Debug)]
+struct LocalSnapshotMetadata {
+    existed: bool,
+    writer_installation_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct LocalSnapshotReplay {
+    replay: ReplayState,
+    metadata: LocalSnapshotMetadata,
+}
+
+async fn load_local_snapshot_with_metadata(path: &Path) -> Result<LocalSnapshotReplay> {
     if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-        return Ok(ReplayState::default());
+        return Ok(LocalSnapshotReplay {
+            replay: ReplayState::default(),
+            metadata: LocalSnapshotMetadata {
+                existed: false,
+                writer_installation_id: None,
+            },
+        });
     }
     let content = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("failed to read local snapshot {}", path.display()))?;
-    let snapshot = serde_json::from_str(&content)
+    let snapshot: wxcd_proto::BridgeSnapshot = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse local snapshot {}", path.display()))?;
-    Ok(ReplayState::from_snapshot(snapshot))
+    let writer_installation_id = snapshot.writer_installation_id.clone();
+    Ok(LocalSnapshotReplay {
+        replay: ReplayState::from_snapshot(snapshot),
+        metadata: LocalSnapshotMetadata {
+            existed: true,
+            writer_installation_id,
+        },
+    })
 }
 
 async fn persist_local_snapshot(path: &Path, snapshot: &wxcd_proto::BridgeSnapshot) -> Result<()> {
@@ -2626,6 +2665,31 @@ impl WorkerState {
         changed
     }
 
+    fn claim_legacy_local_sessions(
+        &mut self,
+        installation_id: &str,
+        mirrored_at: chrono::DateTime<Utc>,
+    ) -> bool {
+        let mut changed = false;
+        for session in self.sessions.values_mut() {
+            if session.authority.is_some() || session.local_mirror.is_some() {
+                continue;
+            }
+            session.authority = Some(SessionAuthority {
+                installation_id: installation_id.to_string(),
+            });
+            session.local_mirror = Some(LocalSessionMirror {
+                installation_id: installation_id.to_string(),
+                mirrored_at,
+            });
+            changed = true;
+        }
+        if changed {
+            self.rebuild_session_indexes();
+        }
+        changed
+    }
+
     fn rebuild_session_indexes(&mut self) {
         self.room_to_session.clear();
         self.thread_to_session.clear();
@@ -2673,6 +2737,12 @@ impl WorkerState {
             pending_approvals: self.pending_approvals.clone(),
             events_since_snapshot: self.events_since_snapshot,
         }
+    }
+
+    fn to_snapshot(&self) -> wxcd_proto::BridgeSnapshot {
+        let mut snapshot = self.to_replay_state().to_snapshot();
+        snapshot.writer_installation_id = self.executable_installation_id.clone();
+        snapshot
     }
 }
 
