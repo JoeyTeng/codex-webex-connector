@@ -204,11 +204,7 @@ fn build_bridge_config(
             .clone()
             .unwrap_or_else(|| "/tmp/wxcd.sock".to_string()),
     )?;
-    let cbth_plugin = build_cbth_plugin_config(
-        file_config.cbth_plugin.as_ref(),
-        &state_dir,
-        config_path.as_deref(),
-    )?;
+    let cbth_plugin = build_cbth_plugin_config(file_config.cbth_plugin.as_ref(), &state_dir)?;
 
     Ok(BridgeConfig {
         socket_path,
@@ -238,7 +234,6 @@ fn build_bridge_config(
 fn build_cbth_plugin_config(
     file_config: Option<&FileCbthPluginConfig>,
     state_dir: &Path,
-    config_path: Option<&Path>,
 ) -> Result<CbthPluginConfig> {
     let cbth_socket_path = optional_path_env("CBTH_PLUGIN_RPC_SOCKET");
     let enabled = cbth_socket_path
@@ -270,12 +265,9 @@ fn build_cbth_plugin_config(
         .or_else(|| file_config.and_then(|config| config.manifest_path.clone()))
         .map(expand_tilde)
         .transpose()?
-        .unwrap_or_else(|| PathBuf::from("plugin/manifest.json"));
+        .unwrap_or_else(|| state_dir.join("current").join("plugin/manifest.json"));
     let manifest_path = if manifest_path.is_relative() {
-        config_path
-            .and_then(Path::parent)
-            .map(|parent| parent.join(&manifest_path))
-            .unwrap_or(manifest_path)
+        state_dir.join("current").join(&manifest_path)
     } else {
         manifest_path
     };
@@ -439,11 +431,13 @@ manifest_path = "plugin/manifest.json"
     }
 
     #[test]
-    fn relative_manifest_path_resolves_from_config_directory() {
+    fn relative_manifest_path_resolves_from_current_release() {
         let _guard = env_guard();
         clear_cbth_env();
         let file_config: FileConfig = toml::from_str(
             r#"
+state_dir = "/tmp/wxcd"
+
 [cbth_plugin]
 manifest_path = "plugin/manifest.json"
 "#,
@@ -455,7 +449,7 @@ manifest_path = "plugin/manifest.json"
 
         assert_eq!(
             config.cbth_plugin.manifest_path.to_string_lossy(),
-            "/tmp/wxcd/config/plugin/manifest.json"
+            "/tmp/wxcd/current/plugin/manifest.json"
         );
     }
 

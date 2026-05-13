@@ -7,6 +7,7 @@ release_id="$(date '+%Y-%m-%dT%H-%M-%S')"
 release_dir="${state_dir}/releases/${release_id}"
 config_dir="${state_dir}/config"
 env_path="${config_dir}/wxcd.env"
+manifest_path="${state_dir}/current/plugin/manifest.json"
 plist_path="${HOME}/Library/LaunchAgents/com.example.wxcd.supervisor.plist"
 node_path="$(command -v node)"
 codex_path="$(command -v codex)"
@@ -32,9 +33,16 @@ rsync -a "${repo_root}/sidecars/webex-ws-sidecar/" "${release_dir}/sidecars/webe
 if [[ ! -f "${config_dir}/wxcd.toml" ]]; then
   sed \
     -e "s|/Users/hoteng/Program/GitHub/codex-webex-connector|${repo_root}|g" \
-    -e "s|manifest_path = \"plugin/manifest.json\"|manifest_path = \"${release_dir}/plugin/manifest.json\"|g" \
+    -e "s|manifest_path = \"plugin/manifest.json\"|manifest_path = \"${manifest_path}\"|g" \
     "${repo_root}/wxcd.example.toml" \
     > "${config_dir}/wxcd.toml"
+else
+  config_tmp="$(mktemp "${config_dir}/wxcd.toml.XXXXXX")"
+  sed \
+    -e "s|^manifest_path = .*|manifest_path = \"${manifest_path}\"|g" \
+    "${config_dir}/wxcd.toml" \
+    > "${config_tmp}"
+  mv "${config_tmp}" "${config_dir}/wxcd.toml"
 fi
 
 cp "${repo_root}/.env" "${env_path}"
