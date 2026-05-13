@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/wxcd-cbth-rpc",
     "crates/wxcd-codex",
     "crates/wxcd-eventlog",
     "crates/wxcd-proto",
@@ -36,8 +37,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 wxcd-codex = { path = "crates/wxcd-codex" }
+wxcd-cbth-rpc = { path = "crates/wxcd-cbth-rpc" }
 wxcd-eventlog = { path = "crates/wxcd-eventlog" }
 wxcd-proto = { path = "crates/wxcd-proto" }
 wxcd-render = { path = "crates/wxcd-render" }
 wxcd-webex = { path = "crates/wxcd-webex" }
-

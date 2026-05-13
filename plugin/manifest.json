@@ -1,0 +1,47 @@
+{
+  "name": "webex-connector",
+  "version": "0.1.0",
+  "description": "Webex control-room bridge for Codex sessions.",
+  "entrypoint": {
+    "binary": "bin/wxcd-supervisor",
+    "args": ["run"]
+  },
+  "capabilities": [
+    {
+      "name": "plugin-rpc-v1",
+      "version": 1
+    },
+    {
+      "name": "diagnostics"
+    },
+    {
+      "name": "standalone-compatible"
+    }
+  ],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "WXCD_CONFIG_PATH": {
+        "type": "string",
+        "description": "Path to wxcd.toml."
+      },
+      "WXCD_CBTH_PLUGIN": {
+        "type": "boolean",
+        "description": "Enable cbth plugin RPC mode."
+      },
+      "WXCD_CBTH_SOCKET_PATH": {
+        "type": "string",
+        "description": "Unix-domain socket path for cbth plugin RPC."
+      },
+      "WXCD_PLUGIN_HOME": {
+        "type": "string",
+        "description": "Writable plugin home managed by cbth."
+      }
+    },
+    "required": []
+  },
+  "diagnostics": {
+    "command": ["bin/wxcd-worker", "doctor"],
+    "requires_webex_credentials": false
+  }
+}

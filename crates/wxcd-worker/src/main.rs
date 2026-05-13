@@ -7,7 +7,7 @@ use std::sync::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -15,13 +15,16 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use wxcd_cbth_rpc::{
+    PLUGIN_RPC_PROTOCOL_VERSION_V1, PluginCapability, PluginHelloRequest, PluginRpcClient,
+};
 use wxcd_codex::{CodexClient, CodexEvent, CodexThreadSummary};
 use wxcd_eventlog::{EventLog, ReplayState};
 use wxcd_proto::{
-    AppConfig, ApprovalDecision, ApprovalKind, BridgeEvent, LocalSessionMirror, PendingApproval,
-    SessionAuthority, SessionFailure, SessionFailureKind, SessionRecord, SessionState,
-    WebexAttachmentActionEvent, WebexIngressAck, WebexIngressEnvelope, WebexMessageEvent,
-    generate_session_id,
+    AppConfig, ApprovalDecision, ApprovalKind, BridgeEvent, CbthPluginConfig, DiagnosticsConfig,
+    LocalSessionMirror, PendingApproval, SessionAuthority, SessionFailure, SessionFailureKind,
+    SessionRecord, SessionState, WebexAttachmentActionEvent, WebexIngressAck, WebexIngressEnvelope,
+    WebexMessageEvent, generate_session_id,
 };
 use wxcd_render::{
     ImportedHistoryTurn, LocalThreadListItem, build_approval_attachment, build_overview_attachment,
@@ -38,7 +41,31 @@ const RECENT_EVENT_ID_LIMIT: usize = 1024;
 const INSTALLATION_IDENTITY_FILE: &str = "installation-identity.json";
 
 #[derive(Parser)]
-struct Args {}
+struct Args {
+    #[command(subcommand)]
+    command: Option<WorkerCommand>,
+}
+
+#[derive(Subcommand)]
+enum WorkerCommand {
+    Run,
+    Doctor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManifestStatus {
+    Valid,
+    Missing(String),
+    Invalid(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RpcStatus {
+    Disabled,
+    MissingSocketPath,
+    HelloOk { protocol_version: u32 },
+    HelloFailed(String),
+}
 
 #[derive(Default)]
 struct WorkerState {
@@ -128,12 +155,15 @@ struct InstallationIdentity {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _args = Args::parse();
+    let args = Args::parse();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    run().await
+    match args.command.unwrap_or(WorkerCommand::Run) {
+        WorkerCommand::Run => run().await,
+        WorkerCommand::Doctor => run_doctor().await,
+    }
 }
 
 async fn run() -> Result<()> {
@@ -338,6 +368,136 @@ async fn run() -> Result<()> {
     codex.shutdown().await?;
     remove_stale_socket(&config.bridge.socket_path).await?;
     Ok(())
+}
+
+async fn run_doctor() -> Result<()> {
+    let diagnostics = AppConfig::load_diagnostics()?;
+    let manifest_status = validate_plugin_manifest(&diagnostics.bridge.cbth_plugin);
+    let rpc_status = diagnose_plugin_rpc(&diagnostics.bridge.cbth_plugin).await;
+    println!(
+        "{}",
+        render_doctor_report(&diagnostics, &manifest_status, &rpc_status)
+    );
+    Ok(())
+}
+
+fn validate_plugin_manifest(config: &CbthPluginConfig) -> ManifestStatus {
+    let path = &config.manifest_path;
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ManifestStatus::Missing(path.display().to_string());
+        }
+        Err(error) => return ManifestStatus::Invalid(error.to_string()),
+    };
+    let value = match serde_json::from_str::<Value>(&content) {
+        Ok(value) => value,
+        Err(error) => return ManifestStatus::Invalid(format!("invalid JSON: {error}")),
+    };
+
+    let required_fields = [
+        "/name",
+        "/version",
+        "/entrypoint/binary",
+        "/capabilities",
+        "/config_schema",
+    ];
+    let missing = required_fields
+        .iter()
+        .filter(|pointer| value.pointer(pointer).is_none())
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return ManifestStatus::Invalid(format!("missing fields: {}", missing.join(", ")));
+    }
+    if value.pointer("/name").and_then(Value::as_str) != Some("webex-connector") {
+        return ManifestStatus::Invalid("manifest name must be webex-connector".to_string());
+    }
+
+    ManifestStatus::Valid
+}
+
+async fn diagnose_plugin_rpc(config: &CbthPluginConfig) -> RpcStatus {
+    if !config.enabled {
+        return RpcStatus::Disabled;
+    }
+    let Some(socket_path) = config.socket_path.as_ref() else {
+        return RpcStatus::MissingSocketPath;
+    };
+
+    let mut client = match PluginRpcClient::connect(socket_path).await {
+        Ok(client) => client,
+        Err(error) => return RpcStatus::HelloFailed(format!("{error:#}")),
+    };
+    let request = PluginHelloRequest {
+        plugin_name: "webex-connector".to_string(),
+        plugin_instance_id: config.plugin_instance_id.clone(),
+        plugin_release_id: config.plugin_release_id.clone(),
+        protocol_versions: vec![PLUGIN_RPC_PROTOCOL_VERSION_V1],
+        capabilities: vec![
+            PluginCapability::new("diagnostics"),
+            PluginCapability::new("standalone-compatible"),
+        ],
+        plugin_home: config.plugin_home.display().to_string(),
+        pid: std::process::id(),
+    };
+    match client.plugin_hello(request).await {
+        Ok(response) => RpcStatus::HelloOk {
+            protocol_version: response.protocol_version,
+        },
+        Err(error) => RpcStatus::HelloFailed(format!("{error:#}")),
+    }
+}
+
+fn render_doctor_report(
+    diagnostics: &DiagnosticsConfig,
+    manifest_status: &ManifestStatus,
+    rpc_status: &RpcStatus,
+) -> String {
+    let plugin = &diagnostics.bridge.cbth_plugin;
+    let mut lines = vec![
+        "wxcd doctor".to_string(),
+        format!("mode: {}", plugin.mode_name()),
+        format!(
+            "worker_socket: {}",
+            diagnostics.bridge.socket_path.display()
+        ),
+        format!("state_dir: {}", diagnostics.bridge.state_dir.display()),
+        format!("repos: {}", diagnostics.repos.len()),
+        format!(
+            "plugin_manifest: {}",
+            render_manifest_status(manifest_status)
+        ),
+        format!("plugin_rpc: {}", render_rpc_status(rpc_status)),
+    ];
+    if !diagnostics.missing_webex_env.is_empty() {
+        lines.push(format!(
+            "webex_credentials: missing {}",
+            diagnostics.missing_webex_env.join(", ")
+        ));
+    } else {
+        lines.push("webex_credentials: present".to_string());
+    }
+    lines.join("\n")
+}
+
+fn render_manifest_status(status: &ManifestStatus) -> String {
+    match status {
+        ManifestStatus::Valid => "ok".to_string(),
+        ManifestStatus::Missing(path) => format!("missing at {path}"),
+        ManifestStatus::Invalid(message) => format!("invalid: {message}"),
+    }
+}
+
+fn render_rpc_status(status: &RpcStatus) -> String {
+    match status {
+        RpcStatus::Disabled => "disabled".to_string(),
+        RpcStatus::MissingSocketPath => "enabled but WXCD_CBTH_SOCKET_PATH is not set".to_string(),
+        RpcStatus::HelloOk { protocol_version } => {
+            format!("hello ok, protocol_version={protocol_version}")
+        }
+        RpcStatus::HelloFailed(message) => format!("hello failed: {message}"),
+    }
 }
 
 async fn handle_webex_ingress(
