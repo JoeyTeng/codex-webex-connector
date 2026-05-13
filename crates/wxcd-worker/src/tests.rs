@@ -1,13 +1,15 @@
 use super::{
     CleanupFailedCommand, DiagnoseCommand, ListCommand, ListMode, PurgeArchivedCommand,
     RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerState, abbreviate,
-    apply_thread_probe, ensure_failed_cleanup_target, extract_thread_history_turns,
-    generate_installation_id, is_default_list_session, load_or_create_installation_identity,
-    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
-    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
-    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
-    repo_name_for_cwd, session_belongs_to_installation, session_requires_codex_archive,
-    slice_thread_history_page, validate_purge_archived_session,
+    apply_thread_probe, attached_session_for_thread, ensure_approval_belongs_to_installation,
+    ensure_failed_cleanup_target, ensure_session_id_belongs_to_installation,
+    extract_thread_history_turns, generate_installation_id, is_default_list_session,
+    load_or_create_installation_identity, normalize_control_command_text,
+    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
+    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
+    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
+    session_belongs_to_installation, session_requires_codex_archive, slice_thread_history_page,
+    validate_purge_archived_session,
 };
 use chrono::Utc;
 use serde_json::json;
@@ -626,6 +628,64 @@ fn executable_indexes_only_include_current_installation_sessions() {
     assert!(!state.thread_to_session.contains_key("thread-ses_foreign"));
 }
 
+#[test]
+fn duplicate_thread_detection_uses_all_recorded_sessions() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(managed_session_record(
+        "ses_failed",
+        SessionState::Failed,
+        false,
+        installation_id,
+    ));
+    state.set_executable_installation(installation_id);
+
+    assert!(!state.thread_to_session.contains_key("thread-ses_failed"));
+    assert_eq!(
+        attached_session_for_thread(&state, "thread-ses_failed"),
+        Some("ses_failed")
+    );
+}
+
+#[test]
+fn installation_guards_reject_foreign_session_and_approval() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(managed_session_record(
+        "ses_current",
+        SessionState::Idle,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_foreign",
+        SessionState::Idle,
+        false,
+        "ins_other",
+    ));
+    state.pending_approvals.insert(
+        "apr_current".to_string(),
+        pending_approval("apr_current", "ses_current"),
+    );
+    state.pending_approvals.insert(
+        "apr_foreign".to_string(),
+        pending_approval("apr_foreign", "ses_foreign"),
+    );
+
+    assert!(
+        ensure_session_id_belongs_to_installation(&state, "ses_current", installation_id).is_ok()
+    );
+    assert!(
+        ensure_session_id_belongs_to_installation(&state, "ses_foreign", installation_id).is_err()
+    );
+    assert!(
+        ensure_approval_belongs_to_installation(&state, "apr_current", installation_id).is_ok()
+    );
+    assert!(
+        ensure_approval_belongs_to_installation(&state, "apr_foreign", installation_id).is_err()
+    );
+}
+
 #[tokio::test]
 async fn installation_identity_persists_and_loads() {
     let state_dir = std::env::temp_dir().join(format!(
@@ -718,4 +778,22 @@ fn managed_session_record(
         installation_id: installation_id.to_string(),
     });
     session
+}
+
+fn pending_approval(approval_id: &str, session_id: &str) -> wxcd_proto::PendingApproval {
+    wxcd_proto::PendingApproval {
+        approval_id: approval_id.to_string(),
+        session_id: session_id.to_string(),
+        thread_id: format!("thread-{session_id}"),
+        turn_id: "turn".to_string(),
+        codex_request_id: json!(1),
+        item_id: "item".to_string(),
+        kind: wxcd_proto::ApprovalKind::CommandExecution,
+        reason: None,
+        command: None,
+        cwd: None,
+        requested_permissions: None,
+        card_message_id: None,
+        requested_at: Utc::now(),
+    }
 }

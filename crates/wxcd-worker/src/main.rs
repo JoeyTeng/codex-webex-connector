@@ -338,7 +338,8 @@ async fn handle_webex_ingress(
             {
                 return Ok(());
             }
-            handle_attachment_action(config, webex, event_log, state, codex, action).await?;
+            handle_attachment_action(config, webex, event_log, state, codex, installation, action)
+                .await?;
         }
         WebexIngressEnvelope::HealthCheck => {}
     }
@@ -900,6 +901,7 @@ async fn handle_attachment_action(
     event_log: &EventLog<'_>,
     state: &mut WorkerState,
     codex: &mut CodexClient,
+    installation: &InstallationIdentity,
     action: WebexAttachmentActionEvent,
 ) -> Result<()> {
     let action_name = find_string(&action.inputs, "wxcd_action");
@@ -909,6 +911,11 @@ async fn handle_attachment_action(
                 .ok_or_else(|| anyhow!("approval card payload missing approval_id"))?;
             let decision = find_string(&action.inputs, "decision")
                 .ok_or_else(|| anyhow!("approval card payload missing decision"))?;
+            ensure_approval_belongs_to_installation(
+                state,
+                &approval_id,
+                &installation.installation_id,
+            )?;
             resolve_approval(
                 config,
                 webex,
@@ -923,6 +930,11 @@ async fn handle_attachment_action(
         Some("status") | Some("resume") | Some("pause") | Some("archive") => {
             let session_id = find_string(&action.inputs, "session_id")
                 .ok_or_else(|| anyhow!("card payload missing session_id"))?;
+            ensure_session_id_belongs_to_installation(
+                state,
+                &session_id,
+                &installation.installation_id,
+            )?;
             let command = match action_name.as_deref().unwrap() {
                 "status" => "/status",
                 "resume" => "/resume",
@@ -943,6 +955,11 @@ async fn handle_attachment_action(
             if let Some(decision) = find_string(&attachment.inputs, "decision") {
                 let approval_id = find_string(&attachment.inputs, "approval_id")
                     .ok_or_else(|| anyhow!("attachment action missing approval_id"))?;
+                ensure_approval_belongs_to_installation(
+                    state,
+                    &approval_id,
+                    &installation.installation_id,
+                )?;
                 resolve_approval(
                     config,
                     webex,
@@ -1566,6 +1583,30 @@ fn ensure_session_belongs_to_installation(
     )
 }
 
+fn ensure_session_id_belongs_to_installation(
+    state: &WorkerState,
+    session_id: &str,
+    installation_id: &str,
+) -> Result<()> {
+    let session = state
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow!("unknown session `{session_id}`"))?;
+    ensure_session_belongs_to_installation(session, installation_id)
+}
+
+fn ensure_approval_belongs_to_installation(
+    state: &WorkerState,
+    approval_id: &str,
+    installation_id: &str,
+) -> Result<()> {
+    let approval = state
+        .pending_approvals
+        .get(approval_id)
+        .ok_or_else(|| anyhow!("unknown approval `{approval_id}`"))?;
+    ensure_session_id_belongs_to_installation(state, &approval.session_id, installation_id)
+}
+
 async fn refresh_overview(webex: &WebexClient, session: &SessionRecord) -> Result<()> {
     let Some(message_id) = session.overview_message_id.as_deref() else {
         return Ok(());
@@ -2150,7 +2191,7 @@ async fn find_local_only_thread(
     state: &WorkerState,
     thread_id: &str,
 ) -> Result<CodexThreadSummary> {
-    if let Some(session_id) = state.thread_to_session.get(thread_id) {
+    if let Some(session_id) = attached_session_for_thread(state, thread_id) {
         bail!("local Codex thread `{thread_id}` is already attached as session `{session_id}`");
     }
 
@@ -2167,6 +2208,14 @@ async fn find_local_only_thread(
     }
 
     bail!("unknown local Codex thread `{thread_id}`")
+}
+
+fn attached_session_for_thread<'a>(state: &'a WorkerState, thread_id: &str) -> Option<&'a str> {
+    state
+        .sessions
+        .values()
+        .find(|session| session.thread_id == thread_id)
+        .map(|session| session.session_id.as_str())
 }
 
 fn repo_name_for_cwd(config: &AppConfig, cwd: &str) -> String {
