@@ -2,17 +2,18 @@ use super::{
     CleanupFailedCommand, DiagnoseCommand, ListCommand, ListMode, PurgeArchivedCommand,
     RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerState, abbreviate,
     apply_thread_probe, ensure_failed_cleanup_target, extract_thread_history_turns,
+    generate_installation_id, is_default_list_session, load_or_create_installation_identity,
     normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
     parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
     parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
-    repo_name_for_cwd, session_requires_codex_archive, slice_thread_history_page,
-    validate_purge_archived_session,
+    repo_name_for_cwd, session_belongs_to_installation, session_requires_codex_archive,
+    slice_thread_history_page, validate_purge_archived_session,
 };
 use chrono::Utc;
 use serde_json::json;
 use wxcd_proto::{
-    AppConfig, BridgeConfig, RepoConfig, SessionFailure, SessionFailureKind, SessionRecord,
-    SessionState, WebexConfig,
+    AppConfig, BridgeConfig, RepoConfig, SessionAuthority, SessionFailure, SessionFailureKind,
+    SessionRecord, SessionState, WebexConfig,
 };
 use wxcd_render::ImportedHistoryTurn;
 
@@ -461,10 +462,115 @@ fn applies_thread_probe_state_transitions() {
         kind: ThreadProbeKind::ProbeUnavailable,
         message: "probe unavailable".to_string(),
     };
-    assert!(apply_thread_probe(&recovered, &unavailable, Utc::now()).is_none());
+    let probe_unavailable = apply_thread_probe(&recovered, &unavailable, Utc::now()).unwrap();
+    assert_eq!(probe_unavailable.state, SessionState::Failed);
+    assert_eq!(
+        probe_unavailable
+            .failure
+            .as_ref()
+            .map(|failure| &failure.kind),
+        Some(&SessionFailureKind::ProbeUnavailable)
+    );
 
     let archived = session_record("ses_archived", SessionState::Archived, true);
     assert!(apply_thread_probe(&archived, &missing, Utc::now()).is_none());
+}
+
+#[test]
+fn control_list_filters_non_executable_sessions() {
+    let installation_id = "ins_current";
+    let mut current = session_record("ses_current", SessionState::Idle, false);
+    current.authority = Some(SessionAuthority {
+        installation_id: installation_id.to_string(),
+    });
+    let mut missing = session_record("ses_missing", SessionState::Failed, false);
+    missing.authority = Some(SessionAuthority {
+        installation_id: installation_id.to_string(),
+    });
+    let mut foreign = session_record("ses_foreign", SessionState::Idle, false);
+    foreign.authority = Some(SessionAuthority {
+        installation_id: "ins_other".to_string(),
+    });
+    let archived = session_record("ses_archived", SessionState::Archived, true);
+
+    assert!(is_default_list_session(&current, installation_id));
+    assert!(!is_default_list_session(&missing, installation_id));
+    assert!(!is_default_list_session(&foreign, installation_id));
+    assert!(!is_default_list_session(&archived, installation_id));
+}
+
+#[test]
+fn local_mirror_can_claim_legacy_remote_session() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert(
+        "ses_1".to_string(),
+        session_record("ses_1", SessionState::Idle, false),
+    );
+
+    assert!(state.merge_local_mirror(local_replay, installation_id, Utc::now()));
+    let session = state.sessions.get("ses_1").unwrap();
+    assert!(session_belongs_to_installation(session, installation_id));
+    assert_eq!(
+        session
+            .authority
+            .as_ref()
+            .map(|authority| authority.installation_id.as_str()),
+        Some(installation_id)
+    );
+    assert_eq!(
+        session
+            .local_mirror
+            .as_ref()
+            .map(|mirror| mirror.installation_id.as_str()),
+        Some(installation_id)
+    );
+}
+
+#[test]
+fn local_mirror_does_not_claim_foreign_authority() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    let mut remote = session_record("ses_1", SessionState::Idle, false);
+    remote.authority = Some(SessionAuthority {
+        installation_id: "ins_other".to_string(),
+    });
+    state.upsert_session(remote);
+
+    let mut local = session_record("ses_1", SessionState::Idle, false);
+    local.authority = Some(SessionAuthority {
+        installation_id: "ins_other".to_string(),
+    });
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_1".to_string(), local);
+
+    assert!(!state.merge_local_mirror(local_replay, installation_id, Utc::now()));
+    let session = state.sessions.get("ses_1").unwrap();
+    assert!(!session_belongs_to_installation(session, installation_id));
+}
+
+#[tokio::test]
+async fn installation_identity_persists_and_loads() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-installation-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+
+    let created = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+    let loaded = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+
+    assert_eq!(created, loaded);
+    assert!(created.installation_id.starts_with("ins_"));
+
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 
 #[test]
@@ -522,5 +628,7 @@ fn session_record(session_id: &str, state: SessionState, archived: bool) -> Sess
         updated_at: Utc::now(),
         archived,
         failure,
+        authority: None,
+        local_mirror: None,
     }
 }

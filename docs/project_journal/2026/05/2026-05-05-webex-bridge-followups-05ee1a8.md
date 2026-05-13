@@ -3,7 +3,7 @@ id: 20260505-webex-bridge-followups-05ee1a8
 title: Webex Bridge Follow-ups
 status: active
 created: 2026-05-05
-updated: 2026-05-05
+updated: 2026-05-13
 branch: master
 pr:
 supersedes: []
@@ -20,10 +20,11 @@ superseded_by:
 - Production uses the bot-owner 1:1 direct room for Data Space replay because the current bot token cannot list group-room history.
 - Session recovery cleanup is deployed: `diagnose`, `cleanup failed`, and two-step `purge archived ... confirm` are documented in `docs/COMMANDS.md`.
 - Live E2E coverage exists in `docs/WEBEX_E2E_TEST_PLAN.md` for temporary rooms, local-only thread creation, `resume local`, history paging, session turns, `attach`, recovery cleanup, and cleanup.
+- W1 state authority split records a stable local installation identity under `state_dir`, treats Data Space as an index/audit log, and uses the local snapshot/mirror plus readable Codex thread as the executable authority for default control lists.
 
 ## Next Steps
-- Use `diagnose sessions` and `cleanup failed <session_id>` on existing production failed sessions that should no longer appear active.
-- Improve recovery for previously created Codex threads that are not reloaded by `thread/read` after process restart.
+- Use `diagnose sessions` and `cleanup failed <session_id>` on degraded sessions whose local Codex thread is missing, unreadable, or not probeable.
+- Plan the next recovery/handoff layer separately from W1.
 - Decide whether the long-term Data Space should stay on the bot-owner 1:1 direct room or move to a credential model that can replay shared/group rooms.
 - Investigate whether Webex overview cards can be refreshed reliably, or replace them with a safer update strategy.
 - Decide whether to root-cause the Mercury SDK/service `url`-undefined disconnect regression, or keep watchdog restart as the long-term mitigation.
@@ -31,7 +32,7 @@ superseded_by:
 ## Blockers
 - Webex bot tokens still cannot replay group-space Data Space history via `GET /messages?roomId=...`.
 - Webex rejects overview card updates with `Invalid roomId`; plain session/final messages and approval cards continue to work.
-- `codex app-server` did not successfully reload some earlier threads by `thread/read`, leaving older sessions failed after restarts.
+- `codex app-server` can still fail to reload some earlier threads by `thread/read`; W1 now classifies those sessions as degraded instead of treating Data Space as sufficient executable authority.
 
 ## Evidence
 - Current command surface: `docs/COMMANDS.md`

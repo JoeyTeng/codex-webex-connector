@@ -8,6 +8,7 @@ use std::sync::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -17,9 +18,10 @@ use tracing_subscriber::EnvFilter;
 use wxcd_codex::{CodexClient, CodexEvent, CodexThreadSummary};
 use wxcd_eventlog::{EventLog, ReplayState};
 use wxcd_proto::{
-    AppConfig, ApprovalDecision, ApprovalKind, BridgeEvent, PendingApproval, SessionFailure,
-    SessionFailureKind, SessionRecord, SessionState, WebexAttachmentActionEvent, WebexIngressAck,
-    WebexIngressEnvelope, WebexMessageEvent, generate_session_id,
+    AppConfig, ApprovalDecision, ApprovalKind, BridgeEvent, LocalSessionMirror, PendingApproval,
+    SessionAuthority, SessionFailure, SessionFailureKind, SessionRecord, SessionState,
+    WebexAttachmentActionEvent, WebexIngressAck, WebexIngressEnvelope, WebexMessageEvent,
+    generate_session_id,
 };
 use wxcd_render::{
     ImportedHistoryTurn, LocalThreadListItem, build_approval_attachment, build_overview_attachment,
@@ -33,6 +35,7 @@ const LOCAL_THREAD_PAGE_SIZE: usize = 20;
 const HISTORY_PAGE_SIZE: usize = 10;
 const IMPORTED_HISTORY_TURN_LIMIT: usize = HISTORY_PAGE_SIZE;
 const RECENT_EVENT_ID_LIMIT: usize = 1024;
+const INSTALLATION_IDENTITY_FILE: &str = "installation-identity.json";
 
 #[derive(Parser)]
 struct Args {}
@@ -113,6 +116,13 @@ struct CreateBridgeSessionInput<'a> {
     repo_path: &'a str,
     thread_id: &'a str,
     checkpoint: &'a str,
+    installation_id: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct InstallationIdentity {
+    installation_id: String,
+    created_at: chrono::DateTime<Utc>,
 }
 
 #[tokio::main]
@@ -135,6 +145,7 @@ async fn run() -> Result<()> {
                 config.bridge.state_dir.display()
             )
         })?;
+    let installation = load_or_create_installation_identity(&config.bridge.state_dir).await?;
 
     remove_stale_socket(&config.bridge.socket_path).await?;
 
@@ -166,15 +177,44 @@ async fn run() -> Result<()> {
 
     let event_log = EventLog::new(&webex, &data_room.id);
     let local_snapshot_path = config.bridge.state_dir.join("bridge-state.json");
-    let replay = match event_log.replay().await {
-        Ok(replay) => replay,
+    let local_replay = load_local_snapshot(&local_snapshot_path).await?;
+    let remote_replay = match event_log.replay().await {
+        Ok(replay) => Some(replay),
         Err(error) => {
             warn!("failed to replay Data Space, falling back to local snapshot: {error:#}");
-            load_local_snapshot(&local_snapshot_path).await?
+            None
         }
     };
+    let replayed_data_space = remote_replay.is_some();
+    let replay = remote_replay.unwrap_or_else(|| wxcd_eventlog::ReplayState {
+        sessions: local_replay.sessions.clone(),
+        pending_approvals: local_replay.pending_approvals.clone(),
+        events_since_snapshot: local_replay.events_since_snapshot,
+    });
     let mut state = WorkerState::from_replay(replay);
-    reconcile_sessions(&config, &webex, &event_log, &mut state, &mut codex).await?;
+    if replayed_data_space {
+        let changed =
+            state.merge_local_mirror(local_replay, &installation.installation_id, Utc::now());
+        if changed {
+            persist_local_snapshot(&local_snapshot_path, &state.to_replay_state().to_snapshot())
+                .await?;
+        }
+    } else {
+        let changed = state.claim_legacy_local_sessions(&installation.installation_id, Utc::now());
+        if changed {
+            persist_local_snapshot(&local_snapshot_path, &state.to_replay_state().to_snapshot())
+                .await?;
+        }
+    }
+    reconcile_sessions(
+        &config,
+        &webex,
+        &event_log,
+        &mut state,
+        &mut codex,
+        &installation,
+    )
+    .await?;
 
     let healthy = Arc::new(AtomicBool::new(false));
     let (webex_tx, mut webex_rx) = mpsc::channel(256);
@@ -201,6 +241,7 @@ async fn run() -> Result<()> {
                     &mut state,
                     &mut codex,
                     &control_room.id,
+                    &installation,
                     event,
                 ).await {
                     error!("failed to handle Webex ingress: {error:#}");
@@ -242,6 +283,7 @@ async fn handle_webex_ingress(
     state: &mut WorkerState,
     codex: &mut CodexClient,
     control_room_id: &str,
+    installation: &InstallationIdentity,
     event: WebexIngressEnvelope,
 ) -> Result<()> {
     match event {
@@ -252,7 +294,16 @@ async fn handle_webex_ingress(
                 return Ok(());
             }
             if message.room_id == control_room_id {
-                handle_control_message(config, webex, event_log, state, codex, &message).await?;
+                handle_control_message(
+                    config,
+                    webex,
+                    event_log,
+                    state,
+                    codex,
+                    installation,
+                    &message,
+                )
+                .await?;
             } else if let Some(session_id) = state.room_to_session.get(&message.room_id).cloned() {
                 handle_session_message(
                     config,
@@ -286,6 +337,7 @@ async fn handle_control_message(
     event_log: &EventLog<'_>,
     state: &mut WorkerState,
     codex: &mut CodexClient,
+    installation: &InstallationIdentity,
     message: &WebexMessageEvent,
 ) -> Result<()> {
     let text = normalize_control_command_text(
@@ -299,7 +351,7 @@ async fn handle_control_message(
         return Ok(());
     }
     if let Some(list_command) = parse_list_command(text) {
-        let mut sessions = state.sessions.values().cloned().collect::<Vec<_>>();
+        let mut sessions = sessions_for_control_list(state, &installation.installation_id);
         sessions.sort_by_key(|session| session.updated_at);
         sessions.reverse();
         let rendered = match list_command.mode {
@@ -376,6 +428,7 @@ async fn handle_control_message(
                 repo_path: &cwd,
                 thread_id,
                 checkpoint: &checkpoint,
+                installation_id: &installation.installation_id,
             },
         )
         .await
@@ -527,6 +580,7 @@ async fn handle_control_message(
             repo_path: cwd,
             thread_id,
             checkpoint: "Session created.",
+            installation_id: &installation.installation_id,
         },
     )
     .await
@@ -629,6 +683,13 @@ async fn create_bridge_session(
         updated_at: Utc::now(),
         archived: false,
         failure: None,
+        authority: Some(SessionAuthority {
+            installation_id: input.installation_id.to_string(),
+        }),
+        local_mirror: Some(LocalSessionMirror {
+            installation_id: input.installation_id.to_string(),
+            mirrored_at: Utc::now(),
+        }),
     };
     state.upsert_session(session.clone());
     persist_event(
@@ -1392,6 +1453,33 @@ fn session_requires_codex_archive(session: &SessionRecord) -> bool {
     session.state != SessionState::Failed
 }
 
+fn sessions_for_control_list(state: &WorkerState, installation_id: &str) -> Vec<SessionRecord> {
+    state
+        .sessions
+        .values()
+        .filter(|session| is_default_list_session(session, installation_id))
+        .cloned()
+        .collect()
+}
+
+fn is_default_list_session(session: &SessionRecord, installation_id: &str) -> bool {
+    !session.archived
+        && session.state != SessionState::Archived
+        && session.state != SessionState::Failed
+        && session_belongs_to_installation(session, installation_id)
+}
+
+fn session_belongs_to_installation(session: &SessionRecord, installation_id: &str) -> bool {
+    session
+        .authority
+        .as_ref()
+        .is_some_and(|authority| authority.installation_id == installation_id)
+        || session
+            .local_mirror
+            .as_ref()
+            .is_some_and(|mirror| mirror.installation_id == installation_id)
+}
+
 async fn refresh_overview(webex: &WebexClient, session: &SessionRecord) -> Result<()> {
     let Some(message_id) = session.overview_message_id.as_deref() else {
         return Ok(());
@@ -1421,6 +1509,7 @@ async fn reconcile_sessions(
     event_log: &EventLog<'_>,
     state: &mut WorkerState,
     codex: &mut CodexClient,
+    installation: &InstallationIdentity,
 ) -> Result<()> {
     let session_ids = state.sessions.keys().cloned().collect::<Vec<_>>();
     for session_id in session_ids {
@@ -1428,6 +1517,9 @@ async fn reconcile_sessions(
             continue;
         };
         if session.archived {
+            continue;
+        }
+        if !session_belongs_to_installation(&session, &installation.installation_id) {
             continue;
         }
         let probe = probe_session_thread(codex, &session).await;
@@ -1562,11 +1654,14 @@ fn apply_thread_probe(
             updated.updated_at = detected_at;
             Some(updated)
         }
-        ThreadProbeKind::MissingThread | ThreadProbeKind::UnreadableThread => {
+        ThreadProbeKind::MissingThread
+        | ThreadProbeKind::UnreadableThread
+        | ThreadProbeKind::ProbeUnavailable => {
             let failure_kind = match probe.kind {
                 ThreadProbeKind::MissingThread => SessionFailureKind::MissingThread,
                 ThreadProbeKind::UnreadableThread => SessionFailureKind::UnreadableThread,
-                _ => unreachable!(),
+                ThreadProbeKind::ProbeUnavailable => SessionFailureKind::ProbeUnavailable,
+                ThreadProbeKind::Readable => unreachable!(),
             };
             if session.state == SessionState::Failed
                 && session.failure.as_ref().is_some_and(|failure| {
@@ -1586,7 +1681,6 @@ fn apply_thread_probe(
             updated.updated_at = detected_at;
             Some(updated)
         }
-        ThreadProbeKind::ProbeUnavailable => None,
     }
 }
 
@@ -2273,6 +2367,38 @@ async fn persist_local_snapshot(path: &Path, snapshot: &wxcd_proto::BridgeSnapsh
     Ok(())
 }
 
+async fn load_or_create_installation_identity(state_dir: &Path) -> Result<InstallationIdentity> {
+    let path = state_dir.join(INSTALLATION_IDENTITY_FILE);
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("failed to read installation identity {}", path.display()))?;
+        let identity = serde_json::from_str::<InstallationIdentity>(&content)
+            .with_context(|| format!("failed to parse installation identity {}", path.display()))?;
+        if identity.installation_id.trim().is_empty() {
+            bail!(
+                "installation identity {} has an empty installation_id",
+                path.display()
+            );
+        }
+        return Ok(identity);
+    }
+
+    let identity = InstallationIdentity {
+        installation_id: generate_installation_id(Utc::now()),
+        created_at: Utc::now(),
+    };
+    let encoded = serde_json::to_string_pretty(&identity)?;
+    tokio::fs::write(&path, encoded)
+        .await
+        .with_context(|| format!("failed to write installation identity {}", path.display()))?;
+    Ok(identity)
+}
+
+fn generate_installation_id(now: chrono::DateTime<Utc>) -> String {
+    format!("ins_{}_{}", now.format("%Y%m%d"), uuid_suffix())
+}
+
 impl WorkerState {
     fn from_replay(replay: ReplayState) -> Self {
         let mut state = Self {
@@ -2311,6 +2437,79 @@ impl WorkerState {
             .retain(|_, approval| approval.session_id != session_id);
     }
 
+    fn merge_local_mirror(
+        &mut self,
+        local_replay: ReplayState,
+        installation_id: &str,
+        mirrored_at: chrono::DateTime<Utc>,
+    ) -> bool {
+        let mut changed = false;
+        for local_session in local_replay.sessions.into_values() {
+            if !session_is_claimable_local_mirror(&local_session, installation_id) {
+                continue;
+            }
+            let Some(session) = self.sessions.get_mut(&local_session.session_id) else {
+                continue;
+            };
+            if session.authority.is_none() {
+                session.authority = Some(SessionAuthority {
+                    installation_id: installation_id.to_string(),
+                });
+                changed = true;
+            }
+            let desired_mirror = local_session
+                .local_mirror
+                .filter(|mirror| mirror.installation_id == installation_id)
+                .unwrap_or_else(|| LocalSessionMirror {
+                    installation_id: installation_id.to_string(),
+                    mirrored_at,
+                });
+            if session.local_mirror.as_ref() != Some(&desired_mirror) {
+                session.local_mirror = Some(desired_mirror);
+                changed = true;
+            }
+        }
+        if changed {
+            self.rebuild_session_indexes();
+        }
+        changed
+    }
+
+    fn claim_legacy_local_sessions(
+        &mut self,
+        installation_id: &str,
+        mirrored_at: chrono::DateTime<Utc>,
+    ) -> bool {
+        let mut changed = false;
+        for session in self.sessions.values_mut() {
+            if session.authority.is_none() {
+                session.authority = Some(SessionAuthority {
+                    installation_id: installation_id.to_string(),
+                });
+                changed = true;
+            }
+            if session.local_mirror.is_none() {
+                session.local_mirror = Some(LocalSessionMirror {
+                    installation_id: installation_id.to_string(),
+                    mirrored_at,
+                });
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn rebuild_session_indexes(&mut self) {
+        self.room_to_session.clear();
+        self.thread_to_session.clear();
+        for session in self.sessions.values() {
+            self.room_to_session
+                .insert(session.session_room_id.clone(), session.session_id.clone());
+            self.thread_to_session
+                .insert(session.thread_id.clone(), session.session_id.clone());
+        }
+    }
+
     fn remember_event(&mut self, event_id: &str) -> bool {
         if self.recent_event_ids.contains(event_id) {
             return false;
@@ -2334,6 +2533,16 @@ impl WorkerState {
             events_since_snapshot: self.events_since_snapshot,
         }
     }
+}
+
+fn session_is_claimable_local_mirror(session: &SessionRecord, installation_id: &str) -> bool {
+    session.authority.as_ref().is_none_or(|authority| {
+        authority.installation_id == installation_id
+            || session
+                .local_mirror
+                .as_ref()
+                .is_some_and(|mirror| mirror.installation_id == installation_id)
+    })
 }
 
 #[cfg(test)]

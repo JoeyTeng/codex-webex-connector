@@ -433,6 +433,8 @@ mod tests {
             updated_at: Utc::now(),
             archived: false,
             failure: None,
+            authority: None,
+            local_mirror: None,
         }
     }
 

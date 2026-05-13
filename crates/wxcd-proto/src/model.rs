@@ -30,6 +30,17 @@ pub struct SessionFailure {
     pub detected_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionAuthority {
+    pub installation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalSessionMirror {
+    pub installation_id: String,
+    pub mirrored_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub session_id: String,
@@ -50,6 +61,10 @@ pub struct SessionRecord {
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<SessionFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<SessionAuthority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_mirror: Option<LocalSessionMirror>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,7 +195,7 @@ mod tests {
     use chrono::TimeZone;
     use serde_json::json;
 
-    use super::{SessionRecord, generate_session_id};
+    use super::{BridgeSnapshot, SessionRecord, generate_session_id};
 
     #[test]
     fn session_id_has_expected_shape() {
@@ -217,5 +232,40 @@ mod tests {
 
         let session: SessionRecord = serde_json::from_value(value).unwrap();
         assert!(session.failure.is_none());
+        assert!(session.authority.is_none());
+        assert!(session.local_mirror.is_none());
+    }
+
+    #[test]
+    fn bridge_snapshot_authority_metadata_is_backward_compatible() {
+        let value = json!({
+            "created_at": "2026-04-08T12:00:00Z",
+            "sessions": [
+                {
+                    "session_id": "ses_1",
+                    "title": "WXCD ses_1 repo",
+                    "repo_name": "repo",
+                    "repo_path": "/tmp/repo",
+                    "owner_email": "user@example.com",
+                    "session_room_id": "room",
+                    "session_room_web_link": null,
+                    "thread_id": "thread",
+                    "overview_message_id": null,
+                    "state": "idle",
+                    "last_checkpoint": null,
+                    "last_final": null,
+                    "active_turn_id": null,
+                    "active_turn_buffer": "",
+                    "updated_at": "2026-04-08T12:00:00Z",
+                    "archived": false
+                }
+            ],
+            "pending_approvals": []
+        });
+
+        let snapshot: BridgeSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert!(snapshot.sessions[0].authority.is_none());
+        assert!(snapshot.sessions[0].local_mirror.is_none());
     }
 }
