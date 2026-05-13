@@ -414,26 +414,55 @@ fn failed_sessions_do_not_require_codex_archive() {
 
 #[test]
 fn validates_failed_cleanup_targets() {
+    let installation_id = "ins_current";
     let mut state = WorkerState::default();
-    state.upsert_session(session_record("ses_failed", SessionState::Failed, false));
-    state.upsert_session(session_record("ses_idle", SessionState::Idle, false));
-    state.upsert_session(session_record("ses_archived", SessionState::Archived, true));
+    state.upsert_session(managed_session_record(
+        "ses_failed",
+        SessionState::Failed,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_idle",
+        SessionState::Idle,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_archived",
+        SessionState::Archived,
+        true,
+        installation_id,
+    ));
 
-    assert!(ensure_failed_cleanup_target(&state, "ses_failed").is_ok());
-    assert!(ensure_failed_cleanup_target(&state, "ses_idle").is_err());
-    assert!(ensure_failed_cleanup_target(&state, "ses_archived").is_err());
-    assert!(ensure_failed_cleanup_target(&state, "ses_missing").is_err());
+    assert!(ensure_failed_cleanup_target(&state, "ses_failed", installation_id).is_ok());
+    assert!(ensure_failed_cleanup_target(&state, "ses_idle", installation_id).is_err());
+    assert!(ensure_failed_cleanup_target(&state, "ses_archived", installation_id).is_err());
+    assert!(ensure_failed_cleanup_target(&state, "ses_missing", installation_id).is_err());
+    assert!(ensure_failed_cleanup_target(&state, "ses_failed", "ins_other").is_err());
 }
 
 #[test]
 fn validates_archived_purge_targets() {
+    let installation_id = "ins_current";
     let mut state = WorkerState::default();
-    state.upsert_session(session_record("ses_archived", SessionState::Archived, true));
-    state.upsert_session(session_record("ses_idle", SessionState::Idle, false));
+    state.upsert_session(managed_session_record(
+        "ses_archived",
+        SessionState::Archived,
+        true,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_idle",
+        SessionState::Idle,
+        false,
+        installation_id,
+    ));
 
-    assert!(validate_purge_archived_session(&state, "ses_archived").is_ok());
-    assert!(validate_purge_archived_session(&state, "ses_idle").is_err());
-    assert!(validate_purge_archived_session(&state, "ses_missing").is_err());
+    assert!(validate_purge_archived_session(&state, "ses_archived", installation_id).is_ok());
+    assert!(validate_purge_archived_session(&state, "ses_idle", installation_id).is_err());
+    assert!(validate_purge_archived_session(&state, "ses_missing", installation_id).is_err());
+    assert!(validate_purge_archived_session(&state, "ses_archived", "ins_other").is_err());
 }
 
 #[test]
@@ -552,6 +581,51 @@ fn local_mirror_does_not_claim_foreign_authority() {
     assert!(!session_belongs_to_installation(session, installation_id));
 }
 
+#[test]
+fn executable_indexes_only_include_current_installation_sessions() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(managed_session_record(
+        "ses_current",
+        SessionState::Idle,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_failed",
+        SessionState::Failed,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_foreign",
+        SessionState::Idle,
+        false,
+        "ins_other",
+    ));
+
+    state.set_executable_installation(installation_id);
+
+    assert_eq!(
+        state
+            .room_to_session
+            .get("room-ses_current")
+            .map(String::as_str),
+        Some("ses_current")
+    );
+    assert_eq!(
+        state
+            .thread_to_session
+            .get("thread-ses_current")
+            .map(String::as_str),
+        Some("ses_current")
+    );
+    assert!(!state.room_to_session.contains_key("room-ses_failed"));
+    assert!(!state.thread_to_session.contains_key("thread-ses_failed"));
+    assert!(!state.room_to_session.contains_key("room-ses_foreign"));
+    assert!(!state.thread_to_session.contains_key("thread-ses_foreign"));
+}
+
 #[tokio::test]
 async fn installation_identity_persists_and_loads() {
     let state_dir = std::env::temp_dir().join(format!(
@@ -631,4 +705,17 @@ fn session_record(session_id: &str, state: SessionState, archived: bool) -> Sess
         authority: None,
         local_mirror: None,
     }
+}
+
+fn managed_session_record(
+    session_id: &str,
+    state: SessionState,
+    archived: bool,
+    installation_id: &str,
+) -> SessionRecord {
+    let mut session = session_record(session_id, state, archived);
+    session.authority = Some(SessionAuthority {
+        installation_id: installation_id.to_string(),
+    });
+    session
 }
