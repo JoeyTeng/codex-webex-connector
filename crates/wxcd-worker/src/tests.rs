@@ -584,6 +584,18 @@ fn local_mirror_does_not_claim_foreign_authority() {
 }
 
 #[test]
+fn foreign_authority_takes_precedence_over_stale_local_mirror() {
+    let installation_id = "ins_current";
+    let mut session = managed_session_record("ses_1", SessionState::Idle, false, "ins_other");
+    session.local_mirror = Some(wxcd_proto::LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+
+    assert!(!session_belongs_to_installation(&session, installation_id));
+}
+
+#[test]
 fn executable_indexes_only_include_current_installation_sessions() {
     let installation_id = "ins_current";
     let mut state = WorkerState::default();

@@ -1560,14 +1560,14 @@ fn is_cleanup_failed_session(session: &SessionRecord, installation_id: &str) -> 
 }
 
 fn session_belongs_to_installation(session: &SessionRecord, installation_id: &str) -> bool {
+    if let Some(authority) = &session.authority {
+        return authority.installation_id == installation_id;
+    }
+
     session
-        .authority
+        .local_mirror
         .as_ref()
-        .is_some_and(|authority| authority.installation_id == installation_id)
-        || session
-            .local_mirror
-            .as_ref()
-            .is_some_and(|mirror| mirror.installation_id == installation_id)
+        .is_some_and(|mirror| mirror.installation_id == installation_id)
 }
 
 fn ensure_session_belongs_to_installation(
