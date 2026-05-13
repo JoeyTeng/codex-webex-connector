@@ -196,13 +196,46 @@ async fn run() -> Result<()> {
     let mut state = WorkerState::from_replay(replay);
     state.set_executable_installation(&installation.installation_id);
     if replayed_data_space {
-        match load_local_snapshot(&local_snapshot_path).await {
-            Ok(local_replay) => {
-                let changed = state.merge_local_mirror(
-                    local_replay,
-                    &installation.installation_id,
-                    Utc::now(),
-                );
+        match load_local_snapshot_with_metadata(&local_snapshot_path).await {
+            Ok(local_snapshot) => {
+                let LocalSnapshotReplay {
+                    replay: local_replay,
+                    metadata,
+                } = local_snapshot;
+                let changed = match metadata.writer_installation_id.as_deref() {
+                    Some(writer_installation_id)
+                        if writer_installation_id == installation.installation_id =>
+                    {
+                        state.merge_local_mirror(
+                            local_replay,
+                            &installation.installation_id,
+                            Utc::now(),
+                            LocalMirrorClaimScope::TrustedSnapshot,
+                        )
+                    }
+                    Some(writer_installation_id) => {
+                        warn!(
+                            "local mirror snapshot belongs to installation {}, ignoring it for current installation {}",
+                            writer_installation_id, installation.installation_id
+                        );
+                        false
+                    }
+                    None if metadata.existed => match collect_local_thread_ids(&mut codex).await {
+                        Ok(local_thread_ids) => state.merge_local_mirror(
+                            local_replay,
+                            &installation.installation_id,
+                            Utc::now(),
+                            LocalMirrorClaimScope::ListedThreads(&local_thread_ids),
+                        ),
+                        Err(error) => {
+                            warn!(
+                                "failed to list local Codex threads before legacy local mirror merge, leaving sessions unclaimed: {error:#}"
+                            );
+                            false
+                        }
+                    },
+                    None => false,
+                };
                 if changed {
                     persist_local_snapshot(&local_snapshot_path, &state.to_snapshot()).await?;
                 }
@@ -389,8 +422,13 @@ async fn handle_control_message(
         let rendered = match list_command.mode {
             ListMode::Bridge => render_control_list(&sessions),
             ListMode::Local => {
-                let local_threads =
-                    collect_local_only_threads(codex, state, list_command.page).await?;
+                let local_threads = collect_local_only_threads(
+                    codex,
+                    state,
+                    &installation.installation_id,
+                    list_command.page,
+                )
+                .await?;
                 render_local_thread_list(
                     &local_threads.items,
                     local_threads.total_count,
@@ -400,8 +438,13 @@ async fn handle_control_message(
                 )
             }
             ListMode::All => {
-                let local_threads =
-                    collect_local_only_threads(codex, state, list_command.page).await?;
+                let local_threads = collect_local_only_threads(
+                    codex,
+                    state,
+                    &installation.installation_id,
+                    list_command.page,
+                )
+                .await?;
                 format!(
                     "{}\n\n{}",
                     render_control_list(&sessions),
@@ -419,7 +462,8 @@ async fn handle_control_message(
         return Ok(());
     }
     if let Some(thread_id) = parse_resume_local_thread_id(text) {
-        let local_thread = find_local_only_thread(codex, state, thread_id).await?;
+        let local_thread =
+            find_local_only_thread(codex, state, &installation.installation_id, thread_id).await?;
         let resumed = codex
             .thread_resume(thread_id)
             .await
@@ -2147,11 +2191,13 @@ fn is_control_command(text: &str) -> bool {
 async fn collect_local_only_threads(
     codex: &mut CodexClient,
     state: &WorkerState,
+    installation_id: &str,
     page: usize,
 ) -> Result<LocalOnlyThreads> {
     let managed_thread_ids = state
         .sessions
         .values()
+        .filter(|session| session_belongs_to_installation(session, installation_id))
         .map(|session| session.thread_id.as_str())
         .collect::<HashSet<_>>();
 
@@ -2227,9 +2273,10 @@ fn summarize_local_thread(thread: CodexThreadSummary) -> LocalThreadListItem {
 async fn find_local_only_thread(
     codex: &mut CodexClient,
     state: &WorkerState,
+    installation_id: &str,
     thread_id: &str,
 ) -> Result<CodexThreadSummary> {
-    if let Some(session_id) = attached_session_for_thread(state, thread_id) {
+    if let Some(session_id) = attached_session_for_thread(state, thread_id, installation_id) {
         bail!("local Codex thread `{thread_id}` is already attached as session `{session_id}`");
     }
 
@@ -2248,11 +2295,18 @@ async fn find_local_only_thread(
     bail!("unknown local Codex thread `{thread_id}`")
 }
 
-fn attached_session_for_thread<'a>(state: &'a WorkerState, thread_id: &str) -> Option<&'a str> {
+fn attached_session_for_thread<'a>(
+    state: &'a WorkerState,
+    thread_id: &str,
+    installation_id: &str,
+) -> Option<&'a str> {
     state
         .sessions
         .values()
-        .find(|session| session.thread_id == thread_id)
+        .find(|session| {
+            session.thread_id == thread_id
+                && session_belongs_to_installation(session, installation_id)
+        })
         .map(|session| session.session_id.as_str())
 }
 
@@ -2520,12 +2574,6 @@ async fn remove_stale_socket(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn load_local_snapshot(path: &Path) -> Result<ReplayState> {
-    load_local_snapshot_with_metadata(path)
-        .await
-        .map(|snapshot| snapshot.replay)
-}
-
 #[derive(Debug)]
 struct LocalSnapshotMetadata {
     existed: bool,
@@ -2657,10 +2705,14 @@ impl WorkerState {
         local_replay: ReplayState,
         installation_id: &str,
         mirrored_at: chrono::DateTime<Utc>,
+        claim_scope: LocalMirrorClaimScope<'_>,
     ) -> bool {
         let mut changed = false;
         for local_session in local_replay.sessions.into_values() {
             if !session_is_claimable_local_mirror(&local_session, installation_id) {
+                continue;
+            }
+            if !claim_scope.allows(&local_session) {
                 continue;
             }
             let Some(session) = self.sessions.get_mut(&local_session.session_id) else {
@@ -2772,6 +2824,21 @@ impl WorkerState {
         let mut snapshot = self.to_replay_state().to_snapshot();
         snapshot.writer_installation_id = self.executable_installation_id.clone();
         snapshot
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LocalMirrorClaimScope<'a> {
+    TrustedSnapshot,
+    ListedThreads(&'a HashSet<String>),
+}
+
+impl LocalMirrorClaimScope<'_> {
+    fn allows(&self, session: &SessionRecord) -> bool {
+        match self {
+            Self::TrustedSnapshot => true,
+            Self::ListedThreads(local_thread_ids) => local_thread_ids.contains(&session.thread_id),
+        }
     }
 }
 

@@ -1,15 +1,16 @@
 use super::{
-    CleanupFailedCommand, DiagnoseCommand, ListCommand, ListMode, PurgeArchivedCommand,
-    RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerState, abbreviate,
-    apply_thread_probe, attached_session_for_thread, ensure_approval_belongs_to_installation,
-    ensure_failed_cleanup_target, ensure_session_id_belongs_to_installation,
-    extract_thread_history_turns, generate_installation_id, is_default_list_session,
-    load_local_snapshot_with_metadata, load_or_create_installation_identity,
-    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
-    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
-    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
-    repo_name_for_cwd, session_belongs_to_installation, session_requires_codex_archive,
-    sessions_for_diagnostics, slice_thread_history_page, validate_purge_archived_session,
+    CleanupFailedCommand, DiagnoseCommand, ListCommand, ListMode, LocalMirrorClaimScope,
+    PurgeArchivedCommand, RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerState,
+    abbreviate, apply_thread_probe, attached_session_for_thread,
+    ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
+    ensure_session_id_belongs_to_installation, extract_thread_history_turns,
+    generate_installation_id, is_default_list_session, load_local_snapshot_with_metadata,
+    load_or_create_installation_identity, normalize_control_command_text,
+    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
+    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
+    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
+    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
+    slice_thread_history_page, validate_purge_archived_session,
 };
 use chrono::Utc;
 use serde_json::json;
@@ -542,7 +543,12 @@ fn local_mirror_can_claim_legacy_remote_session() {
         session_record("ses_1", SessionState::Idle, false),
     );
 
-    assert!(state.merge_local_mirror(local_replay, installation_id, Utc::now()));
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::TrustedSnapshot
+    ));
     let session = state.sessions.get("ses_1").unwrap();
     assert!(session_belongs_to_installation(session, installation_id));
     assert_eq!(
@@ -578,9 +584,56 @@ fn local_mirror_does_not_claim_foreign_authority() {
     let mut local_replay = wxcd_eventlog::ReplayState::default();
     local_replay.sessions.insert("ses_1".to_string(), local);
 
-    assert!(!state.merge_local_mirror(local_replay, installation_id, Utc::now()));
+    assert!(!state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::TrustedSnapshot
+    ));
     let session = state.sessions.get("ses_1").unwrap();
     assert!(!session_belongs_to_installation(session, installation_id));
+}
+
+#[test]
+fn legacy_local_mirror_claim_requires_listed_thread() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert(
+        "ses_1".to_string(),
+        session_record("ses_1", SessionState::Idle, false),
+    );
+    let local_thread_ids = std::collections::HashSet::new();
+
+    assert!(!state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::ListedThreads(&local_thread_ids)
+    ));
+    assert!(!session_belongs_to_installation(
+        state.sessions.get("ses_1").unwrap(),
+        installation_id
+    ));
+
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert(
+        "ses_1".to_string(),
+        session_record("ses_1", SessionState::Idle, false),
+    );
+    let local_thread_ids = std::iter::once("thread-ses_1".to_string()).collect();
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::ListedThreads(&local_thread_ids)
+    ));
+    assert!(session_belongs_to_installation(
+        state.sessions.get("ses_1").unwrap(),
+        installation_id
+    ));
 }
 
 #[test]
@@ -742,7 +795,7 @@ fn diagnose_summary_filters_foreign_sessions() {
 }
 
 #[test]
-fn duplicate_thread_detection_uses_all_recorded_sessions() {
+fn duplicate_thread_detection_uses_current_installation_sessions() {
     let installation_id = "ins_current";
     let mut state = WorkerState::default();
     state.upsert_session(managed_session_record(
@@ -751,12 +804,22 @@ fn duplicate_thread_detection_uses_all_recorded_sessions() {
         false,
         installation_id,
     ));
+    state.upsert_session(managed_session_record(
+        "ses_foreign",
+        SessionState::Idle,
+        false,
+        "ins_other",
+    ));
     state.set_executable_installation(installation_id);
 
     assert!(!state.thread_to_session.contains_key("thread-ses_failed"));
     assert_eq!(
-        attached_session_for_thread(&state, "thread-ses_failed"),
+        attached_session_for_thread(&state, "thread-ses_failed", installation_id),
         Some("ses_failed")
+    );
+    assert_eq!(
+        attached_session_for_thread(&state, "thread-ses_foreign", installation_id),
+        None
     );
 }
 
