@@ -27,3 +27,4 @@ superseded_by:
 - Validation: `cargo test` passed locally on 2026-05-13.
 - Review: helper-backed `codex-review` on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..ba9601f` found timeout, installed manifest path, and macOS UDS test-path risks; the follow-up commit fixed all three.
 - Final review: helper-backed `codex-review` on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..30ec21f` found missing runtime handshake and missing `CBTH_*` env support; the follow-up fix adds supervisor startup hello and cbth env derivation.
+- Final review follow-up: clear-context review on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..0b1daa2` found the runtime supervisor hello still lacked a timeout; the follow-up fix bounds startup plugin RPC hello.

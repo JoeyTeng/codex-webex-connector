@@ -14,6 +14,8 @@ use wxcd_cbth_rpc::{
 };
 use wxcd_proto::{AppConfig, CbthPluginConfig};
 
+const PLUGIN_RPC_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[derive(Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -105,27 +107,41 @@ async fn connect_cbth_plugin_rpc(config: &CbthPluginConfig) -> Result<Option<Plu
         bail!("cbth plugin mode is enabled but no plugin RPC socket is configured");
     };
 
-    let mut client = PluginRpcClient::connect(socket_path).await?;
-    let response = client
-        .plugin_hello(PluginHelloRequest {
-            plugin_name: "webex-connector".to_string(),
-            plugin_instance_id: config.plugin_instance_id.clone(),
-            plugin_release_id: config.plugin_release_id.clone(),
-            protocol_versions: vec![PLUGIN_RPC_PROTOCOL_VERSION_V1],
-            capabilities: vec![
-                PluginCapability::new("diagnostics"),
-                PluginCapability::new("standalone-compatible"),
-            ],
-            plugin_home: config.plugin_home.display().to_string(),
-            pid: std::process::id(),
-        })
-        .await
-        .context("failed to complete cbth plugin hello")?;
+    let (client, response) = timeout(PLUGIN_RPC_STARTUP_TIMEOUT, async {
+        let mut client = PluginRpcClient::connect(socket_path).await?;
+        let response = client
+            .plugin_hello(plugin_hello_request(config))
+            .await
+            .context("failed to complete cbth plugin hello")?;
+        Ok::<_, anyhow::Error>((client, response))
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "timed out after {}s completing cbth plugin hello",
+            PLUGIN_RPC_STARTUP_TIMEOUT.as_secs()
+        )
+    })??;
     info!(
         "cbth plugin RPC hello completed with protocol version {}",
         response.protocol_version
     );
     Ok(Some(client))
+}
+
+fn plugin_hello_request(config: &CbthPluginConfig) -> PluginHelloRequest {
+    PluginHelloRequest {
+        plugin_name: "webex-connector".to_string(),
+        plugin_instance_id: config.plugin_instance_id.clone(),
+        plugin_release_id: config.plugin_release_id.clone(),
+        protocol_versions: vec![PLUGIN_RPC_PROTOCOL_VERSION_V1],
+        capabilities: vec![
+            PluginCapability::new("diagnostics"),
+            PluginCapability::new("standalone-compatible"),
+        ],
+        plugin_home: config.plugin_home.display().to_string(),
+        pid: std::process::id(),
+    }
 }
 
 async fn activate_release(release_dir: PathBuf) -> Result<()> {
