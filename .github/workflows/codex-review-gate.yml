@@ -1,18 +1,22 @@
 name: Codex Review Gate
 
-"on":
+on:
   pull_request_target:
-    types:
-      - opened
-      - reopened
-      - synchronize
-      - ready_for_review
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  schedule:
+    - cron: "0 */2 * * *"
   workflow_dispatch:
     inputs:
       pull_request:
-        description: Pull request number to review
-        required: true
-        type: number
+        description: Optional pull request number to gate
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -21,39 +25,53 @@ permissions:
   statuses: write
 
 concurrency:
-  group: codex-review-gate-${{ github.event.pull_request.number || inputs.pull_request }}
-  cancel-in-progress: true
+  group: codex-review-gate-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
-  review-gate:
+  codex-review-gate:
     name: codex/review-gate runner
-    runs-on: ubuntu-latest
-    timeout-minutes: 130
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    if: >-
+      ${{
+        (github.event_name != 'schedule' || vars.CODEX_REVIEW_GATE_AUTO_RETRY != 'false') &&
+        (github.event_name != 'pull_request_target' ||
+          github.event.pull_request.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'issue_comment' ||
+          github.event.issue.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'pull_request_review' ||
+          github.event.pull_request.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'pull_request_review_comment' ||
+          github.event.pull_request.user.login != 'dependabot[bot]') &&
+        (github.event_name != 'issue_comment' ||
+          (github.event.issue.pull_request &&
+            (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.comment.user.login)) ||
+             contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(', {0},', github.event.comment.user.login))))) &&
+        (github.event_name != 'pull_request_review' ||
+          (vars.CODEX_REVIEW_GATE_EVENT_MODE != 'comment-only' &&
+            github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name &&
+            (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.review.user.login)) ||
+             contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(', {0},', github.event.review.user.login))))) &&
+        (github.event_name != 'pull_request_review_comment' ||
+          (vars.CODEX_REVIEW_GATE_EVENT_MODE == 'full' &&
+            github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name &&
+            (contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(',{0},', github.event.comment.user.login)) ||
+             contains(format(',chatgpt-codex-connector,chatgpt-codex-connector[bot],{0},',
+              vars.CODEX_REVIEW_GATE_BOT_LOGINS), format(', {0},', github.event.comment.user.login)))))
+      }}
+    runs-on: ${{ fromJSON(vars.CODEX_REVIEW_GATE_RUNNER_LABELS || '["ubuntu-slim"]') }}
+    timeout-minutes: 15
     steps:
-      - name: Resolve pull request
-        id: pull_request
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pull_request }}
-          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-
-          if [ -n "${EVENT_HEAD_SHA}" ]; then
-            head_sha="${EVENT_HEAD_SHA}"
-          else
-            head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq ".head.sha")"
-          fi
-
-          {
-            echo "number=${PR_NUMBER}"
-            echo "head_sha=${head_sha}"
-          } >> "${GITHUB_OUTPUT}"
-
       - name: Run Codex Review Gate
-        uses: JoeyTeng/codex-review-gate@b6a2fc7d011ba60d9220e6f881c8d5e7c733fc2d
+        uses: JoeyTeng/codex-review-gate@eb8a85fedccf6d4278e9b5d6de4a1824e103d5d0
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          pull-request: ${{ steps.pull_request.outputs.number }}
-          head-sha: ${{ steps.pull_request.outputs.head_sha }}
+          github-token: ${{ github.token }}
+          pull-request: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}
+          head-sha: ${{ github.event.pull_request.head.sha || '' }}
+          event-mode: ${{ vars.CODEX_REVIEW_GATE_EVENT_MODE }}
+          codex-bot-logins: ${{ vars.CODEX_REVIEW_GATE_BOT_LOGINS }}
+          completion-signal-buffer-seconds: ${{ vars.CODEX_REVIEW_GATE_COMPLETION_SIGNAL_BUFFER_SECONDS || '30' }}
