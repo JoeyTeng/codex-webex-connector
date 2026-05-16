@@ -26,6 +26,7 @@ superseded_by:
 - W1 local snapshot mirror merge preserves snapshot-only current sessions, and missing identity recovery tolerates malformed fallback snapshots by warning and minting a fresh identity.
 - W1 preserves existing installation identity lookup errors instead of minting replacement IDs, and failed session rooms only accept recovery/status commands while staying routable.
 - W1 persists local mirror merge results back to Data Space snapshots and merges newer local snapshot session fields plus current-installation pending approvals after successful replay.
+- W1 remote replay tombstones prevent stale local mirror snapshots from resurrecting purged sessions, resolved approvals, or remotely archived sessions.
 - Failed session rooms remain routable for in-room recovery commands, `/list all` includes archived sessions for purge discovery, and legacy claim evidence includes archived Codex threads without making archived sessions executable.
 
 ## Next Steps

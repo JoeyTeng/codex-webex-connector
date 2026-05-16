@@ -641,6 +641,56 @@ fn local_mirror_preserves_snapshot_only_current_session_during_claim_merge() {
 }
 
 #[test]
+fn local_mirror_does_not_resurrect_purged_snapshot_only_session() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state
+        .remote_purged_session_ids
+        .insert("ses_local".to_string());
+
+    let mut local = managed_session_record("ses_local", SessionState::Idle, false, installation_id);
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_local".to_string(), local);
+
+    assert!(!state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+    assert!(!state.sessions.contains_key("ses_local"));
+}
+
+#[test]
+fn local_mirror_skips_snapshot_only_sessions_older_than_remote_snapshot() {
+    let installation_id = "ins_current";
+    let base_time = Utc::now();
+    let mut state = WorkerState::default();
+    state.remote_snapshot_created_at = Some(base_time + Duration::seconds(2));
+
+    let mut local = managed_session_record("ses_local", SessionState::Idle, false, installation_id);
+    local.updated_at = base_time;
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: base_time,
+    });
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_local".to_string(), local);
+
+    assert!(!state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        base_time + Duration::seconds(3),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+    assert!(!state.sessions.contains_key("ses_local"));
+}
+
+#[test]
 fn local_mirror_preserves_newer_same_session_snapshot_state() {
     let installation_id = "ins_current";
     let base_time = Utc::now();
@@ -676,6 +726,39 @@ fn local_mirror_preserves_newer_same_session_snapshot_state() {
     assert_eq!(session.state, SessionState::WaitingApproval);
     assert_eq!(session.last_checkpoint.as_deref(), Some("local checkpoint"));
     assert!(session_belongs_to_installation(session, installation_id));
+}
+
+#[test]
+fn local_mirror_does_not_undo_remote_archive() {
+    let installation_id = "ins_current";
+    let base_time = Utc::now();
+    let mut state = WorkerState::default();
+    let mut remote = managed_session_record("ses_1", SessionState::Archived, true, installation_id);
+    remote.updated_at = base_time;
+    state.upsert_session(remote);
+    state
+        .remote_archived_session_ids
+        .insert("ses_1".to_string());
+
+    let mut local = managed_session_record("ses_1", SessionState::Running, false, installation_id);
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: base_time + Duration::seconds(1),
+    });
+    local.updated_at = base_time + Duration::seconds(1);
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_1".to_string(), local);
+
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        base_time + Duration::seconds(2),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+
+    let session = state.sessions.get("ses_1").unwrap();
+    assert_eq!(session.state, SessionState::Archived);
+    assert!(session.archived);
 }
 
 #[test]
@@ -765,6 +848,82 @@ fn local_mirror_restores_current_pending_approvals() {
 
     assert!(state.pending_approvals.contains_key("apr_current"));
     assert!(!state.pending_approvals.contains_key("apr_foreign"));
+}
+
+#[test]
+fn local_mirror_does_not_readd_remote_resolved_or_snapshot_stale_approvals() {
+    let installation_id = "ins_current";
+    let base_time = Utc::now();
+    let mut state = WorkerState::default();
+    state.remote_snapshot_created_at = Some(base_time + Duration::seconds(2));
+    state
+        .remote_resolved_approval_ids
+        .insert("apr_resolved".to_string());
+    state.upsert_session(managed_session_record(
+        "ses_1",
+        SessionState::WaitingApproval,
+        false,
+        installation_id,
+    ));
+
+    let mut local = managed_session_record(
+        "ses_1",
+        SessionState::WaitingApproval,
+        false,
+        installation_id,
+    );
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: base_time + Duration::seconds(3),
+    });
+    local.updated_at = base_time + Duration::seconds(3);
+    let mut resolved = pending_approval("apr_resolved", "ses_1");
+    resolved.requested_at = base_time + Duration::seconds(3);
+    let mut stale = pending_approval("apr_stale", "ses_1");
+    stale.requested_at = base_time;
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_1".to_string(), local);
+    local_replay
+        .pending_approvals
+        .insert("apr_resolved".to_string(), resolved);
+    local_replay
+        .pending_approvals
+        .insert("apr_stale".to_string(), stale);
+
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        base_time + Duration::seconds(4),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+
+    assert!(!state.pending_approvals.contains_key("apr_resolved"));
+    assert!(!state.pending_approvals.contains_key("apr_stale"));
+}
+
+#[test]
+fn current_writer_scope_retries_authorityless_listed_threads() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert(
+        "ses_1".to_string(),
+        session_record("ses_1", SessionState::Idle, false),
+    );
+    let local_thread_ids = std::iter::once("thread-ses_1".to_string()).collect();
+
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::CurrentWriterSnapshotOrListedThreads(&local_thread_ids)
+    ));
+    assert!(session_belongs_to_installation(
+        state.sessions.get("ses_1").unwrap(),
+        installation_id
+    ));
 }
 
 #[test]

@@ -47,6 +47,10 @@ struct WorkerState {
     room_to_session: HashMap<String, String>,
     thread_to_session: HashMap<String, String>,
     pending_approvals: HashMap<String, PendingApproval>,
+    remote_snapshot_created_at: Option<chrono::DateTime<Utc>>,
+    remote_archived_session_ids: HashSet<String>,
+    remote_purged_session_ids: HashSet<String>,
+    remote_resolved_approval_ids: HashSet<String>,
     recent_event_ids: HashSet<String>,
     recent_event_queue: VecDeque<String>,
     events_since_snapshot: usize,
@@ -213,12 +217,27 @@ async fn run() -> Result<()> {
                     Some(writer_installation_id)
                         if writer_installation_id == installation.installation_id =>
                     {
-                        state.merge_local_mirror(
-                            local_replay,
-                            &installation.installation_id,
-                            Utc::now(),
-                            LocalMirrorClaimScope::CurrentWriterSnapshot,
-                        )
+                        match collect_local_thread_ids(&mut codex, true).await {
+                            Ok(local_thread_ids) => state.merge_local_mirror(
+                                local_replay,
+                                &installation.installation_id,
+                                Utc::now(),
+                                LocalMirrorClaimScope::CurrentWriterSnapshotOrListedThreads(
+                                    &local_thread_ids,
+                                ),
+                            ),
+                            Err(error) => {
+                                warn!(
+                                    "failed to list local Codex threads before current-writer local mirror merge, only applying explicit current-installation evidence: {error:#}"
+                                );
+                                state.merge_local_mirror(
+                                    local_replay,
+                                    &installation.installation_id,
+                                    Utc::now(),
+                                    LocalMirrorClaimScope::CurrentWriterSnapshot,
+                                )
+                            }
+                        }
                     }
                     Some(writer_installation_id) => {
                         warn!(
@@ -243,7 +262,19 @@ async fn run() -> Result<()> {
                             }
                         }
                     }
-                    None => false,
+                    None => match collect_local_thread_ids(&mut codex, true).await {
+                        Ok(local_thread_ids) => state.claim_legacy_local_sessions(
+                            &installation.installation_id,
+                            Utc::now(),
+                            &local_thread_ids,
+                        ),
+                        Err(error) => {
+                            warn!(
+                                "failed to list local Codex threads before legacy Data Space claim, leaving sessions unclaimed: {error:#}"
+                            );
+                            false
+                        }
+                    },
                 };
                 if changed {
                     persist_snapshot(&event_log, &mut state, &config).await?;
@@ -2760,6 +2791,10 @@ impl WorkerState {
     fn from_replay(replay: ReplayState) -> Self {
         let mut state = Self {
             events_since_snapshot: replay.events_since_snapshot,
+            remote_snapshot_created_at: replay.snapshot_created_at,
+            remote_archived_session_ids: replay.archived_session_ids,
+            remote_purged_session_ids: replay.purged_session_ids,
+            remote_resolved_approval_ids: replay.resolved_approval_ids,
             ..Self::default()
         };
         for session in replay.sessions.into_values() {
@@ -2839,7 +2874,11 @@ impl WorkerState {
             if local_session.local_mirror.as_ref() != Some(&desired_mirror) {
                 local_session.local_mirror = Some(desired_mirror.clone());
             }
-            let Some(session) = self.sessions.get_mut(&local_session.session_id) else {
+            let session_id = local_session.session_id.clone();
+            let Some(session) = self.sessions.get(&session_id) else {
+                if self.local_session_is_stale_against_remote(&local_session) {
+                    continue;
+                }
                 self.upsert_session(local_session);
                 changed = true;
                 continue;
@@ -2847,11 +2886,20 @@ impl WorkerState {
             if !remote_session_accepts_local_mirror_claim(session, installation_id) {
                 continue;
             }
-            if local_session.updated_at > session.updated_at {
+            let remote_blocks_local_replacement =
+                remote_session_blocks_local_replacement(session, &local_session)
+                    || (self.remote_archived_session_ids.contains(&session_id)
+                        && !(local_session.archived
+                            || local_session.state == SessionState::Archived));
+            if local_session.updated_at > session.updated_at && !remote_blocks_local_replacement {
                 self.upsert_session(local_session);
                 changed = true;
                 continue;
             }
+            let session = self
+                .sessions
+                .get_mut(&session_id)
+                .expect("session should exist after immutable lookup");
             if session.authority.is_none() || session.local_mirror.as_ref() != Some(&desired_mirror)
             {
                 if session.authority.is_none() {
@@ -2881,6 +2929,9 @@ impl WorkerState {
     ) -> bool {
         let mut changed = false;
         for approval in pending_approvals.into_values() {
+            if self.local_approval_is_stale_against_remote(&approval) {
+                continue;
+            }
             let Some(session) = self.sessions.get(&approval.session_id) else {
                 continue;
             };
@@ -2900,6 +2951,23 @@ impl WorkerState {
             }
         }
         changed
+    }
+
+    fn local_session_is_stale_against_remote(&self, session: &SessionRecord) -> bool {
+        self.remote_purged_session_ids.contains(&session.session_id)
+            || self
+                .remote_snapshot_created_at
+                .as_ref()
+                .is_some_and(|snapshot_created_at| *snapshot_created_at >= session.updated_at)
+    }
+
+    fn local_approval_is_stale_against_remote(&self, approval: &PendingApproval) -> bool {
+        self.remote_resolved_approval_ids
+            .contains(&approval.approval_id)
+            || self
+                .remote_snapshot_created_at
+                .as_ref()
+                .is_some_and(|snapshot_created_at| *snapshot_created_at >= approval.requested_at)
     }
 
     fn claim_legacy_local_sessions(
@@ -2980,6 +3048,10 @@ impl WorkerState {
             sessions: self.sessions.clone(),
             pending_approvals: self.pending_approvals.clone(),
             events_since_snapshot: self.events_since_snapshot,
+            snapshot_created_at: self.remote_snapshot_created_at,
+            archived_session_ids: self.remote_archived_session_ids.clone(),
+            purged_session_ids: self.remote_purged_session_ids.clone(),
+            resolved_approval_ids: self.remote_resolved_approval_ids.clone(),
         }
     }
 
@@ -2993,6 +3065,7 @@ impl WorkerState {
 #[derive(Debug, Clone, Copy)]
 enum LocalMirrorClaimScope<'a> {
     CurrentWriterSnapshot,
+    CurrentWriterSnapshotOrListedThreads(&'a HashSet<String>),
     ListedThreads(&'a HashSet<String>),
 }
 
@@ -3001,6 +3074,10 @@ impl LocalMirrorClaimScope<'_> {
         match self {
             Self::CurrentWriterSnapshot => {
                 local_session_has_current_installation_evidence(session, installation_id)
+            }
+            Self::CurrentWriterSnapshotOrListedThreads(local_thread_ids) => {
+                local_session_has_current_installation_evidence(session, installation_id)
+                    || local_thread_ids.contains(&session.thread_id)
             }
             Self::ListedThreads(local_thread_ids) => local_thread_ids.contains(&session.thread_id),
         }
@@ -3039,6 +3116,14 @@ fn remote_session_accepts_local_mirror_claim(
         .authority
         .as_ref()
         .is_none_or(|authority| authority.installation_id == installation_id)
+}
+
+fn remote_session_blocks_local_replacement(
+    remote_session: &SessionRecord,
+    local_session: &SessionRecord,
+) -> bool {
+    (remote_session.archived || remote_session.state == SessionState::Archived)
+        && !(local_session.archived || local_session.state == SessionState::Archived)
 }
 
 #[cfg(test)]
