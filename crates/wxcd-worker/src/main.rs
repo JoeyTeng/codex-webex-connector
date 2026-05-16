@@ -36,6 +36,7 @@ const HISTORY_PAGE_SIZE: usize = 10;
 const IMPORTED_HISTORY_TURN_LIMIT: usize = HISTORY_PAGE_SIZE;
 const RECENT_EVENT_ID_LIMIT: usize = 1024;
 const INSTALLATION_IDENTITY_FILE: &str = "installation-identity.json";
+const LOCAL_SNAPSHOT_FILE: &str = "bridge-state.json";
 
 #[derive(Parser)]
 struct Args {}
@@ -126,6 +127,12 @@ struct InstallationIdentity {
     created_at: chrono::DateTime<Utc>,
 }
 
+#[derive(Debug, Deserialize)]
+struct LocalSnapshotIdentityMetadata {
+    #[serde(default)]
+    writer_installation_id: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _args = Args::parse();
@@ -177,7 +184,7 @@ async fn run() -> Result<()> {
         .context("failed to initialize codex app-server")?;
 
     let event_log = EventLog::new(&webex, &data_room.id);
-    let local_snapshot_path = config.bridge.state_dir.join("bridge-state.json");
+    let local_snapshot_path = config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE);
     let remote_replay = match event_log.replay().await {
         Ok(replay) => Some(replay),
         Err(error) => {
@@ -1908,7 +1915,7 @@ async fn persist_event(
         return Ok(());
     }
     persist_local_snapshot(
-        &config.bridge.state_dir.join("bridge-state.json"),
+        &config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE),
         &state.to_snapshot(),
     )
     .await?;
@@ -1926,7 +1933,7 @@ async fn persist_snapshot(
     }
     state.events_since_snapshot = 0;
     persist_local_snapshot(
-        &config.bridge.state_dir.join("bridge-state.json"),
+        &config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE),
         &snapshot,
     )
     .await?;
@@ -2636,15 +2643,56 @@ async fn load_or_create_installation_identity(state_dir: &Path) -> Result<Instal
         return Ok(identity);
     }
 
-    let identity = InstallationIdentity {
-        installation_id: generate_installation_id(Utc::now()),
-        created_at: Utc::now(),
+    let identity = match recover_installation_identity_from_snapshot(state_dir).await? {
+        Some(identity) => identity,
+        None => InstallationIdentity {
+            installation_id: generate_installation_id(Utc::now()),
+            created_at: Utc::now(),
+        },
     };
+    persist_installation_identity(&path, &identity).await?;
+    Ok(identity)
+}
+
+async fn recover_installation_identity_from_snapshot(
+    state_dir: &Path,
+) -> Result<Option<InstallationIdentity>> {
+    let snapshot_path = state_dir.join(LOCAL_SNAPSHOT_FILE);
+    if !tokio::fs::try_exists(&snapshot_path).await.unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let content = tokio::fs::read_to_string(&snapshot_path)
+        .await
+        .with_context(|| format!("failed to read local snapshot {}", snapshot_path.display()))?;
+    let metadata: LocalSnapshotIdentityMetadata =
+        serde_json::from_str(&content).with_context(|| {
+            format!(
+                "failed to parse local snapshot {} while recovering missing installation identity",
+                snapshot_path.display()
+            )
+        })?;
+    let Some(installation_id) = metadata.writer_installation_id else {
+        return Ok(None);
+    };
+    if installation_id.trim().is_empty() {
+        bail!(
+            "local snapshot {} has an empty writer_installation_id",
+            snapshot_path.display()
+        );
+    }
+    Ok(Some(InstallationIdentity {
+        installation_id,
+        created_at: Utc::now(),
+    }))
+}
+
+async fn persist_installation_identity(path: &Path, identity: &InstallationIdentity) -> Result<()> {
     let encoded = serde_json::to_string_pretty(&identity)?;
     tokio::fs::write(&path, encoded)
         .await
         .with_context(|| format!("failed to write installation identity {}", path.display()))?;
-    Ok(identity)
+    Ok(())
 }
 
 fn generate_installation_id(now: chrono::DateTime<Utc>) -> String {

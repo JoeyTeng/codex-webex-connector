@@ -943,6 +943,65 @@ async fn installation_identity_persists_and_loads() {
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 
+#[tokio::test]
+async fn installation_identity_recovers_from_snapshot_writer() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-installation-recovery-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+    let snapshot_path = state_dir.join("bridge-state.json");
+    let snapshot = BridgeSnapshot {
+        created_at: Utc::now(),
+        writer_installation_id: Some("ins_recovered".to_string()),
+        sessions: Vec::new(),
+        pending_approvals: Vec::new(),
+    };
+    tokio::fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap())
+        .await
+        .unwrap();
+
+    let recovered = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+    let loaded = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+
+    assert_eq!(recovered.installation_id, "ins_recovered");
+    assert_eq!(loaded, recovered);
+
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn installation_identity_mints_for_legacy_snapshot_without_writer() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-installation-legacy-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+    let snapshot_path = state_dir.join("bridge-state.json");
+    let snapshot = BridgeSnapshot {
+        created_at: Utc::now(),
+        writer_installation_id: None,
+        sessions: Vec::new(),
+        pending_approvals: Vec::new(),
+    };
+    tokio::fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap())
+        .await
+        .unwrap();
+
+    let created = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+
+    assert!(created.installation_id.starts_with("ins_"));
+    assert_ne!(created.installation_id, "ins_recovered");
+
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
 #[test]
 fn remove_session_cleans_indexes_and_approvals() {
     let mut state = WorkerState::default();

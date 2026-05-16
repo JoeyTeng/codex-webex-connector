@@ -22,6 +22,7 @@ superseded_by:
 - Live E2E coverage exists in `docs/WEBEX_E2E_TEST_PLAN.md` for temporary rooms, local-only thread creation, `resume local`, history paging, session turns, `attach`, recovery cleanup, and cleanup.
 - W1 state authority split records a stable local installation identity under `state_dir`, treats Data Space as an index/audit log, and uses the local snapshot/mirror plus readable Codex thread as the executable authority for default control lists.
 - W1 current-writer local snapshots still require explicit current-installation `authority` or `local_mirror` evidence before claiming remote legacy sessions; authority-less legacy snapshot records require listed local Codex thread evidence.
+- If `installation-identity.json` is missing but a W1 local snapshot records a writer installation, startup recovers and persists that writer identity before minting any new installation id.
 
 ## Next Steps
 - Use `diagnose sessions` and `cleanup failed <session_id>` on degraded sessions whose local Codex thread is missing, unreadable, or not probeable.
