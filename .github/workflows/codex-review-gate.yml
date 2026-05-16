@@ -67,7 +67,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Run Codex Review Gate
-        uses: JoeyTeng/codex-review-gate@eb8a85fedccf6d4278e9b5d6de4a1824e103d5d0
+        uses: JoeyTeng/codex-review-gate@v1.2.0
         with:
           github-token: ${{ github.token }}
           pull-request: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}
