@@ -210,7 +210,7 @@ async fn run() -> Result<()> {
                             local_replay,
                             &installation.installation_id,
                             Utc::now(),
-                            LocalMirrorClaimScope::TrustedSnapshot,
+                            LocalMirrorClaimScope::CurrentWriterSnapshot,
                         )
                     }
                     Some(writer_installation_id) => {
@@ -2712,7 +2712,7 @@ impl WorkerState {
             if !local_session_is_claimable_mirror_evidence(&local_session, installation_id) {
                 continue;
             }
-            if !claim_scope.allows(&local_session) {
+            if !claim_scope.allows(&local_session, installation_id) {
                 continue;
             }
             let Some(session) = self.sessions.get_mut(&local_session.session_id) else {
@@ -2832,14 +2832,16 @@ impl WorkerState {
 
 #[derive(Debug, Clone, Copy)]
 enum LocalMirrorClaimScope<'a> {
-    TrustedSnapshot,
+    CurrentWriterSnapshot,
     ListedThreads(&'a HashSet<String>),
 }
 
 impl LocalMirrorClaimScope<'_> {
-    fn allows(&self, session: &SessionRecord) -> bool {
+    fn allows(&self, session: &SessionRecord, installation_id: &str) -> bool {
         match self {
-            Self::TrustedSnapshot => true,
+            Self::CurrentWriterSnapshot => {
+                local_session_has_current_installation_evidence(session, installation_id)
+            }
             Self::ListedThreads(local_thread_ids) => local_thread_ids.contains(&session.thread_id),
         }
     }
@@ -2853,6 +2855,20 @@ fn local_session_is_claimable_mirror_evidence(
         .authority
         .as_ref()
         .is_none_or(|authority| authority.installation_id == installation_id)
+}
+
+fn local_session_has_current_installation_evidence(
+    session: &SessionRecord,
+    installation_id: &str,
+) -> bool {
+    session
+        .authority
+        .as_ref()
+        .is_some_and(|authority| authority.installation_id == installation_id)
+        || session
+            .local_mirror
+            .as_ref()
+            .is_some_and(|mirror| mirror.installation_id == installation_id)
 }
 
 fn remote_session_accepts_local_mirror_claim(

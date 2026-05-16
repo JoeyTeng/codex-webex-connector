@@ -532,22 +532,24 @@ fn control_list_filters_non_executable_sessions() {
 }
 
 #[test]
-fn local_mirror_can_claim_legacy_remote_session() {
+fn current_writer_local_mirror_can_claim_current_session() {
     let installation_id = "ins_current";
     let mut state = WorkerState::default();
     state.upsert_session(session_record("ses_1", SessionState::Idle, false));
 
+    let mut local = session_record("ses_1", SessionState::Idle, false);
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
     let mut local_replay = wxcd_eventlog::ReplayState::default();
-    local_replay.sessions.insert(
-        "ses_1".to_string(),
-        session_record("ses_1", SessionState::Idle, false),
-    );
+    local_replay.sessions.insert("ses_1".to_string(), local);
 
     assert!(state.merge_local_mirror(
         local_replay,
         installation_id,
         Utc::now(),
-        LocalMirrorClaimScope::TrustedSnapshot
+        LocalMirrorClaimScope::CurrentWriterSnapshot
     ));
     let session = state.sessions.get("ses_1").unwrap();
     assert!(session_belongs_to_installation(session, installation_id));
@@ -565,6 +567,30 @@ fn local_mirror_can_claim_legacy_remote_session() {
             .map(|mirror| mirror.installation_id.as_str()),
         Some(installation_id)
     );
+}
+
+#[test]
+fn current_writer_local_mirror_does_not_claim_authorityless_legacy_session() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert(
+        "ses_1".to_string(),
+        session_record("ses_1", SessionState::Idle, false),
+    );
+
+    assert!(!state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+    let session = state.sessions.get("ses_1").unwrap();
+    assert!(!session_belongs_to_installation(session, installation_id));
+    assert!(session.authority.is_none());
+    assert!(session.local_mirror.is_none());
 }
 
 #[test]
@@ -592,7 +618,7 @@ fn local_mirror_does_not_claim_foreign_authority() {
         local_replay,
         installation_id,
         Utc::now(),
-        LocalMirrorClaimScope::TrustedSnapshot
+        LocalMirrorClaimScope::CurrentWriterSnapshot
     ));
     let session = state.sessions.get("ses_1").unwrap();
     assert!(!session_belongs_to_installation(session, installation_id));
@@ -620,7 +646,7 @@ fn stale_local_mirror_does_not_claim_legacy_remote_session() {
         local_replay,
         installation_id,
         Utc::now(),
-        LocalMirrorClaimScope::TrustedSnapshot
+        LocalMirrorClaimScope::CurrentWriterSnapshot
     ));
     let session = state.sessions.get("ses_1").unwrap();
     assert!(!session_belongs_to_installation(session, installation_id));
