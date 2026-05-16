@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Webex control-room bridge for Codex sessions.",
   "entrypoint": {
-    "binary": "bin/wxcd-supervisor",
+    "binary": "../bin/wxcd-supervisor",
     "args": ["run"]
   },
   "capabilities": [
@@ -41,7 +41,7 @@
     "required": []
   },
   "diagnostics": {
-    "command": ["bin/wxcd-worker", "doctor"],
+    "command": ["../bin/wxcd-worker", "doctor"],
     "requires_webex_credentials": false
   }
 }

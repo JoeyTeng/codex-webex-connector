@@ -240,6 +240,7 @@ impl PluginRpcClient {
         &mut self,
         request: PluginHelloRequest,
     ) -> Result<PluginHelloResponse> {
+        let supported_protocol_versions = request.protocol_versions.clone();
         let id = self.next_request_id();
         let frame = PluginRpcRequestFrame::plugin_hello(id.clone(), request)?;
         write_plugin_rpc_frame(&mut self.stream, &frame, self.max_frame_bytes).await?;
@@ -258,7 +259,24 @@ impl PluginRpcClient {
         let result = response.result.ok_or_else(|| {
             PluginRpcError::malformed_frame("plugin hello response missing result")
         })?;
-        serde_json::from_value(result).context("failed to decode plugin hello response")
+        let response: PluginHelloResponse =
+            serde_json::from_value(result).context("failed to decode plugin hello response")?;
+        if !supported_protocol_versions.contains(&response.protocol_version) {
+            return Err(PluginRpcError {
+                kind: PluginRpcErrorKind::UnsupportedProtocol,
+                message: format!(
+                    "cbth selected unsupported plugin RPC protocol version {}",
+                    response.protocol_version
+                ),
+                retryable: false,
+                details: Some(json!({
+                    "protocol_version": response.protocol_version,
+                    "supported_protocol_versions": supported_protocol_versions,
+                })),
+            })
+            .context("cbth plugin hello failed");
+        }
+        Ok(response)
     }
 
     fn next_request_id(&mut self) -> String {
@@ -503,6 +521,52 @@ mod tests {
             .expect_err("hello should fail");
 
         assert!(format!("{error:#}").contains("UnsupportedProtocol"));
+        server.await.expect("server");
+        std::fs::remove_file(socket_path).ok();
+    }
+
+    #[tokio::test]
+    async fn plugin_hello_rejects_unsupported_success_protocol() {
+        let socket_path = test_socket_path("unsupported");
+        let listener = UnixListener::bind(&socket_path).expect("bind fake server");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let request: PluginRpcRequestFrame =
+                read_plugin_rpc_frame(&mut stream, PLUGIN_RPC_MAX_FRAME_BYTES)
+                    .await
+                    .expect("read request");
+            let response = PluginHelloResponse {
+                protocol_version: 999,
+                service_capabilities: vec![ServiceCapability::new("plugin-hello")],
+                policy: PluginRpcPolicy {
+                    max_frame_bytes: PLUGIN_RPC_MAX_FRAME_BYTES,
+                    requires_idempotency_key: false,
+                },
+                daemon_endpoint: None,
+            };
+            write_plugin_rpc_frame(
+                &mut stream,
+                &PluginRpcResponseFrame::success(
+                    request.id,
+                    serde_json::to_value(response).unwrap(),
+                ),
+                PLUGIN_RPC_MAX_FRAME_BYTES,
+            )
+            .await
+            .expect("write response");
+        });
+
+        let mut client = PluginRpcClient::connect(&socket_path)
+            .await
+            .expect("connect");
+        let error = client
+            .plugin_hello(hello_request(vec![PLUGIN_RPC_PROTOCOL_VERSION_V1]))
+            .await
+            .expect_err("unsupported protocol should fail");
+
+        let error = format!("{error:#}");
+        assert!(error.contains("UnsupportedProtocol"));
+        assert!(error.contains("unsupported plugin RPC protocol version 999"));
         server.await.expect("server");
         std::fs::remove_file(socket_path).ok();
     }

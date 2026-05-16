@@ -3,9 +3,9 @@ id: 20260513-w2-plugin-packaging-rpc-client-1989c19
 title: W2 Plugin Packaging RPC Client
 status: completed
 created: 2026-05-13
-updated: 2026-05-13
+updated: 2026-05-16
 branch: codex/w2-plugin-packaging-rpc-client
-pr:
+pr: https://github.com/JoeyTeng/codex-webex-connector/pull/3
 supersedes: []
 superseded_by:
 ---
@@ -30,3 +30,5 @@ superseded_by:
 - Final review follow-up: clear-context review on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..0b1daa2` found the runtime supervisor hello still lacked a timeout; the follow-up fix bounds startup plugin RPC hello.
 - Final review follow-up: clear-context review on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..de1d5c7` found installed manifest paths could become stale across releases; the follow-up fix uses stable `current/plugin/manifest.json` resolution.
 - Final review follow-up: clear-context review on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..4703e98` found cbth runtime identity was shadowed by installed `plugin_instance_id = "standalone"`; the follow-up fix lets `CBTH_PLUGIN_STARTED_AT` override file config.
+- PR #3 Codex review follow-up: GitHub review on `4c8501c5f7` found unsupported successful `plugin.hello` protocol versions were accepted and packaged manifest commands pointed at paths that do not exist when resolved from `plugin/manifest.json`; the follow-up validates negotiated protocol versions and uses `../bin/...` command paths.
+- Validation: `cargo test -p wxcd-cbth-rpc`, `cargo test -p wxcd-worker plugin_manifest_validates_packaging_metadata`, and `cargo test` passed locally on 2026-05-16.

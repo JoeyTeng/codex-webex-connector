@@ -362,6 +362,10 @@ fn plugin_manifest_validates_packaging_metadata() {
     let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("plugin/manifest.json");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path).expect("read plugin manifest"),
+    )
+    .expect("decode plugin manifest");
     let config = CbthPluginConfig {
         enabled: false,
         socket_path: None,
@@ -374,6 +378,18 @@ fn plugin_manifest_validates_packaging_metadata() {
     assert_eq!(
         super::validate_plugin_manifest(&config),
         super::ManifestStatus::Valid
+    );
+    assert_eq!(
+        manifest
+            .pointer("/entrypoint/binary")
+            .and_then(|value| value.as_str()),
+        Some("../bin/wxcd-supervisor")
+    );
+    assert_eq!(
+        manifest
+            .pointer("/diagnostics/command/0")
+            .and_then(|value| value.as_str()),
+        Some("../bin/wxcd-worker")
     );
 }
 
