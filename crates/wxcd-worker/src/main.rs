@@ -857,6 +857,15 @@ async fn handle_session_message(
         &config.webex.bot_email,
         config.webex.bot_display_name.as_deref(),
     );
+    if session.state == SessionState::Failed && !is_failed_session_room_command(command_text) {
+        send_plain_message(
+            webex,
+            &session.session_room_id,
+            &render_failed_session_room_guard(&session),
+        )
+        .await?;
+        return Ok(());
+    }
 
     if let Some(page) = parse_session_history_page(command_text) {
         match read_thread_history(codex, &session.thread_id).await {
@@ -966,6 +975,18 @@ async fn handle_session_message(
     .await?;
     refresh_overview(webex, &session).await?;
     Ok(())
+}
+
+fn is_failed_session_room_command(text: &str) -> bool {
+    parse_session_history_page(text).is_some()
+        || matches!(text, "help" | "/help" | "/status" | "/resume")
+}
+
+fn render_failed_session_room_guard(session: &SessionRecord) -> String {
+    format!(
+        "Session `{}` is failed and will not accept new turns until recovery. Use `/status`, `/history`, or `/resume` here; use `diagnose {}` or `cleanup failed {}` from the control room for operator cleanup.",
+        session.session_id, session.session_id, session.session_id
+    )
 }
 
 async fn handle_attachment_action(
@@ -2650,7 +2671,10 @@ async fn persist_local_snapshot(path: &Path, snapshot: &wxcd_proto::BridgeSnapsh
 
 async fn load_or_create_installation_identity(state_dir: &Path) -> Result<InstallationIdentity> {
     let path = state_dir.join(INSTALLATION_IDENTITY_FILE);
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+    if tokio::fs::try_exists(&path)
+        .await
+        .with_context(|| format!("failed to inspect installation identity {}", path.display()))?
+    {
         let content = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("failed to read installation identity {}", path.display()))?;

@@ -24,6 +24,7 @@ superseded_by:
 - W1 current-writer local snapshots still require explicit current-installation `authority` or `local_mirror` evidence before claiming remote legacy sessions; authority-less legacy snapshot records require listed local Codex thread evidence.
 - If `installation-identity.json` is missing but a W1 local snapshot records a writer installation, startup recovers and persists that writer identity before minting any new installation id.
 - W1 local snapshot mirror merge preserves snapshot-only current sessions, and missing identity recovery tolerates malformed fallback snapshots by warning and minting a fresh identity.
+- W1 preserves existing installation identity lookup errors instead of minting replacement IDs, and failed session rooms only accept recovery/status commands while staying routable.
 - Failed session rooms remain routable for in-room recovery commands, `/list all` includes archived sessions for purge discovery, and legacy claim evidence includes archived Codex threads without making archived sessions executable.
 
 ## Next Steps

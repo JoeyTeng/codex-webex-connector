@@ -5,12 +5,13 @@ use super::{
     ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
     ensure_session_id_belongs_to_installation, extract_thread_history_turns,
     generate_installation_id, is_control_list_session, is_default_list_session,
-    load_local_snapshot_with_metadata, load_or_create_installation_identity,
-    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
-    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
-    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
-    repo_name_for_cwd, session_belongs_to_installation, session_requires_codex_archive,
-    sessions_for_diagnostics, slice_thread_history_page, validate_purge_archived_session,
+    is_failed_session_room_command, load_local_snapshot_with_metadata,
+    load_or_create_installation_identity, normalize_control_command_text,
+    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
+    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
+    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
+    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
+    slice_thread_history_page, validate_purge_archived_session,
 };
 use chrono::Utc;
 use serde_json::json;
@@ -213,6 +214,18 @@ fn parses_session_history_command() {
     assert_eq!(parse_session_history_page("/history page 3"), Some(3));
     assert_eq!(parse_session_history_page("/history page 0"), None);
     assert_eq!(parse_session_history_page("history"), None);
+}
+
+#[test]
+fn failed_session_rooms_accept_only_recovery_commands() {
+    assert!(is_failed_session_room_command("help"));
+    assert!(is_failed_session_room_command("/help"));
+    assert!(is_failed_session_room_command("/status"));
+    assert!(is_failed_session_room_command("/history"));
+    assert!(is_failed_session_room_command("/history page 2"));
+    assert!(is_failed_session_room_command("/resume"));
+    assert!(!is_failed_session_room_command("/pause"));
+    assert!(!is_failed_session_room_command("continue the task"));
 }
 
 #[test]
@@ -1022,6 +1035,23 @@ async fn installation_identity_persists_and_loads() {
     assert!(created.installation_id.starts_with("ins_"));
 
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn installation_identity_lookup_error_is_not_treated_as_missing() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-installation-lookup-error-test-{}",
+        "a".repeat(300)
+    ));
+
+    let error = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("failed to inspect installation identity"),
+        "{error:#}"
+    );
 }
 
 #[tokio::test]
