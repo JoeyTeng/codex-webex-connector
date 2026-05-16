@@ -4,6 +4,7 @@
 - Webex-Codex Bridge 已部署在 macOS launchd 管理形态下，当前能力包括 session 创建、local thread attach、history paging、user reattach、failed-session diagnosis、soft archive，以及 archived room purge。
 - W1 state authority split 已落地：bridge 会持久化本安装 identity，将 Data Space 作为 index/audit log，并用本地 snapshot/mirror 与可读 Codex thread 决定默认可控 session。
 - W2 plugin packaging/RPC client foundation 已落地：standalone legacy mode 仍是默认路径，显式 cbth plugin mode 支持 manifest、`plugin.hello` UDS readiness check 和 `wxcd-worker doctor`。
+- GitHub pull requests run `codex/review-gate` through the repository workflow.
 - 详细历史、验证证据和迁移前 tracker 原文已移入 `docs/project_journal/`：
   - W2 plugin packaging/RPC client：`docs/project_journal/2026/05/2026-05-13-w2-plugin-packaging-rpc-client-1989c19.md`
   - 当前后续事项：`docs/project_journal/2026/05/2026-05-05-webex-bridge-followups-05ee1a8.md`

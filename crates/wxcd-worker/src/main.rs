@@ -40,6 +40,7 @@ const HISTORY_PAGE_SIZE: usize = 10;
 const IMPORTED_HISTORY_TURN_LIMIT: usize = HISTORY_PAGE_SIZE;
 const RECENT_EVENT_ID_LIMIT: usize = 1024;
 const INSTALLATION_IDENTITY_FILE: &str = "installation-identity.json";
+const LOCAL_SNAPSHOT_FILE: &str = "bridge-state.json";
 const PLUGIN_RPC_DOCTOR_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Parser)]
@@ -75,6 +76,10 @@ struct WorkerState {
     room_to_session: HashMap<String, String>,
     thread_to_session: HashMap<String, String>,
     pending_approvals: HashMap<String, PendingApproval>,
+    remote_snapshot_created_at: Option<chrono::DateTime<Utc>>,
+    remote_archived_session_ids: HashSet<String>,
+    remote_purged_session_ids: HashSet<String>,
+    remote_resolved_approval_ids: HashSet<String>,
     recent_event_ids: HashSet<String>,
     recent_event_queue: VecDeque<String>,
     events_since_snapshot: usize,
@@ -155,6 +160,12 @@ struct InstallationIdentity {
     created_at: chrono::DateTime<Utc>,
 }
 
+#[derive(Debug, Deserialize)]
+struct LocalSnapshotIdentityMetadata {
+    #[serde(default)]
+    writer_installation_id: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -209,7 +220,7 @@ async fn run() -> Result<()> {
         .context("failed to initialize codex app-server")?;
 
     let event_log = EventLog::new(&webex, &data_room.id);
-    let local_snapshot_path = config.bridge.state_dir.join("bridge-state.json");
+    let local_snapshot_path = config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE);
     let remote_replay = match event_log.replay().await {
         Ok(replay) => Some(replay),
         Err(error) => {
@@ -238,12 +249,27 @@ async fn run() -> Result<()> {
                     Some(writer_installation_id)
                         if writer_installation_id == installation.installation_id =>
                     {
-                        state.merge_local_mirror(
-                            local_replay,
-                            &installation.installation_id,
-                            Utc::now(),
-                            LocalMirrorClaimScope::TrustedSnapshot,
-                        )
+                        match collect_local_thread_ids(&mut codex, true).await {
+                            Ok(local_thread_ids) => state.merge_local_mirror(
+                                local_replay,
+                                &installation.installation_id,
+                                Utc::now(),
+                                LocalMirrorClaimScope::CurrentWriterSnapshotOrListedThreads(
+                                    &local_thread_ids,
+                                ),
+                            ),
+                            Err(error) => {
+                                warn!(
+                                    "failed to list local Codex threads before current-writer local mirror merge, only applying explicit current-installation evidence: {error:#}"
+                                );
+                                state.merge_local_mirror(
+                                    local_replay,
+                                    &installation.installation_id,
+                                    Utc::now(),
+                                    LocalMirrorClaimScope::CurrentWriterSnapshot,
+                                )
+                            }
+                        }
                     }
                     Some(writer_installation_id) => {
                         warn!(
@@ -252,24 +278,38 @@ async fn run() -> Result<()> {
                         );
                         false
                     }
-                    None if metadata.existed => match collect_local_thread_ids(&mut codex).await {
-                        Ok(local_thread_ids) => state.merge_local_mirror(
-                            local_replay,
+                    None if metadata.existed => {
+                        match collect_local_thread_ids(&mut codex, true).await {
+                            Ok(local_thread_ids) => state.merge_local_mirror(
+                                local_replay,
+                                &installation.installation_id,
+                                Utc::now(),
+                                LocalMirrorClaimScope::ListedThreads(&local_thread_ids),
+                            ),
+                            Err(error) => {
+                                warn!(
+                                    "failed to list local Codex threads before legacy local mirror merge, leaving sessions unclaimed: {error:#}"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    None => match collect_local_thread_ids(&mut codex, true).await {
+                        Ok(local_thread_ids) => state.claim_legacy_local_sessions(
                             &installation.installation_id,
                             Utc::now(),
-                            LocalMirrorClaimScope::ListedThreads(&local_thread_ids),
+                            &local_thread_ids,
                         ),
                         Err(error) => {
                             warn!(
-                                "failed to list local Codex threads before legacy local mirror merge, leaving sessions unclaimed: {error:#}"
+                                "failed to list local Codex threads before legacy Data Space claim, leaving sessions unclaimed: {error:#}"
                             );
                             false
                         }
                     },
-                    None => false,
                 };
                 if changed {
-                    persist_local_snapshot(&local_snapshot_path, &state.to_snapshot()).await?;
+                    persist_snapshot(&event_log, &mut state, &config).await?;
                 }
             }
             Err(error) => {
@@ -282,7 +322,7 @@ async fn run() -> Result<()> {
         if local_snapshot_metadata
             .is_some_and(|metadata| metadata.existed && metadata.writer_installation_id.is_none())
         {
-            match collect_local_thread_ids(&mut codex).await {
+            match collect_local_thread_ids(&mut codex, true).await {
                 Ok(local_thread_ids) => {
                     let changed = state.claim_legacy_local_sessions(
                         &installation.installation_id,
@@ -583,7 +623,11 @@ async fn handle_control_message(
         return Ok(());
     }
     if let Some(list_command) = parse_list_command(text) {
-        let mut sessions = sessions_for_control_list(state, &installation.installation_id);
+        let mut sessions = sessions_for_control_list(
+            state,
+            &installation.installation_id,
+            matches!(list_command.mode, ListMode::All),
+        );
         sessions.sort_by_key(|session| session.updated_at);
         sessions.reverse();
         let rendered = match list_command.mode {
@@ -1011,6 +1055,15 @@ async fn handle_session_message(
         &config.webex.bot_email,
         config.webex.bot_display_name.as_deref(),
     );
+    if session.state == SessionState::Failed && !is_failed_session_room_command(command_text) {
+        send_plain_message(
+            webex,
+            &session.session_room_id,
+            &render_failed_session_room_guard(&session),
+        )
+        .await?;
+        return Ok(());
+    }
 
     if let Some(page) = parse_session_history_page(command_text) {
         match read_thread_history(codex, &session.thread_id).await {
@@ -1120,6 +1173,18 @@ async fn handle_session_message(
     .await?;
     refresh_overview(webex, &session).await?;
     Ok(())
+}
+
+fn is_failed_session_room_command(text: &str) -> bool {
+    parse_session_history_page(text).is_some()
+        || matches!(text, "help" | "/help" | "/status" | "/resume")
+}
+
+fn render_failed_session_room_guard(session: &SessionRecord) -> String {
+    format!(
+        "Session `{}` is failed and will not accept new turns until recovery. Use `/status`, `/history`, or `/resume` here; use `diagnose {}` or `cleanup failed {}` from the control room for operator cleanup.",
+        session.session_id, session.session_id, session.session_id
+    )
 }
 
 async fn handle_attachment_action(
@@ -1755,18 +1820,29 @@ fn session_requires_codex_archive(session: &SessionRecord) -> bool {
     session.state != SessionState::Failed
 }
 
-fn sessions_for_control_list(state: &WorkerState, installation_id: &str) -> Vec<SessionRecord> {
+fn sessions_for_control_list(
+    state: &WorkerState,
+    installation_id: &str,
+    include_archived: bool,
+) -> Vec<SessionRecord> {
     state
         .sessions
         .values()
-        .filter(|session| is_default_list_session(session, installation_id))
+        .filter(|session| is_control_list_session(session, installation_id, include_archived))
         .cloned()
         .collect()
 }
 
 fn is_default_list_session(session: &SessionRecord, installation_id: &str) -> bool {
-    !session.archived
-        && session.state != SessionState::Archived
+    is_control_list_session(session, installation_id, false)
+}
+
+fn is_control_list_session(
+    session: &SessionRecord,
+    installation_id: &str,
+    include_archived: bool,
+) -> bool {
+    (include_archived || (!session.archived && session.state != SessionState::Archived))
         && session.state != SessionState::Failed
         && session_belongs_to_installation(session, installation_id)
 }
@@ -1995,11 +2071,16 @@ async fn codex_thread_exists(codex: &mut CodexClient, thread_id: &str) -> Result
     }
 }
 
-async fn collect_local_thread_ids(codex: &mut CodexClient) -> Result<HashSet<String>> {
+async fn collect_local_thread_ids(
+    codex: &mut CodexClient,
+    include_archived: bool,
+) -> Result<HashSet<String>> {
     let mut cursor = None;
     let mut thread_ids = HashSet::new();
     loop {
-        let page = codex.thread_list_page(false, cursor.as_deref()).await?;
+        let page = codex
+            .thread_list_page(include_archived, cursor.as_deref())
+            .await?;
         thread_ids.extend(page.data.into_iter().map(|thread| thread.id));
         let Some(next_cursor) = page.next_cursor else {
             return Ok(thread_ids);
@@ -2075,7 +2156,7 @@ async fn persist_event(
         return Ok(());
     }
     persist_local_snapshot(
-        &config.bridge.state_dir.join("bridge-state.json"),
+        &config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE),
         &state.to_snapshot(),
     )
     .await?;
@@ -2093,7 +2174,7 @@ async fn persist_snapshot(
     }
     state.events_since_snapshot = 0;
     persist_local_snapshot(
-        &config.bridge.state_dir.join("bridge-state.json"),
+        &config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE),
         &snapshot,
     )
     .await?;
@@ -2788,7 +2869,10 @@ async fn persist_local_snapshot(path: &Path, snapshot: &wxcd_proto::BridgeSnapsh
 
 async fn load_or_create_installation_identity(state_dir: &Path) -> Result<InstallationIdentity> {
     let path = state_dir.join(INSTALLATION_IDENTITY_FILE);
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+    if tokio::fs::try_exists(&path)
+        .await
+        .with_context(|| format!("failed to inspect installation identity {}", path.display()))?
+    {
         let content = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("failed to read installation identity {}", path.display()))?;
@@ -2803,15 +2887,67 @@ async fn load_or_create_installation_identity(state_dir: &Path) -> Result<Instal
         return Ok(identity);
     }
 
-    let identity = InstallationIdentity {
-        installation_id: generate_installation_id(Utc::now()),
-        created_at: Utc::now(),
+    let identity = match recover_installation_identity_from_snapshot(state_dir).await? {
+        Some(identity) => identity,
+        None => InstallationIdentity {
+            installation_id: generate_installation_id(Utc::now()),
+            created_at: Utc::now(),
+        },
     };
+    persist_installation_identity(&path, &identity).await?;
+    Ok(identity)
+}
+
+async fn recover_installation_identity_from_snapshot(
+    state_dir: &Path,
+) -> Result<Option<InstallationIdentity>> {
+    let snapshot_path = state_dir.join(LOCAL_SNAPSHOT_FILE);
+    if !tokio::fs::try_exists(&snapshot_path).await.unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let content = match tokio::fs::read_to_string(&snapshot_path).await {
+        Ok(content) => content,
+        Err(error) => {
+            warn!(
+                "failed to read local snapshot {} while recovering missing installation identity, minting a new identity: {error:#}",
+                snapshot_path.display()
+            );
+            return Ok(None);
+        }
+    };
+    let metadata: LocalSnapshotIdentityMetadata = match serde_json::from_str(&content) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            warn!(
+                "failed to parse local snapshot {} while recovering missing installation identity, minting a new identity: {error:#}",
+                snapshot_path.display()
+            );
+            return Ok(None);
+        }
+    };
+    let Some(installation_id) = metadata.writer_installation_id else {
+        return Ok(None);
+    };
+    if installation_id.trim().is_empty() {
+        warn!(
+            "local snapshot {} has an empty writer_installation_id while recovering missing installation identity, minting a new identity",
+            snapshot_path.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(InstallationIdentity {
+        installation_id,
+        created_at: Utc::now(),
+    }))
+}
+
+async fn persist_installation_identity(path: &Path, identity: &InstallationIdentity) -> Result<()> {
     let encoded = serde_json::to_string_pretty(&identity)?;
     tokio::fs::write(&path, encoded)
         .await
         .with_context(|| format!("failed to write installation identity {}", path.display()))?;
-    Ok(identity)
+    Ok(())
 }
 
 fn generate_installation_id(now: chrono::DateTime<Utc>) -> String {
@@ -2822,6 +2958,10 @@ impl WorkerState {
     fn from_replay(replay: ReplayState) -> Self {
         let mut state = Self {
             events_since_snapshot: replay.events_since_snapshot,
+            remote_snapshot_created_at: replay.snapshot_created_at,
+            remote_archived_session_ids: replay.archived_session_ids,
+            remote_purged_session_ids: replay.purged_session_ids,
+            remote_resolved_approval_ids: replay.resolved_approval_ids,
             ..Self::default()
         };
         for session in replay.sessions.into_values() {
@@ -2840,9 +2980,11 @@ impl WorkerState {
             self.room_to_session.remove(&previous.session_room_id);
             self.thread_to_session.remove(&previous.thread_id);
         }
-        if self.should_index_session(&session) {
+        if self.should_route_session_room(&session) {
             self.room_to_session
                 .insert(session.session_room_id.clone(), session.session_id.clone());
+        }
+        if self.should_index_session_thread(&session) {
             self.thread_to_session
                 .insert(session.thread_id.clone(), session.session_id.clone());
         }
@@ -2875,41 +3017,124 @@ impl WorkerState {
         claim_scope: LocalMirrorClaimScope<'_>,
     ) -> bool {
         let mut changed = false;
-        for local_session in local_replay.sessions.into_values() {
+        let local_pending_approvals = local_replay.pending_approvals;
+        for mut local_session in local_replay.sessions.into_values() {
             if !local_session_is_claimable_mirror_evidence(&local_session, installation_id) {
                 continue;
             }
-            if !claim_scope.allows(&local_session) {
+            if !claim_scope.allows(&local_session, installation_id) {
                 continue;
-            }
-            let Some(session) = self.sessions.get_mut(&local_session.session_id) else {
-                continue;
-            };
-            if !remote_session_accepts_local_mirror_claim(session, installation_id) {
-                continue;
-            }
-            if session.authority.is_none() {
-                session.authority = Some(SessionAuthority {
-                    installation_id: installation_id.to_string(),
-                });
-                changed = true;
             }
             let desired_mirror = local_session
                 .local_mirror
+                .clone()
                 .filter(|mirror| mirror.installation_id == installation_id)
                 .unwrap_or_else(|| LocalSessionMirror {
                     installation_id: installation_id.to_string(),
                     mirrored_at,
                 });
-            if session.local_mirror.as_ref() != Some(&desired_mirror) {
-                session.local_mirror = Some(desired_mirror);
+            if local_session.authority.is_none() {
+                local_session.authority = Some(SessionAuthority {
+                    installation_id: installation_id.to_string(),
+                });
+            }
+            if local_session.local_mirror.as_ref() != Some(&desired_mirror) {
+                local_session.local_mirror = Some(desired_mirror.clone());
+            }
+            let session_id = local_session.session_id.clone();
+            let Some(session) = self.sessions.get(&session_id) else {
+                if self.local_session_is_stale_against_remote(&local_session) {
+                    continue;
+                }
+                self.upsert_session(local_session);
+                changed = true;
+                continue;
+            };
+            if !remote_session_accepts_local_mirror_claim(session, installation_id) {
+                continue;
+            }
+            let remote_blocks_local_replacement =
+                remote_session_blocks_local_replacement(session, &local_session)
+                    || (self.remote_archived_session_ids.contains(&session_id)
+                        && !(local_session.archived
+                            || local_session.state == SessionState::Archived));
+            if local_session.updated_at > session.updated_at && !remote_blocks_local_replacement {
+                self.upsert_session(local_session);
+                changed = true;
+                continue;
+            }
+            let session = self
+                .sessions
+                .get_mut(&session_id)
+                .expect("session should exist after immutable lookup");
+            if session.authority.is_none() || session.local_mirror.as_ref() != Some(&desired_mirror)
+            {
+                if session.authority.is_none() {
+                    session.authority = Some(SessionAuthority {
+                        installation_id: installation_id.to_string(),
+                    });
+                }
+                if session.local_mirror.as_ref() != Some(&desired_mirror) {
+                    session.local_mirror = Some(desired_mirror);
+                }
                 changed = true;
             }
+        }
+        if self.merge_local_pending_approvals(local_pending_approvals, installation_id) {
+            changed = true;
         }
         if changed {
             self.rebuild_session_indexes();
         }
         changed
+    }
+
+    fn merge_local_pending_approvals(
+        &mut self,
+        pending_approvals: HashMap<String, PendingApproval>,
+        installation_id: &str,
+    ) -> bool {
+        let mut changed = false;
+        for approval in pending_approvals.into_values() {
+            if self.local_approval_is_stale_against_remote(&approval) {
+                continue;
+            }
+            let Some(session) = self.sessions.get(&approval.session_id) else {
+                continue;
+            };
+            if !session_belongs_to_installation(session, installation_id) {
+                continue;
+            }
+            if approval.thread_id != session.thread_id {
+                continue;
+            }
+            match self.pending_approvals.get(&approval.approval_id) {
+                Some(existing) if existing.requested_at >= approval.requested_at => {}
+                _ => {
+                    self.pending_approvals
+                        .insert(approval.approval_id.clone(), approval);
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    fn local_session_is_stale_against_remote(&self, session: &SessionRecord) -> bool {
+        self.remote_purged_session_ids.contains(&session.session_id)
+            || self
+                .remote_snapshot_created_at
+                .as_ref()
+                .is_some_and(|snapshot_created_at| *snapshot_created_at >= session.updated_at)
+    }
+
+    fn local_approval_is_stale_against_remote(&self, approval: &PendingApproval) -> bool {
+        self.remote_resolved_approval_ids
+            .contains(&approval.approval_id)
+            || self
+                .remote_snapshot_created_at
+                .as_ref()
+                .is_some_and(|snapshot_created_at| *snapshot_created_at >= approval.requested_at)
     }
 
     fn claim_legacy_local_sessions(
@@ -2945,25 +3170,28 @@ impl WorkerState {
         self.room_to_session.clear();
         self.thread_to_session.clear();
         for session in self.sessions.values() {
-            if self.should_index_session(session) {
+            if self.should_route_session_room(session) {
                 self.room_to_session
                     .insert(session.session_room_id.clone(), session.session_id.clone());
+            }
+            if self.should_index_session_thread(session) {
                 self.thread_to_session
                     .insert(session.thread_id.clone(), session.session_id.clone());
             }
         }
     }
 
-    fn should_index_session(&self, session: &SessionRecord) -> bool {
-        if session.archived
-            || session.state == SessionState::Archived
-            || session.state == SessionState::Failed
-        {
+    fn should_route_session_room(&self, session: &SessionRecord) -> bool {
+        if session.archived || session.state == SessionState::Archived {
             return false;
         }
         self.executable_installation_id
             .as_deref()
             .is_none_or(|installation_id| session_belongs_to_installation(session, installation_id))
+    }
+
+    fn should_index_session_thread(&self, session: &SessionRecord) -> bool {
+        session.state != SessionState::Failed && self.should_route_session_room(session)
     }
 
     fn remember_event(&mut self, event_id: &str) -> bool {
@@ -2987,6 +3215,10 @@ impl WorkerState {
             sessions: self.sessions.clone(),
             pending_approvals: self.pending_approvals.clone(),
             events_since_snapshot: self.events_since_snapshot,
+            snapshot_created_at: self.remote_snapshot_created_at,
+            archived_session_ids: self.remote_archived_session_ids.clone(),
+            purged_session_ids: self.remote_purged_session_ids.clone(),
+            resolved_approval_ids: self.remote_resolved_approval_ids.clone(),
         }
     }
 
@@ -2999,14 +3231,21 @@ impl WorkerState {
 
 #[derive(Debug, Clone, Copy)]
 enum LocalMirrorClaimScope<'a> {
-    TrustedSnapshot,
+    CurrentWriterSnapshot,
+    CurrentWriterSnapshotOrListedThreads(&'a HashSet<String>),
     ListedThreads(&'a HashSet<String>),
 }
 
 impl LocalMirrorClaimScope<'_> {
-    fn allows(&self, session: &SessionRecord) -> bool {
+    fn allows(&self, session: &SessionRecord, installation_id: &str) -> bool {
         match self {
-            Self::TrustedSnapshot => true,
+            Self::CurrentWriterSnapshot => {
+                local_session_has_current_installation_evidence(session, installation_id)
+            }
+            Self::CurrentWriterSnapshotOrListedThreads(local_thread_ids) => {
+                local_session_has_current_installation_evidence(session, installation_id)
+                    || local_thread_ids.contains(&session.thread_id)
+            }
             Self::ListedThreads(local_thread_ids) => local_thread_ids.contains(&session.thread_id),
         }
     }
@@ -3022,6 +3261,20 @@ fn local_session_is_claimable_mirror_evidence(
         .is_none_or(|authority| authority.installation_id == installation_id)
 }
 
+fn local_session_has_current_installation_evidence(
+    session: &SessionRecord,
+    installation_id: &str,
+) -> bool {
+    session
+        .authority
+        .as_ref()
+        .is_some_and(|authority| authority.installation_id == installation_id)
+        || session
+            .local_mirror
+            .as_ref()
+            .is_some_and(|mirror| mirror.installation_id == installation_id)
+}
+
 fn remote_session_accepts_local_mirror_claim(
     session: &SessionRecord,
     installation_id: &str,
@@ -3030,6 +3283,14 @@ fn remote_session_accepts_local_mirror_claim(
         .authority
         .as_ref()
         .is_none_or(|authority| authority.installation_id == installation_id)
+}
+
+fn remote_session_blocks_local_replacement(
+    remote_session: &SessionRecord,
+    local_session: &SessionRecord,
+) -> bool {
+    (remote_session.archived || remote_session.state == SessionState::Archived)
+        && !(local_session.archived || local_session.state == SessionState::Archived)
 }
 
 #[cfg(test)]
