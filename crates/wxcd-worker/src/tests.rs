@@ -4,13 +4,13 @@ use super::{
     abbreviate, apply_thread_probe, attached_session_for_thread,
     ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
     ensure_session_id_belongs_to_installation, extract_thread_history_turns,
-    generate_installation_id, is_default_list_session, load_local_snapshot_with_metadata,
-    load_or_create_installation_identity, normalize_control_command_text,
-    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
-    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
-    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
-    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
-    slice_thread_history_page, validate_purge_archived_session,
+    generate_installation_id, is_control_list_session, is_default_list_session,
+    load_local_snapshot_with_metadata, load_or_create_installation_identity,
+    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
+    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
+    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
+    repo_name_for_cwd, session_belongs_to_installation, session_requires_codex_archive,
+    sessions_for_diagnostics, slice_thread_history_page, validate_purge_archived_session,
 };
 use chrono::Utc;
 use serde_json::json;
@@ -523,12 +523,18 @@ fn control_list_filters_non_executable_sessions() {
     foreign.authority = Some(SessionAuthority {
         installation_id: "ins_other".to_string(),
     });
-    let archived = session_record("ses_archived", SessionState::Archived, true);
+    let mut archived = session_record("ses_archived", SessionState::Archived, true);
+    archived.authority = Some(SessionAuthority {
+        installation_id: installation_id.to_string(),
+    });
 
     assert!(is_default_list_session(&current, installation_id));
     assert!(!is_default_list_session(&missing, installation_id));
     assert!(!is_default_list_session(&foreign, installation_id));
     assert!(!is_default_list_session(&archived, installation_id));
+    assert!(is_control_list_session(&archived, installation_id, true));
+    assert!(!is_control_list_session(&missing, installation_id, true));
+    assert!(!is_control_list_session(&foreign, installation_id, true));
 }
 
 #[test]
@@ -743,6 +749,23 @@ fn legacy_local_snapshot_claim_requires_listed_thread() {
 }
 
 #[test]
+fn legacy_local_snapshot_claims_archived_session_without_indexing() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_archived", SessionState::Archived, true));
+    state.set_executable_installation(installation_id);
+    let local_thread_ids = std::iter::once("thread-ses_archived".to_string()).collect();
+
+    assert!(state.claim_legacy_local_sessions(installation_id, Utc::now(), &local_thread_ids));
+
+    let session = state.sessions.get("ses_archived").unwrap();
+    assert!(session_belongs_to_installation(session, installation_id));
+    assert!(validate_purge_archived_session(&state, "ses_archived", installation_id).is_ok());
+    assert!(state.room_to_session.is_empty());
+    assert!(state.thread_to_session.is_empty());
+}
+
+#[test]
 fn local_snapshot_records_writer_installation() {
     let installation_id = "ins_current";
     let mut state = WorkerState::default();
@@ -825,7 +848,13 @@ fn executable_indexes_only_include_current_installation_sessions() {
             .map(String::as_str),
         Some("ses_current")
     );
-    assert!(!state.room_to_session.contains_key("room-ses_failed"));
+    assert_eq!(
+        state
+            .room_to_session
+            .get("room-ses_failed")
+            .map(String::as_str),
+        Some("ses_failed")
+    );
     assert!(!state.thread_to_session.contains_key("thread-ses_failed"));
     assert!(!state.room_to_session.contains_key("room-ses_foreign"));
     assert!(!state.thread_to_session.contains_key("thread-ses_foreign"));

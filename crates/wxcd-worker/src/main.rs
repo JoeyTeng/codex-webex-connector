@@ -227,20 +227,22 @@ async fn run() -> Result<()> {
                         );
                         false
                     }
-                    None if metadata.existed => match collect_local_thread_ids(&mut codex).await {
-                        Ok(local_thread_ids) => state.merge_local_mirror(
-                            local_replay,
-                            &installation.installation_id,
-                            Utc::now(),
-                            LocalMirrorClaimScope::ListedThreads(&local_thread_ids),
-                        ),
-                        Err(error) => {
-                            warn!(
-                                "failed to list local Codex threads before legacy local mirror merge, leaving sessions unclaimed: {error:#}"
-                            );
-                            false
+                    None if metadata.existed => {
+                        match collect_local_thread_ids(&mut codex, true).await {
+                            Ok(local_thread_ids) => state.merge_local_mirror(
+                                local_replay,
+                                &installation.installation_id,
+                                Utc::now(),
+                                LocalMirrorClaimScope::ListedThreads(&local_thread_ids),
+                            ),
+                            Err(error) => {
+                                warn!(
+                                    "failed to list local Codex threads before legacy local mirror merge, leaving sessions unclaimed: {error:#}"
+                                );
+                                false
+                            }
                         }
-                    },
+                    }
                     None => false,
                 };
                 if changed {
@@ -257,7 +259,7 @@ async fn run() -> Result<()> {
         if local_snapshot_metadata
             .is_some_and(|metadata| metadata.existed && metadata.writer_installation_id.is_none())
         {
-            match collect_local_thread_ids(&mut codex).await {
+            match collect_local_thread_ids(&mut codex, true).await {
                 Ok(local_thread_ids) => {
                     let changed = state.claim_legacy_local_sessions(
                         &installation.installation_id,
@@ -423,7 +425,11 @@ async fn handle_control_message(
         return Ok(());
     }
     if let Some(list_command) = parse_list_command(text) {
-        let mut sessions = sessions_for_control_list(state, &installation.installation_id);
+        let mut sessions = sessions_for_control_list(
+            state,
+            &installation.installation_id,
+            matches!(list_command.mode, ListMode::All),
+        );
         sessions.sort_by_key(|session| session.updated_at);
         sessions.reverse();
         let rendered = match list_command.mode {
@@ -1595,18 +1601,29 @@ fn session_requires_codex_archive(session: &SessionRecord) -> bool {
     session.state != SessionState::Failed
 }
 
-fn sessions_for_control_list(state: &WorkerState, installation_id: &str) -> Vec<SessionRecord> {
+fn sessions_for_control_list(
+    state: &WorkerState,
+    installation_id: &str,
+    include_archived: bool,
+) -> Vec<SessionRecord> {
     state
         .sessions
         .values()
-        .filter(|session| is_default_list_session(session, installation_id))
+        .filter(|session| is_control_list_session(session, installation_id, include_archived))
         .cloned()
         .collect()
 }
 
 fn is_default_list_session(session: &SessionRecord, installation_id: &str) -> bool {
-    !session.archived
-        && session.state != SessionState::Archived
+    is_control_list_session(session, installation_id, false)
+}
+
+fn is_control_list_session(
+    session: &SessionRecord,
+    installation_id: &str,
+    include_archived: bool,
+) -> bool {
+    (include_archived || (!session.archived && session.state != SessionState::Archived))
         && session.state != SessionState::Failed
         && session_belongs_to_installation(session, installation_id)
 }
@@ -1835,11 +1852,16 @@ async fn codex_thread_exists(codex: &mut CodexClient, thread_id: &str) -> Result
     }
 }
 
-async fn collect_local_thread_ids(codex: &mut CodexClient) -> Result<HashSet<String>> {
+async fn collect_local_thread_ids(
+    codex: &mut CodexClient,
+    include_archived: bool,
+) -> Result<HashSet<String>> {
     let mut cursor = None;
     let mut thread_ids = HashSet::new();
     loop {
-        let page = codex.thread_list_page(false, cursor.as_deref()).await?;
+        let page = codex
+            .thread_list_page(include_archived, cursor.as_deref())
+            .await?;
         thread_ids.extend(page.data.into_iter().map(|thread| thread.id));
         let Some(next_cursor) = page.next_cursor else {
             return Ok(thread_ids);
@@ -2721,9 +2743,11 @@ impl WorkerState {
             self.room_to_session.remove(&previous.session_room_id);
             self.thread_to_session.remove(&previous.thread_id);
         }
-        if self.should_index_session(&session) {
+        if self.should_route_session_room(&session) {
             self.room_to_session
                 .insert(session.session_room_id.clone(), session.session_id.clone());
+        }
+        if self.should_index_session_thread(&session) {
             self.thread_to_session
                 .insert(session.thread_id.clone(), session.session_id.clone());
         }
@@ -2826,25 +2850,28 @@ impl WorkerState {
         self.room_to_session.clear();
         self.thread_to_session.clear();
         for session in self.sessions.values() {
-            if self.should_index_session(session) {
+            if self.should_route_session_room(session) {
                 self.room_to_session
                     .insert(session.session_room_id.clone(), session.session_id.clone());
+            }
+            if self.should_index_session_thread(session) {
                 self.thread_to_session
                     .insert(session.thread_id.clone(), session.session_id.clone());
             }
         }
     }
 
-    fn should_index_session(&self, session: &SessionRecord) -> bool {
-        if session.archived
-            || session.state == SessionState::Archived
-            || session.state == SessionState::Failed
-        {
+    fn should_route_session_room(&self, session: &SessionRecord) -> bool {
+        if session.archived || session.state == SessionState::Archived {
             return false;
         }
         self.executable_installation_id
             .as_deref()
             .is_none_or(|installation_id| session_belongs_to_installation(session, installation_id))
+    }
+
+    fn should_index_session_thread(&self, session: &SessionRecord) -> bool {
+        session.state != SessionState::Failed && self.should_route_session_room(session)
     }
 
     fn remember_event(&mut self, event_id: &str) -> bool {
