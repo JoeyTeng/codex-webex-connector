@@ -246,7 +246,7 @@ async fn run() -> Result<()> {
                     None => false,
                 };
                 if changed {
-                    persist_local_snapshot(&local_snapshot_path, &state.to_snapshot()).await?;
+                    persist_snapshot(&event_log, &mut state, &config).await?;
                 }
             }
             Err(error) => {
@@ -2815,6 +2815,7 @@ impl WorkerState {
         claim_scope: LocalMirrorClaimScope<'_>,
     ) -> bool {
         let mut changed = false;
+        let local_pending_approvals = local_replay.pending_approvals;
         for mut local_session in local_replay.sessions.into_values() {
             if !local_session_is_claimable_mirror_evidence(&local_session, installation_id) {
                 continue;
@@ -2830,15 +2831,15 @@ impl WorkerState {
                     installation_id: installation_id.to_string(),
                     mirrored_at,
                 });
+            if local_session.authority.is_none() {
+                local_session.authority = Some(SessionAuthority {
+                    installation_id: installation_id.to_string(),
+                });
+            }
+            if local_session.local_mirror.as_ref() != Some(&desired_mirror) {
+                local_session.local_mirror = Some(desired_mirror.clone());
+            }
             let Some(session) = self.sessions.get_mut(&local_session.session_id) else {
-                if local_session.authority.is_none() {
-                    local_session.authority = Some(SessionAuthority {
-                        installation_id: installation_id.to_string(),
-                    });
-                }
-                if local_session.local_mirror.as_ref() != Some(&desired_mirror) {
-                    local_session.local_mirror = Some(desired_mirror);
-                }
                 self.upsert_session(local_session);
                 changed = true;
                 continue;
@@ -2846,19 +2847,57 @@ impl WorkerState {
             if !remote_session_accepts_local_mirror_claim(session, installation_id) {
                 continue;
             }
-            if session.authority.is_none() {
-                session.authority = Some(SessionAuthority {
-                    installation_id: installation_id.to_string(),
-                });
+            if local_session.updated_at > session.updated_at {
+                self.upsert_session(local_session);
                 changed = true;
+                continue;
             }
-            if session.local_mirror.as_ref() != Some(&desired_mirror) {
-                session.local_mirror = Some(desired_mirror);
+            if session.authority.is_none() || session.local_mirror.as_ref() != Some(&desired_mirror)
+            {
+                if session.authority.is_none() {
+                    session.authority = Some(SessionAuthority {
+                        installation_id: installation_id.to_string(),
+                    });
+                }
+                if session.local_mirror.as_ref() != Some(&desired_mirror) {
+                    session.local_mirror = Some(desired_mirror);
+                }
                 changed = true;
             }
         }
+        if self.merge_local_pending_approvals(local_pending_approvals, installation_id) {
+            changed = true;
+        }
         if changed {
             self.rebuild_session_indexes();
+        }
+        changed
+    }
+
+    fn merge_local_pending_approvals(
+        &mut self,
+        pending_approvals: HashMap<String, PendingApproval>,
+        installation_id: &str,
+    ) -> bool {
+        let mut changed = false;
+        for approval in pending_approvals.into_values() {
+            let Some(session) = self.sessions.get(&approval.session_id) else {
+                continue;
+            };
+            if !session_belongs_to_installation(session, installation_id) {
+                continue;
+            }
+            if approval.thread_id != session.thread_id {
+                continue;
+            }
+            match self.pending_approvals.get(&approval.approval_id) {
+                Some(existing) if existing.requested_at >= approval.requested_at => {}
+                _ => {
+                    self.pending_approvals
+                        .insert(approval.approval_id.clone(), approval);
+                    changed = true;
+                }
+            }
         }
         changed
     }
