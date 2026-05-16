@@ -576,6 +576,58 @@ fn current_writer_local_mirror_can_claim_current_session() {
 }
 
 #[test]
+fn local_mirror_preserves_snapshot_only_current_session_during_claim_merge() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.set_executable_installation(installation_id);
+    state.upsert_session(session_record("ses_remote", SessionState::Idle, false));
+
+    let mut local_remote = session_record("ses_remote", SessionState::Idle, false);
+    local_remote.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+    let mut local_only = session_record("ses_local", SessionState::Idle, false);
+    local_only.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay
+        .sessions
+        .insert("ses_remote".to_string(), local_remote);
+    local_replay
+        .sessions
+        .insert("ses_local".to_string(), local_only);
+
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+
+    let remote = state.sessions.get("ses_remote").unwrap();
+    assert!(session_belongs_to_installation(remote, installation_id));
+    let local = state.sessions.get("ses_local").unwrap();
+    assert!(session_belongs_to_installation(local, installation_id));
+    assert_eq!(
+        state
+            .room_to_session
+            .get("room-ses_local")
+            .map(String::as_str),
+        Some("ses_local")
+    );
+    assert_eq!(
+        state
+            .thread_to_session
+            .get("thread-ses_local")
+            .map(String::as_str),
+        Some("ses_local")
+    );
+}
+
+#[test]
 fn current_writer_local_mirror_does_not_claim_authorityless_legacy_session() {
     let installation_id = "ins_current";
     let mut state = WorkerState::default();
@@ -999,6 +1051,29 @@ async fn installation_identity_recovers_from_snapshot_writer() {
 
     assert_eq!(recovered.installation_id, "ins_recovered");
     assert_eq!(loaded, recovered);
+
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn installation_identity_mints_when_snapshot_recovery_is_malformed() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-installation-malformed-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+    let snapshot_path = state_dir.join("bridge-state.json");
+    tokio::fs::write(&snapshot_path, "{not json").await.unwrap();
+
+    let created = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+    let loaded = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+
+    assert!(created.installation_id.starts_with("ins_"));
+    assert_eq!(loaded, created);
 
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }

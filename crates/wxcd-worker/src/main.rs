@@ -2684,24 +2684,35 @@ async fn recover_installation_identity_from_snapshot(
         return Ok(None);
     }
 
-    let content = tokio::fs::read_to_string(&snapshot_path)
-        .await
-        .with_context(|| format!("failed to read local snapshot {}", snapshot_path.display()))?;
-    let metadata: LocalSnapshotIdentityMetadata =
-        serde_json::from_str(&content).with_context(|| {
-            format!(
-                "failed to parse local snapshot {} while recovering missing installation identity",
+    let content = match tokio::fs::read_to_string(&snapshot_path).await {
+        Ok(content) => content,
+        Err(error) => {
+            warn!(
+                "failed to read local snapshot {} while recovering missing installation identity, minting a new identity: {error:#}",
                 snapshot_path.display()
-            )
-        })?;
+            );
+            return Ok(None);
+        }
+    };
+    let metadata: LocalSnapshotIdentityMetadata = match serde_json::from_str(&content) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            warn!(
+                "failed to parse local snapshot {} while recovering missing installation identity, minting a new identity: {error:#}",
+                snapshot_path.display()
+            );
+            return Ok(None);
+        }
+    };
     let Some(installation_id) = metadata.writer_installation_id else {
         return Ok(None);
     };
     if installation_id.trim().is_empty() {
-        bail!(
-            "local snapshot {} has an empty writer_installation_id",
+        warn!(
+            "local snapshot {} has an empty writer_installation_id while recovering missing installation identity, minting a new identity",
             snapshot_path.display()
         );
+        return Ok(None);
     }
     Ok(Some(InstallationIdentity {
         installation_id,
@@ -2780,14 +2791,32 @@ impl WorkerState {
         claim_scope: LocalMirrorClaimScope<'_>,
     ) -> bool {
         let mut changed = false;
-        for local_session in local_replay.sessions.into_values() {
+        for mut local_session in local_replay.sessions.into_values() {
             if !local_session_is_claimable_mirror_evidence(&local_session, installation_id) {
                 continue;
             }
             if !claim_scope.allows(&local_session, installation_id) {
                 continue;
             }
+            let desired_mirror = local_session
+                .local_mirror
+                .clone()
+                .filter(|mirror| mirror.installation_id == installation_id)
+                .unwrap_or_else(|| LocalSessionMirror {
+                    installation_id: installation_id.to_string(),
+                    mirrored_at,
+                });
             let Some(session) = self.sessions.get_mut(&local_session.session_id) else {
+                if local_session.authority.is_none() {
+                    local_session.authority = Some(SessionAuthority {
+                        installation_id: installation_id.to_string(),
+                    });
+                }
+                if local_session.local_mirror.as_ref() != Some(&desired_mirror) {
+                    local_session.local_mirror = Some(desired_mirror);
+                }
+                self.upsert_session(local_session);
+                changed = true;
                 continue;
             };
             if !remote_session_accepts_local_mirror_claim(session, installation_id) {
@@ -2799,13 +2828,6 @@ impl WorkerState {
                 });
                 changed = true;
             }
-            let desired_mirror = local_session
-                .local_mirror
-                .filter(|mirror| mirror.installation_id == installation_id)
-                .unwrap_or_else(|| LocalSessionMirror {
-                    installation_id: installation_id.to_string(),
-                    mirrored_at,
-                });
             if session.local_mirror.as_ref() != Some(&desired_mirror) {
                 session.local_mirror = Some(desired_mirror);
                 changed = true;

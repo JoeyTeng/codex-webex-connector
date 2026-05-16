@@ -23,6 +23,7 @@ superseded_by:
 - W1 state authority split records a stable local installation identity under `state_dir`, treats Data Space as an index/audit log, and uses the local snapshot/mirror plus readable Codex thread as the executable authority for default control lists.
 - W1 current-writer local snapshots still require explicit current-installation `authority` or `local_mirror` evidence before claiming remote legacy sessions; authority-less legacy snapshot records require listed local Codex thread evidence.
 - If `installation-identity.json` is missing but a W1 local snapshot records a writer installation, startup recovers and persists that writer identity before minting any new installation id.
+- W1 local snapshot mirror merge preserves snapshot-only current sessions, and missing identity recovery tolerates malformed fallback snapshots by warning and minting a fresh identity.
 - Failed session rooms remain routable for in-room recovery commands, `/list all` includes archived sessions for purge discovery, and legacy claim evidence includes archived Codex threads without making archived sessions executable.
 
 ## Next Steps
