@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tracing::warn;
 use wxcd_proto::{
     ApprovalDecision, BridgeEvent, BridgeEventEnvelope, BridgeSnapshot, PendingApproval,
@@ -19,6 +19,10 @@ pub struct ReplayState {
     pub sessions: HashMap<String, SessionRecord>,
     pub pending_approvals: HashMap<String, PendingApproval>,
     pub events_since_snapshot: usize,
+    pub snapshot_created_at: Option<DateTime<Utc>>,
+    pub archived_session_ids: HashSet<String>,
+    pub purged_session_ids: HashSet<String>,
+    pub resolved_approval_ids: HashSet<String>,
 }
 
 pub struct EventLog<'a> {
@@ -172,6 +176,7 @@ impl ReplayState {
     pub fn to_snapshot(&self) -> BridgeSnapshot {
         BridgeSnapshot {
             created_at: Utc::now(),
+            writer_installation_id: None,
             sessions: self.sessions.values().cloned().collect(),
             pending_approvals: self.pending_approvals.values().cloned().collect(),
         }
@@ -179,6 +184,7 @@ impl ReplayState {
 
     pub fn from_snapshot(snapshot: BridgeSnapshot) -> Self {
         Self {
+            snapshot_created_at: Some(snapshot.created_at),
             sessions: snapshot
                 .sessions
                 .into_iter()
@@ -190,6 +196,9 @@ impl ReplayState {
                 .map(|approval| (approval.approval_id.clone(), approval))
                 .collect(),
             events_since_snapshot: 0,
+            archived_session_ids: HashSet::new(),
+            purged_session_ids: HashSet::new(),
+            resolved_approval_ids: HashSet::new(),
         }
     }
 
@@ -199,6 +208,7 @@ impl ReplayState {
                 self.sessions.insert(session.session_id.clone(), session);
             }
             BridgeEvent::SessionArchived { session_id, .. } => {
+                self.archived_session_ids.insert(session_id.clone());
                 if let Some(session) = self.sessions.get_mut(&session_id) {
                     session.archived = true;
                     session.state = SessionState::Archived;
@@ -207,6 +217,8 @@ impl ReplayState {
                     .retain(|_, approval| approval.session_id != session_id);
             }
             BridgeEvent::SessionPurged { session_id, .. } => {
+                self.purged_session_ids.insert(session_id.clone());
+                self.archived_session_ids.remove(&session_id);
                 self.sessions.remove(&session_id);
                 self.pending_approvals
                     .retain(|_, approval| approval.session_id != session_id);
@@ -227,6 +239,7 @@ impl ReplayState {
                     decision,
                     ApprovalDecision::Decline | ApprovalDecision::Cancel
                 ) {
+                    self.resolved_approval_ids.insert(approval_id.clone());
                     self.pending_approvals.remove(&approval_id);
                 }
             }
@@ -320,8 +333,10 @@ mod tests {
     #[test]
     fn replay_uses_snapshot_from_older_page() {
         let stale = session_record("ses_1", "Stale", "thread", SessionState::Failed);
+        let snapshot_created_at = Utc::now();
         let snapshot = BridgeSnapshot {
-            created_at: Utc::now(),
+            created_at: snapshot_created_at,
+            writer_installation_id: None,
             sessions: vec![session_record(
                 "ses_1",
                 "Snapshot",
@@ -348,6 +363,71 @@ mod tests {
         assert_eq!(rebuilt.title, "Latest");
         assert_eq!(rebuilt.state, SessionState::Completed);
         assert_eq!(replay.events_since_snapshot, 1);
+        assert_eq!(replay.snapshot_created_at, Some(snapshot_created_at));
+    }
+
+    #[test]
+    fn replay_tracks_remote_tombstones_after_snapshot() {
+        let approval = PendingApproval {
+            approval_id: "apr_1".to_string(),
+            session_id: "ses_1".to_string(),
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            codex_request_id: serde_json::json!(1),
+            item_id: "item".to_string(),
+            kind: ApprovalKind::CommandExecution,
+            reason: None,
+            command: None,
+            cwd: None,
+            requested_permissions: None,
+            card_message_id: None,
+            requested_at: Utc::now(),
+        };
+        let snapshot = BridgeSnapshot {
+            created_at: Utc::now(),
+            writer_installation_id: None,
+            sessions: vec![session_record(
+                "ses_1",
+                "Snapshot",
+                "thread",
+                SessionState::Idle,
+            )],
+            pending_approvals: vec![approval],
+        };
+        let messages = vec![
+            event_message(
+                "purged",
+                BridgeEvent::SessionPurged {
+                    session_id: "ses_1".to_string(),
+                    purged_at: Utc::now(),
+                },
+            ),
+            event_message(
+                "resolved",
+                BridgeEvent::ApprovalResolved {
+                    approval_id: "apr_1".to_string(),
+                    session_id: "ses_1".to_string(),
+                    decision: wxcd_proto::ApprovalDecision::Decline,
+                    resolved_at: Utc::now(),
+                },
+            ),
+            event_message(
+                "archived",
+                BridgeEvent::SessionArchived {
+                    session_id: "ses_1".to_string(),
+                    archived_at: Utc::now(),
+                },
+            ),
+            snapshot_message("snapshot", snapshot),
+        ];
+
+        let replay = replay_from_messages(messages);
+
+        assert!(replay.sessions.is_empty());
+        assert!(replay.pending_approvals.is_empty());
+        assert!(replay.purged_session_ids.contains("ses_1"));
+        assert!(replay.resolved_approval_ids.contains("apr_1"));
+        assert!(!replay.archived_session_ids.contains("ses_1"));
     }
 
     #[test]
@@ -359,6 +439,7 @@ mod tests {
             "snapshot",
             BridgeSnapshot {
                 created_at: Utc::now(),
+                writer_installation_id: None,
                 sessions: Vec::new(),
                 pending_approvals: Vec::new(),
             },
@@ -433,6 +514,8 @@ mod tests {
             updated_at: Utc::now(),
             archived: false,
             failure: None,
+            authority: None,
+            local_mirror: None,
         }
     }
 

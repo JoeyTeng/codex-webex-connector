@@ -2,6 +2,7 @@
 
 ## Current State
 - Webex-Codex Bridge 已部署在 macOS launchd 管理形态下，当前能力包括 session 创建、local thread attach、history paging、user reattach、failed-session diagnosis、soft archive，以及 archived room purge。
+- W1 state authority split 已落地：bridge 会持久化本安装 identity，将 Data Space 作为 index/audit log，并用本地 snapshot/mirror 与可读 Codex thread 决定默认可控 session。
 - GitHub pull requests run `codex/review-gate` through the repository workflow.
 - 详细历史、验证证据和迁移前 tracker 原文已移入 `docs/project_journal/`：
   - 当前后续事项：`docs/project_journal/2026/05/2026-05-05-webex-bridge-followups-05ee1a8.md`
@@ -12,8 +13,8 @@
 - Phase: deployed
 - Summary: 生产 bridge 依赖 bot-owner 1:1 direct room 作为 Data Space；Webex Mercury 断连由 sidecar watchdog 自恢复；session-room slash commands 已支持 Webex mention prefixes；recovery cleanup commands 已部署并记录在 `docs/COMMANDS.md`。
 - Next Steps:
-  - 使用 `diagnose sessions` 和 `cleanup failed <session_id>` 处理仍应 soft-archive 的生产 failed sessions。
-  - 改进旧 Codex threads 在 process restart 后无法通过 `thread/read` reload 的恢复路径。
+  - 使用 `diagnose sessions` 和 `cleanup failed <session_id>` 处理 degraded / missing-local-thread sessions。
+  - 后续 workstream 再处理 explicit handoff、RPC client、plugin packaging、app-server lease、delivery enqueue 或 lifecycle hooks。
 - Blockers:
   - 当前 Webex bot token 仍不能 replay group-room Data Space history。
   - Webex overview card refresh 仍可能返回 `Invalid roomId`，目前仅作为 best-effort。
@@ -32,5 +33,5 @@
 
 ## Risks Or Open Questions
 - Long-term Data Space shape still depends on the credential model.
-- Older sessions can remain failed if the underlying Codex thread cannot be reloaded by `thread/read`.
+- Older sessions with missing or unreadable local Codex threads are now intentionally degraded and hidden from the default active list, while remaining visible to diagnose/cleanup.
 - Overview card updates and the underlying Mercury SDK/service disconnect regression remain open reliability questions.

@@ -1,18 +1,23 @@
 use super::{
-    CleanupFailedCommand, DiagnoseCommand, ListCommand, ListMode, PurgeArchivedCommand,
-    RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerState, abbreviate,
-    apply_thread_probe, ensure_failed_cleanup_target, extract_thread_history_turns,
-    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
-    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
-    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
-    repo_name_for_cwd, session_requires_codex_archive, slice_thread_history_page,
-    validate_purge_archived_session,
+    CleanupFailedCommand, DiagnoseCommand, ListCommand, ListMode, LocalMirrorClaimScope,
+    PurgeArchivedCommand, RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerState,
+    abbreviate, apply_thread_probe, attached_session_for_thread,
+    ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
+    ensure_session_id_belongs_to_installation, extract_thread_history_turns,
+    generate_installation_id, is_control_list_session, is_default_list_session,
+    is_failed_session_room_command, load_local_snapshot_with_metadata,
+    load_or_create_installation_identity, normalize_control_command_text,
+    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
+    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
+    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
+    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
+    slice_thread_history_page, validate_purge_archived_session,
 };
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde_json::json;
 use wxcd_proto::{
-    AppConfig, BridgeConfig, RepoConfig, SessionFailure, SessionFailureKind, SessionRecord,
-    SessionState, WebexConfig,
+    AppConfig, BridgeConfig, BridgeSnapshot, LocalSessionMirror, RepoConfig, SessionAuthority,
+    SessionFailure, SessionFailureKind, SessionRecord, SessionState, WebexConfig,
 };
 use wxcd_render::ImportedHistoryTurn;
 
@@ -209,6 +214,18 @@ fn parses_session_history_command() {
     assert_eq!(parse_session_history_page("/history page 3"), Some(3));
     assert_eq!(parse_session_history_page("/history page 0"), None);
     assert_eq!(parse_session_history_page("history"), None);
+}
+
+#[test]
+fn failed_session_rooms_accept_only_recovery_commands() {
+    assert!(is_failed_session_room_command("help"));
+    assert!(is_failed_session_room_command("/help"));
+    assert!(is_failed_session_room_command("/status"));
+    assert!(is_failed_session_room_command("/history"));
+    assert!(is_failed_session_room_command("/history page 2"));
+    assert!(is_failed_session_room_command("/resume"));
+    assert!(!is_failed_session_room_command("/pause"));
+    assert!(!is_failed_session_room_command("continue the task"));
 }
 
 #[test]
@@ -413,26 +430,55 @@ fn failed_sessions_do_not_require_codex_archive() {
 
 #[test]
 fn validates_failed_cleanup_targets() {
+    let installation_id = "ins_current";
     let mut state = WorkerState::default();
-    state.upsert_session(session_record("ses_failed", SessionState::Failed, false));
-    state.upsert_session(session_record("ses_idle", SessionState::Idle, false));
-    state.upsert_session(session_record("ses_archived", SessionState::Archived, true));
+    state.upsert_session(managed_session_record(
+        "ses_failed",
+        SessionState::Failed,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_idle",
+        SessionState::Idle,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_archived",
+        SessionState::Archived,
+        true,
+        installation_id,
+    ));
 
-    assert!(ensure_failed_cleanup_target(&state, "ses_failed").is_ok());
-    assert!(ensure_failed_cleanup_target(&state, "ses_idle").is_err());
-    assert!(ensure_failed_cleanup_target(&state, "ses_archived").is_err());
-    assert!(ensure_failed_cleanup_target(&state, "ses_missing").is_err());
+    assert!(ensure_failed_cleanup_target(&state, "ses_failed", installation_id).is_ok());
+    assert!(ensure_failed_cleanup_target(&state, "ses_idle", installation_id).is_err());
+    assert!(ensure_failed_cleanup_target(&state, "ses_archived", installation_id).is_err());
+    assert!(ensure_failed_cleanup_target(&state, "ses_missing", installation_id).is_err());
+    assert!(ensure_failed_cleanup_target(&state, "ses_failed", "ins_other").is_err());
 }
 
 #[test]
 fn validates_archived_purge_targets() {
+    let installation_id = "ins_current";
     let mut state = WorkerState::default();
-    state.upsert_session(session_record("ses_archived", SessionState::Archived, true));
-    state.upsert_session(session_record("ses_idle", SessionState::Idle, false));
+    state.upsert_session(managed_session_record(
+        "ses_archived",
+        SessionState::Archived,
+        true,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_idle",
+        SessionState::Idle,
+        false,
+        installation_id,
+    ));
 
-    assert!(validate_purge_archived_session(&state, "ses_archived").is_ok());
-    assert!(validate_purge_archived_session(&state, "ses_idle").is_err());
-    assert!(validate_purge_archived_session(&state, "ses_missing").is_err());
+    assert!(validate_purge_archived_session(&state, "ses_archived", installation_id).is_ok());
+    assert!(validate_purge_archived_session(&state, "ses_idle", installation_id).is_err());
+    assert!(validate_purge_archived_session(&state, "ses_missing", installation_id).is_err());
+    assert!(validate_purge_archived_session(&state, "ses_archived", "ins_other").is_err());
 }
 
 #[test]
@@ -461,10 +507,919 @@ fn applies_thread_probe_state_transitions() {
         kind: ThreadProbeKind::ProbeUnavailable,
         message: "probe unavailable".to_string(),
     };
-    assert!(apply_thread_probe(&recovered, &unavailable, Utc::now()).is_none());
+    let probe_unavailable = apply_thread_probe(&recovered, &unavailable, Utc::now()).unwrap();
+    assert_eq!(probe_unavailable.state, SessionState::Failed);
+    assert_eq!(
+        probe_unavailable
+            .failure
+            .as_ref()
+            .map(|failure| &failure.kind),
+        Some(&SessionFailureKind::ProbeUnavailable)
+    );
 
     let archived = session_record("ses_archived", SessionState::Archived, true);
     assert!(apply_thread_probe(&archived, &missing, Utc::now()).is_none());
+}
+
+#[test]
+fn control_list_filters_non_executable_sessions() {
+    let installation_id = "ins_current";
+    let mut current = session_record("ses_current", SessionState::Idle, false);
+    current.authority = Some(SessionAuthority {
+        installation_id: installation_id.to_string(),
+    });
+    let mut missing = session_record("ses_missing", SessionState::Failed, false);
+    missing.authority = Some(SessionAuthority {
+        installation_id: installation_id.to_string(),
+    });
+    let mut foreign = session_record("ses_foreign", SessionState::Idle, false);
+    foreign.authority = Some(SessionAuthority {
+        installation_id: "ins_other".to_string(),
+    });
+    let mut archived = session_record("ses_archived", SessionState::Archived, true);
+    archived.authority = Some(SessionAuthority {
+        installation_id: installation_id.to_string(),
+    });
+
+    assert!(is_default_list_session(&current, installation_id));
+    assert!(!is_default_list_session(&missing, installation_id));
+    assert!(!is_default_list_session(&foreign, installation_id));
+    assert!(!is_default_list_session(&archived, installation_id));
+    assert!(is_control_list_session(&archived, installation_id, true));
+    assert!(!is_control_list_session(&missing, installation_id, true));
+    assert!(!is_control_list_session(&foreign, installation_id, true));
+}
+
+#[test]
+fn current_writer_local_mirror_can_claim_current_session() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+
+    let mut local = session_record("ses_1", SessionState::Idle, false);
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_1".to_string(), local);
+
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+    let session = state.sessions.get("ses_1").unwrap();
+    assert!(session_belongs_to_installation(session, installation_id));
+    assert_eq!(
+        session
+            .authority
+            .as_ref()
+            .map(|authority| authority.installation_id.as_str()),
+        Some(installation_id)
+    );
+    assert_eq!(
+        session
+            .local_mirror
+            .as_ref()
+            .map(|mirror| mirror.installation_id.as_str()),
+        Some(installation_id)
+    );
+}
+
+#[test]
+fn local_mirror_preserves_snapshot_only_current_session_during_claim_merge() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.set_executable_installation(installation_id);
+    state.upsert_session(session_record("ses_remote", SessionState::Idle, false));
+
+    let mut local_remote = session_record("ses_remote", SessionState::Idle, false);
+    local_remote.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+    let mut local_only = session_record("ses_local", SessionState::Idle, false);
+    local_only.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay
+        .sessions
+        .insert("ses_remote".to_string(), local_remote);
+    local_replay
+        .sessions
+        .insert("ses_local".to_string(), local_only);
+
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+
+    let remote = state.sessions.get("ses_remote").unwrap();
+    assert!(session_belongs_to_installation(remote, installation_id));
+    let local = state.sessions.get("ses_local").unwrap();
+    assert!(session_belongs_to_installation(local, installation_id));
+    assert_eq!(
+        state
+            .room_to_session
+            .get("room-ses_local")
+            .map(String::as_str),
+        Some("ses_local")
+    );
+    assert_eq!(
+        state
+            .thread_to_session
+            .get("thread-ses_local")
+            .map(String::as_str),
+        Some("ses_local")
+    );
+}
+
+#[test]
+fn local_mirror_does_not_resurrect_purged_snapshot_only_session() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state
+        .remote_purged_session_ids
+        .insert("ses_local".to_string());
+
+    let mut local = managed_session_record("ses_local", SessionState::Idle, false, installation_id);
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_local".to_string(), local);
+
+    assert!(!state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+    assert!(!state.sessions.contains_key("ses_local"));
+}
+
+#[test]
+fn local_mirror_skips_snapshot_only_sessions_older_than_remote_snapshot() {
+    let installation_id = "ins_current";
+    let base_time = Utc::now();
+    let mut state = WorkerState::default();
+    state.remote_snapshot_created_at = Some(base_time + Duration::seconds(2));
+
+    let mut local = managed_session_record("ses_local", SessionState::Idle, false, installation_id);
+    local.updated_at = base_time;
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: base_time,
+    });
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_local".to_string(), local);
+
+    assert!(!state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        base_time + Duration::seconds(3),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+    assert!(!state.sessions.contains_key("ses_local"));
+}
+
+#[test]
+fn local_mirror_preserves_newer_same_session_snapshot_state() {
+    let installation_id = "ins_current";
+    let base_time = Utc::now();
+    let mut state = WorkerState::default();
+    let mut remote = managed_session_record("ses_1", SessionState::Running, false, installation_id);
+    remote.updated_at = base_time;
+    remote.last_checkpoint = Some("remote checkpoint".to_string());
+    state.upsert_session(remote);
+
+    let mut local = managed_session_record(
+        "ses_1",
+        SessionState::WaitingApproval,
+        false,
+        installation_id,
+    );
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: base_time + Duration::seconds(1),
+    });
+    local.updated_at = base_time + Duration::seconds(1);
+    local.last_checkpoint = Some("local checkpoint".to_string());
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_1".to_string(), local);
+
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        base_time + Duration::seconds(2),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+
+    let session = state.sessions.get("ses_1").unwrap();
+    assert_eq!(session.state, SessionState::WaitingApproval);
+    assert_eq!(session.last_checkpoint.as_deref(), Some("local checkpoint"));
+    assert!(session_belongs_to_installation(session, installation_id));
+}
+
+#[test]
+fn local_mirror_does_not_undo_remote_archive() {
+    let installation_id = "ins_current";
+    let base_time = Utc::now();
+    let mut state = WorkerState::default();
+    let mut remote = managed_session_record("ses_1", SessionState::Archived, true, installation_id);
+    remote.updated_at = base_time;
+    state.upsert_session(remote);
+    state
+        .remote_archived_session_ids
+        .insert("ses_1".to_string());
+
+    let mut local = managed_session_record("ses_1", SessionState::Running, false, installation_id);
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: base_time + Duration::seconds(1),
+    });
+    local.updated_at = base_time + Duration::seconds(1);
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_1".to_string(), local);
+
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        base_time + Duration::seconds(2),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+
+    let session = state.sessions.get("ses_1").unwrap();
+    assert_eq!(session.state, SessionState::Archived);
+    assert!(session.archived);
+}
+
+#[test]
+fn local_mirror_does_not_regress_newer_remote_session_state() {
+    let installation_id = "ins_current";
+    let base_time = Utc::now();
+    let mut state = WorkerState::default();
+    let mut remote =
+        managed_session_record("ses_1", SessionState::Completed, false, installation_id);
+    remote.updated_at = base_time + Duration::seconds(2);
+    remote.last_final = Some("remote final".to_string());
+    state.upsert_session(remote);
+
+    let mut local = managed_session_record("ses_1", SessionState::Running, false, installation_id);
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: base_time,
+    });
+    local.updated_at = base_time;
+    local.last_checkpoint = Some("local checkpoint".to_string());
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_1".to_string(), local);
+
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        base_time + Duration::seconds(3),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+
+    let session = state.sessions.get("ses_1").unwrap();
+    assert_eq!(session.state, SessionState::Completed);
+    assert_eq!(session.last_final.as_deref(), Some("remote final"));
+    assert_eq!(
+        session
+            .local_mirror
+            .as_ref()
+            .map(|mirror| mirror.installation_id.as_str()),
+        Some(installation_id)
+    );
+}
+
+#[test]
+fn local_mirror_restores_current_pending_approvals() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(managed_session_record(
+        "ses_1",
+        SessionState::WaitingApproval,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_foreign",
+        SessionState::WaitingApproval,
+        false,
+        "ins_other",
+    ));
+
+    let mut local = managed_session_record(
+        "ses_1",
+        SessionState::WaitingApproval,
+        false,
+        installation_id,
+    );
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_1".to_string(), local);
+    local_replay.pending_approvals.insert(
+        "apr_current".to_string(),
+        pending_approval("apr_current", "ses_1"),
+    );
+    local_replay.pending_approvals.insert(
+        "apr_foreign".to_string(),
+        pending_approval("apr_foreign", "ses_foreign"),
+    );
+
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+
+    assert!(state.pending_approvals.contains_key("apr_current"));
+    assert!(!state.pending_approvals.contains_key("apr_foreign"));
+}
+
+#[test]
+fn local_mirror_does_not_readd_remote_resolved_or_snapshot_stale_approvals() {
+    let installation_id = "ins_current";
+    let base_time = Utc::now();
+    let mut state = WorkerState::default();
+    state.remote_snapshot_created_at = Some(base_time + Duration::seconds(2));
+    state
+        .remote_resolved_approval_ids
+        .insert("apr_resolved".to_string());
+    state.upsert_session(managed_session_record(
+        "ses_1",
+        SessionState::WaitingApproval,
+        false,
+        installation_id,
+    ));
+
+    let mut local = managed_session_record(
+        "ses_1",
+        SessionState::WaitingApproval,
+        false,
+        installation_id,
+    );
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: base_time + Duration::seconds(3),
+    });
+    local.updated_at = base_time + Duration::seconds(3);
+    let mut resolved = pending_approval("apr_resolved", "ses_1");
+    resolved.requested_at = base_time + Duration::seconds(3);
+    let mut stale = pending_approval("apr_stale", "ses_1");
+    stale.requested_at = base_time;
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_1".to_string(), local);
+    local_replay
+        .pending_approvals
+        .insert("apr_resolved".to_string(), resolved);
+    local_replay
+        .pending_approvals
+        .insert("apr_stale".to_string(), stale);
+
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        base_time + Duration::seconds(4),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+
+    assert!(!state.pending_approvals.contains_key("apr_resolved"));
+    assert!(!state.pending_approvals.contains_key("apr_stale"));
+}
+
+#[test]
+fn current_writer_scope_retries_authorityless_listed_threads() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert(
+        "ses_1".to_string(),
+        session_record("ses_1", SessionState::Idle, false),
+    );
+    let local_thread_ids = std::iter::once("thread-ses_1".to_string()).collect();
+
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::CurrentWriterSnapshotOrListedThreads(&local_thread_ids)
+    ));
+    assert!(session_belongs_to_installation(
+        state.sessions.get("ses_1").unwrap(),
+        installation_id
+    ));
+}
+
+#[test]
+fn current_writer_local_mirror_does_not_claim_authorityless_legacy_session() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert(
+        "ses_1".to_string(),
+        session_record("ses_1", SessionState::Idle, false),
+    );
+
+    assert!(!state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+    let session = state.sessions.get("ses_1").unwrap();
+    assert!(!session_belongs_to_installation(session, installation_id));
+    assert!(session.authority.is_none());
+    assert!(session.local_mirror.is_none());
+}
+
+#[test]
+fn local_mirror_does_not_claim_foreign_authority() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    let mut remote = session_record("ses_1", SessionState::Idle, false);
+    remote.authority = Some(SessionAuthority {
+        installation_id: "ins_other".to_string(),
+    });
+    state.upsert_session(remote);
+
+    let mut local = session_record("ses_1", SessionState::Idle, false);
+    local.authority = Some(SessionAuthority {
+        installation_id: "ins_other".to_string(),
+    });
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_1".to_string(), local);
+
+    assert!(!state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+    let session = state.sessions.get("ses_1").unwrap();
+    assert!(!session_belongs_to_installation(session, installation_id));
+    assert!(session.local_mirror.is_none());
+}
+
+#[test]
+fn stale_local_mirror_does_not_claim_legacy_remote_session() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+
+    let mut local = session_record("ses_1", SessionState::Idle, false);
+    local.authority = Some(SessionAuthority {
+        installation_id: "ins_other".to_string(),
+    });
+    local.local_mirror = Some(LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert("ses_1".to_string(), local);
+
+    assert!(!state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::CurrentWriterSnapshot
+    ));
+    let session = state.sessions.get("ses_1").unwrap();
+    assert!(!session_belongs_to_installation(session, installation_id));
+    assert!(session.authority.is_none());
+    assert!(session.local_mirror.is_none());
+}
+
+#[test]
+fn legacy_local_mirror_claim_requires_listed_thread() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert(
+        "ses_1".to_string(),
+        session_record("ses_1", SessionState::Idle, false),
+    );
+    let local_thread_ids = std::collections::HashSet::new();
+
+    assert!(!state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::ListedThreads(&local_thread_ids)
+    ));
+    assert!(!session_belongs_to_installation(
+        state.sessions.get("ses_1").unwrap(),
+        installation_id
+    ));
+
+    let mut local_replay = wxcd_eventlog::ReplayState::default();
+    local_replay.sessions.insert(
+        "ses_1".to_string(),
+        session_record("ses_1", SessionState::Idle, false),
+    );
+    let local_thread_ids = std::iter::once("thread-ses_1".to_string()).collect();
+    assert!(state.merge_local_mirror(
+        local_replay,
+        installation_id,
+        Utc::now(),
+        LocalMirrorClaimScope::ListedThreads(&local_thread_ids)
+    ));
+    assert!(session_belongs_to_installation(
+        state.sessions.get("ses_1").unwrap(),
+        installation_id
+    ));
+}
+
+#[test]
+fn foreign_authority_takes_precedence_over_stale_local_mirror() {
+    let installation_id = "ins_current";
+    let mut session = managed_session_record("ses_1", SessionState::Idle, false, "ins_other");
+    session.local_mirror = Some(wxcd_proto::LocalSessionMirror {
+        installation_id: installation_id.to_string(),
+        mirrored_at: Utc::now(),
+    });
+
+    assert!(!session_belongs_to_installation(&session, installation_id));
+}
+
+#[test]
+fn legacy_local_snapshot_sessions_are_claimed_on_fallback() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+    state.set_executable_installation(installation_id);
+    let local_thread_ids = std::iter::once("thread-ses_1".to_string()).collect();
+
+    assert!(state.thread_to_session.is_empty());
+    assert!(state.claim_legacy_local_sessions(installation_id, Utc::now(), &local_thread_ids));
+
+    let session = state.sessions.get("ses_1").unwrap();
+    assert!(session_belongs_to_installation(session, installation_id));
+    assert_eq!(
+        state.thread_to_session.get(&session.thread_id),
+        Some(&session.session_id)
+    );
+}
+
+#[test]
+fn legacy_local_snapshot_claim_requires_listed_thread() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_1", SessionState::Idle, false));
+    state.set_executable_installation(installation_id);
+    let local_thread_ids = std::collections::HashSet::new();
+
+    assert!(!state.claim_legacy_local_sessions(installation_id, Utc::now(), &local_thread_ids));
+
+    let session = state.sessions.get("ses_1").unwrap();
+    assert!(!session_belongs_to_installation(session, installation_id));
+    assert!(state.thread_to_session.is_empty());
+}
+
+#[test]
+fn legacy_local_snapshot_claims_archived_session_without_indexing() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_archived", SessionState::Archived, true));
+    state.set_executable_installation(installation_id);
+    let local_thread_ids = std::iter::once("thread-ses_archived".to_string()).collect();
+
+    assert!(state.claim_legacy_local_sessions(installation_id, Utc::now(), &local_thread_ids));
+
+    let session = state.sessions.get("ses_archived").unwrap();
+    assert!(session_belongs_to_installation(session, installation_id));
+    assert!(validate_purge_archived_session(&state, "ses_archived", installation_id).is_ok());
+    assert!(state.room_to_session.is_empty());
+    assert!(state.thread_to_session.is_empty());
+}
+
+#[test]
+fn local_snapshot_records_writer_installation() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.set_executable_installation(installation_id);
+
+    let snapshot = state.to_snapshot();
+
+    assert_eq!(
+        snapshot.writer_installation_id.as_deref(),
+        Some(installation_id)
+    );
+}
+
+#[tokio::test]
+async fn local_snapshot_writer_metadata_round_trips() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-snapshot-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+    let snapshot_path = state_dir.join("bridge-state.json");
+    let snapshot = BridgeSnapshot {
+        created_at: Utc::now(),
+        writer_installation_id: Some("ins_current".to_string()),
+        sessions: Vec::new(),
+        pending_approvals: Vec::new(),
+    };
+    tokio::fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap())
+        .await
+        .unwrap();
+
+    let local_snapshot = load_local_snapshot_with_metadata(&snapshot_path)
+        .await
+        .unwrap();
+
+    assert!(local_snapshot.metadata.existed);
+    assert_eq!(
+        local_snapshot.metadata.writer_installation_id.as_deref(),
+        Some("ins_current")
+    );
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[test]
+fn executable_indexes_only_include_current_installation_sessions() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(managed_session_record(
+        "ses_current",
+        SessionState::Idle,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_failed",
+        SessionState::Failed,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_foreign",
+        SessionState::Idle,
+        false,
+        "ins_other",
+    ));
+
+    state.set_executable_installation(installation_id);
+
+    assert_eq!(
+        state
+            .room_to_session
+            .get("room-ses_current")
+            .map(String::as_str),
+        Some("ses_current")
+    );
+    assert_eq!(
+        state
+            .thread_to_session
+            .get("thread-ses_current")
+            .map(String::as_str),
+        Some("ses_current")
+    );
+    assert_eq!(
+        state
+            .room_to_session
+            .get("room-ses_failed")
+            .map(String::as_str),
+        Some("ses_failed")
+    );
+    assert!(!state.thread_to_session.contains_key("thread-ses_failed"));
+    assert!(!state.room_to_session.contains_key("room-ses_foreign"));
+    assert!(!state.thread_to_session.contains_key("thread-ses_foreign"));
+}
+
+#[test]
+fn diagnose_summary_filters_foreign_sessions() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(managed_session_record(
+        "ses_current",
+        SessionState::Failed,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_foreign",
+        SessionState::Failed,
+        false,
+        "ins_other",
+    ));
+
+    let sessions = sessions_for_diagnostics(&state, installation_id);
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "ses_current");
+}
+
+#[test]
+fn duplicate_thread_detection_uses_current_installation_sessions() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(managed_session_record(
+        "ses_failed",
+        SessionState::Failed,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_foreign",
+        SessionState::Idle,
+        false,
+        "ins_other",
+    ));
+    state.set_executable_installation(installation_id);
+
+    assert!(!state.thread_to_session.contains_key("thread-ses_failed"));
+    assert_eq!(
+        attached_session_for_thread(&state, "thread-ses_failed", installation_id),
+        Some("ses_failed")
+    );
+    assert_eq!(
+        attached_session_for_thread(&state, "thread-ses_foreign", installation_id),
+        None
+    );
+}
+
+#[test]
+fn installation_guards_reject_foreign_session_and_approval() {
+    let installation_id = "ins_current";
+    let mut state = WorkerState::default();
+    state.upsert_session(managed_session_record(
+        "ses_current",
+        SessionState::Idle,
+        false,
+        installation_id,
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_foreign",
+        SessionState::Idle,
+        false,
+        "ins_other",
+    ));
+    state.pending_approvals.insert(
+        "apr_current".to_string(),
+        pending_approval("apr_current", "ses_current"),
+    );
+    state.pending_approvals.insert(
+        "apr_foreign".to_string(),
+        pending_approval("apr_foreign", "ses_foreign"),
+    );
+
+    assert!(
+        ensure_session_id_belongs_to_installation(&state, "ses_current", installation_id).is_ok()
+    );
+    assert!(
+        ensure_session_id_belongs_to_installation(&state, "ses_foreign", installation_id).is_err()
+    );
+    assert!(
+        ensure_approval_belongs_to_installation(&state, "apr_current", installation_id).is_ok()
+    );
+    assert!(
+        ensure_approval_belongs_to_installation(&state, "apr_foreign", installation_id).is_err()
+    );
+}
+
+#[tokio::test]
+async fn installation_identity_persists_and_loads() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-installation-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+
+    let created = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+    let loaded = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+
+    assert_eq!(created, loaded);
+    assert!(created.installation_id.starts_with("ins_"));
+
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn installation_identity_lookup_error_is_not_treated_as_missing() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-installation-lookup-error-test-{}",
+        "a".repeat(300)
+    ));
+
+    let error = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("failed to inspect installation identity"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+async fn installation_identity_recovers_from_snapshot_writer() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-installation-recovery-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+    let snapshot_path = state_dir.join("bridge-state.json");
+    let snapshot = BridgeSnapshot {
+        created_at: Utc::now(),
+        writer_installation_id: Some("ins_recovered".to_string()),
+        sessions: Vec::new(),
+        pending_approvals: Vec::new(),
+    };
+    tokio::fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap())
+        .await
+        .unwrap();
+
+    let recovered = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+    let loaded = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+
+    assert_eq!(recovered.installation_id, "ins_recovered");
+    assert_eq!(loaded, recovered);
+
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn installation_identity_mints_when_snapshot_recovery_is_malformed() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-installation-malformed-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+    let snapshot_path = state_dir.join("bridge-state.json");
+    tokio::fs::write(&snapshot_path, "{not json").await.unwrap();
+
+    let created = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+    let loaded = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+
+    assert!(created.installation_id.starts_with("ins_"));
+    assert_eq!(loaded, created);
+
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn installation_identity_mints_for_legacy_snapshot_without_writer() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-installation-legacy-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+    let snapshot_path = state_dir.join("bridge-state.json");
+    let snapshot = BridgeSnapshot {
+        created_at: Utc::now(),
+        writer_installation_id: None,
+        sessions: Vec::new(),
+        pending_approvals: Vec::new(),
+    };
+    tokio::fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap())
+        .await
+        .unwrap();
+
+    let created = load_or_create_installation_identity(&state_dir)
+        .await
+        .unwrap();
+
+    assert!(created.installation_id.starts_with("ins_"));
+    assert_ne!(created.installation_id, "ins_recovered");
+
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 
 #[test]
@@ -522,5 +1477,38 @@ fn session_record(session_id: &str, state: SessionState, archived: bool) -> Sess
         updated_at: Utc::now(),
         archived,
         failure,
+        authority: None,
+        local_mirror: None,
+    }
+}
+
+fn managed_session_record(
+    session_id: &str,
+    state: SessionState,
+    archived: bool,
+    installation_id: &str,
+) -> SessionRecord {
+    let mut session = session_record(session_id, state, archived);
+    session.authority = Some(SessionAuthority {
+        installation_id: installation_id.to_string(),
+    });
+    session
+}
+
+fn pending_approval(approval_id: &str, session_id: &str) -> wxcd_proto::PendingApproval {
+    wxcd_proto::PendingApproval {
+        approval_id: approval_id.to_string(),
+        session_id: session_id.to_string(),
+        thread_id: format!("thread-{session_id}"),
+        turn_id: "turn".to_string(),
+        codex_request_id: json!(1),
+        item_id: "item".to_string(),
+        kind: wxcd_proto::ApprovalKind::CommandExecution,
+        reason: None,
+        command: None,
+        cwd: None,
+        requested_permissions: None,
+        card_message_id: None,
+        requested_at: Utc::now(),
     }
 }

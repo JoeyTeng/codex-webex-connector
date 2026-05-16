@@ -1,6 +1,7 @@
 # Project TODO
 
-- [pending] Improve recovery for previously created Codex threads that are not reloaded by `thread/read` after process restart.
+- [done] Split session authority so missing or unreadable local Codex threads become degraded sessions hidden from the default active list while remaining diagnosable/cleanable.
+- [pending] Decide the next recovery/handoff layer for degraded sessions after W1, without folding cbth RPC, app-server lease, delivery enqueue, lifecycle hooks, or plugin packaging into W1.
 - [pending] Decide whether to keep the 1:1 direct room as the long-term Data Space shape or switch to a credential model that can replay a shared/group room.
 - [pending] Investigate whether Webex overview cards can be refreshed reliably, or replace them with a safer update strategy.
 - [pending] Decide whether to root-cause the underlying Mercury SDK/service `url`-undefined disconnect regression, or keep watchdog restart as the long-term mitigation.
