@@ -20,6 +20,13 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct DiagnosticsConfig {
+    pub bridge: BridgeConfig,
+    pub repos: Vec<RepoConfig>,
+    pub missing_webex_env: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone)]
 pub struct WebexConfig {
     pub bot_token: String,
     pub bot_email: String,
@@ -39,6 +46,17 @@ pub struct BridgeConfig {
     pub snapshot_interval: usize,
     pub developer_instructions: String,
     pub config_path: Option<PathBuf>,
+    pub cbth_plugin: CbthPluginConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct CbthPluginConfig {
+    pub enabled: bool,
+    pub socket_path: Option<PathBuf>,
+    pub plugin_home: PathBuf,
+    pub plugin_instance_id: String,
+    pub plugin_release_id: String,
+    pub manifest_path: PathBuf,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -50,102 +68,48 @@ struct FileConfig {
     sandbox_mode: Option<String>,
     snapshot_interval: Option<usize>,
     developer_instructions: Option<String>,
+    cbth_plugin: Option<FileCbthPluginConfig>,
     repos: Option<Vec<RepoConfig>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileCbthPluginConfig {
+    enabled: Option<bool>,
+    socket_path: Option<String>,
+    plugin_home: Option<String>,
+    plugin_instance_id: Option<String>,
+    plugin_release_id: Option<String>,
+    manifest_path: Option<String>,
 }
 
 impl AppConfig {
     pub fn load() -> Result<Self> {
-        if let Some(env_path) = env::var_os("WXCD_ENV_PATH") {
-            dotenvy::from_path(&env_path).with_context(|| {
-                format!(
-                    "failed to load env file {}",
-                    PathBuf::from(&env_path).display()
-                )
-            })?;
-        } else {
-            dotenvy::dotenv().ok();
-        }
-
-        let config_path = discover_config_path()?;
-        let file_config = match &config_path {
-            Some(path) => {
-                let content = fs::read_to_string(path)
-                    .with_context(|| format!("failed to read config file {}", path.display()))?;
-                toml::from_str::<FileConfig>(&content)
-                    .with_context(|| format!("failed to parse config file {}", path.display()))?
-            }
-            None => FileConfig::default(),
-        };
-
-        let bot_token = required_env("WEBEX_BOT_TOKEN")?;
-        let bot_email = required_env("WEBEX_BOT_EMAIL")?;
-        let bot_display_name = optional_env("WEBEX_BOT_DISPLAY_NAME");
-        let control_room_ref = required_env("WEBEX_CONTROL_ROOM_SPACE_LINK")?;
-        let data_room_ref = required_env("WEBEX_DATA_ROOM_SPACE_LINK")?;
-        let allowed_user_emails = required_env("WEBEX_ALLOWED_USER_EMAILS")?
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(|item| item.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        if allowed_user_emails.is_empty() {
-            bail!("WEBEX_ALLOWED_USER_EMAILS must contain at least one email");
-        }
-
-        let state_dir =
-            expand_tilde(file_config.state_dir.unwrap_or_else(|| {
-                "~/Library/Application Support/codex-webex-connector".to_string()
-            }))?;
-        let socket_path = expand_tilde(
-            file_config
-                .socket_path
-                .unwrap_or_else(|| "/tmp/wxcd.sock".to_string()),
-        )?;
-        let repos = match file_config.repos {
-            Some(repos) if !repos.is_empty() => repos,
-            _ => {
-                let cwd = env::current_dir().context("failed to determine current directory")?;
-                let repo_name = cwd
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("codex-webex-connector")
-                    .to_string();
-                vec![RepoConfig {
-                    name: repo_name,
-                    path: cwd,
-                }]
-            }
-        };
+        let sources = load_config_sources()?;
+        let webex = load_webex_config()?;
+        let bridge = build_bridge_config(&sources.file_config, sources.config_path.clone())?;
+        let repos = build_repos(sources.file_config.repos)?;
 
         Ok(Self {
-            webex: WebexConfig {
-                bot_token,
-                bot_email: bot_email.to_ascii_lowercase(),
-                bot_display_name,
-                control_room_ref,
-                data_room_ref,
-                allowed_user_emails,
-            },
-            bridge: BridgeConfig {
-                socket_path,
-                state_dir,
-                session_title_prefix: file_config
-                    .session_title_prefix
-                    .unwrap_or_else(|| "WXCD".to_string()),
-                approval_policy: file_config
-                    .approval_policy
-                    .unwrap_or_else(|| "on-request".to_string()),
-                sandbox_mode: file_config
-                    .sandbox_mode
-                    .unwrap_or_else(|| "workspace-write".to_string()),
-                snapshot_interval: file_config.snapshot_interval.unwrap_or(20),
-                developer_instructions: file_config.developer_instructions.unwrap_or_else(|| {
-                    "You are operating through the wxcd Webex bridge. Keep updates concise and act on concrete requests."
-                        .to_string()
-                }),
-                config_path,
-            },
+            webex,
+            bridge,
             repos,
+        })
+    }
+
+    pub fn load_diagnostics() -> Result<DiagnosticsConfig> {
+        let sources = load_config_sources()?;
+        let bridge = build_bridge_config(&sources.file_config, sources.config_path.clone())?;
+        let repos = build_repos(sources.file_config.repos)?;
+        let missing_webex_env = WEBEX_REQUIRED_ENV
+            .iter()
+            .copied()
+            .filter(|name| env::var(name).is_err())
+            .collect();
+
+        Ok(DiagnosticsConfig {
+            bridge,
+            repos,
+            missing_webex_env,
         })
     }
 
@@ -153,6 +117,215 @@ impl AppConfig {
         self.repos
             .iter()
             .find(|repo| repo.name.eq_ignore_ascii_case(name))
+    }
+}
+
+struct ConfigSources {
+    config_path: Option<PathBuf>,
+    file_config: FileConfig,
+}
+
+const WEBEX_REQUIRED_ENV: &[&str] = &[
+    "WEBEX_BOT_TOKEN",
+    "WEBEX_BOT_EMAIL",
+    "WEBEX_CONTROL_ROOM_SPACE_LINK",
+    "WEBEX_DATA_ROOM_SPACE_LINK",
+    "WEBEX_ALLOWED_USER_EMAILS",
+];
+
+fn load_config_sources() -> Result<ConfigSources> {
+    if let Some(env_path) = env::var_os("WXCD_ENV_PATH") {
+        dotenvy::from_path(&env_path).with_context(|| {
+            format!(
+                "failed to load env file {}",
+                PathBuf::from(&env_path).display()
+            )
+        })?;
+    } else {
+        dotenvy::dotenv().ok();
+    }
+
+    let config_path = discover_config_path()?;
+    let file_config = match &config_path {
+        Some(path) => {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("failed to read config file {}", path.display()))?;
+            toml::from_str::<FileConfig>(&content)
+                .with_context(|| format!("failed to parse config file {}", path.display()))?
+        }
+        None => FileConfig::default(),
+    };
+
+    Ok(ConfigSources {
+        config_path,
+        file_config,
+    })
+}
+
+fn load_webex_config() -> Result<WebexConfig> {
+    let bot_token = required_env("WEBEX_BOT_TOKEN")?;
+    let bot_email = required_env("WEBEX_BOT_EMAIL")?;
+    let bot_display_name = optional_env("WEBEX_BOT_DISPLAY_NAME");
+    let control_room_ref = required_env("WEBEX_CONTROL_ROOM_SPACE_LINK")?;
+    let data_room_ref = required_env("WEBEX_DATA_ROOM_SPACE_LINK")?;
+    let allowed_user_emails = required_env("WEBEX_ALLOWED_USER_EMAILS")?
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if allowed_user_emails.is_empty() {
+        bail!("WEBEX_ALLOWED_USER_EMAILS must contain at least one email");
+    }
+
+    Ok(WebexConfig {
+        bot_token,
+        bot_email: bot_email.to_ascii_lowercase(),
+        bot_display_name,
+        control_room_ref,
+        data_room_ref,
+        allowed_user_emails,
+    })
+}
+
+fn build_bridge_config(
+    file_config: &FileConfig,
+    config_path: Option<PathBuf>,
+) -> Result<BridgeConfig> {
+    let state_dir = expand_tilde(
+        file_config
+            .state_dir
+            .clone()
+            .unwrap_or_else(|| "~/Library/Application Support/codex-webex-connector".to_string()),
+    )?;
+    let socket_path = expand_tilde(
+        file_config
+            .socket_path
+            .clone()
+            .unwrap_or_else(|| "/tmp/wxcd.sock".to_string()),
+    )?;
+    let cbth_plugin = build_cbth_plugin_config(file_config.cbth_plugin.as_ref(), &state_dir)?;
+
+    Ok(BridgeConfig {
+        socket_path,
+        state_dir,
+        session_title_prefix: file_config
+            .session_title_prefix
+            .clone()
+            .unwrap_or_else(|| "WXCD".to_string()),
+        approval_policy: file_config
+            .approval_policy
+            .clone()
+            .unwrap_or_else(|| "on-request".to_string()),
+        sandbox_mode: file_config
+            .sandbox_mode
+            .clone()
+            .unwrap_or_else(|| "workspace-write".to_string()),
+        snapshot_interval: file_config.snapshot_interval.unwrap_or(20),
+        developer_instructions: file_config.developer_instructions.clone().unwrap_or_else(|| {
+            "You are operating through the wxcd Webex bridge. Keep updates concise and act on concrete requests."
+                .to_string()
+        }),
+        config_path,
+        cbth_plugin,
+    })
+}
+
+fn build_cbth_plugin_config(
+    file_config: Option<&FileCbthPluginConfig>,
+    state_dir: &Path,
+) -> Result<CbthPluginConfig> {
+    let cbth_socket_path = optional_path_env("CBTH_PLUGIN_RPC_SOCKET");
+    let enabled = cbth_socket_path
+        .as_ref()
+        .map(|_| true)
+        .or_else(|| env_bool("WXCD_CBTH_PLUGIN"))
+        .or_else(|| file_config.and_then(|config| config.enabled))
+        .unwrap_or(false);
+    let socket_path = cbth_socket_path
+        .or_else(|| optional_path_env("WXCD_CBTH_SOCKET_PATH"))
+        .or_else(|| file_config.and_then(|config| config.socket_path.clone()))
+        .map(expand_tilde)
+        .transpose()?;
+    let plugin_home = optional_path_env("CBTH_PLUGIN_HOME")
+        .or_else(|| optional_path_env("WXCD_PLUGIN_HOME"))
+        .or_else(|| file_config.and_then(|config| config.plugin_home.clone()))
+        .map(expand_tilde)
+        .transpose()?
+        .unwrap_or_else(|| state_dir.join("plugin"));
+    let plugin_instance_id = optional_env("WXCD_PLUGIN_INSTANCE_ID")
+        .or_else(|| optional_env("CBTH_PLUGIN_STARTED_AT").map(|value| format!("cbth-{value}")))
+        .or_else(|| file_config.and_then(|config| config.plugin_instance_id.clone()))
+        .unwrap_or_else(|| "standalone".to_string());
+    let plugin_release_id = optional_env("CBTH_PLUGIN_RELEASE_ID")
+        .or_else(|| optional_env("WXCD_PLUGIN_RELEASE_ID"))
+        .or_else(|| file_config.and_then(|config| config.plugin_release_id.clone()))
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let manifest_path = optional_path_env("WXCD_PLUGIN_MANIFEST_PATH")
+        .or_else(|| file_config.and_then(|config| config.manifest_path.clone()))
+        .map(expand_tilde)
+        .transpose()?
+        .unwrap_or_else(|| state_dir.join("current").join("plugin/manifest.json"));
+    let manifest_path = if manifest_path.is_relative() {
+        state_dir.join("current").join(&manifest_path)
+    } else {
+        manifest_path
+    };
+
+    Ok(CbthPluginConfig {
+        enabled,
+        socket_path,
+        plugin_home,
+        plugin_instance_id,
+        plugin_release_id,
+        manifest_path,
+    })
+}
+
+fn build_repos(repos: Option<Vec<RepoConfig>>) -> Result<Vec<RepoConfig>> {
+    match repos {
+        Some(repos) if !repos.is_empty() => Ok(repos),
+        _ => {
+            let cwd = env::current_dir().context("failed to determine current directory")?;
+            let repo_name = cwd
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("codex-webex-connector")
+                .to_string();
+            Ok(vec![RepoConfig {
+                name: repo_name,
+                path: cwd,
+            }])
+        }
+    }
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    env::var(name).ok().and_then(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+fn optional_path_env(name: &str) -> Option<String> {
+    optional_env(name)
+}
+
+impl CbthPluginConfig {
+    pub fn mode_name(&self) -> &'static str {
+        if self.enabled {
+            "cbth_plugin"
+        } else {
+            "standalone"
+        }
+    }
+
+    pub fn is_ready_for_rpc(&self) -> bool {
+        self.enabled && self.socket_path.is_some()
     }
 }
 
@@ -197,4 +370,172 @@ fn expand_tilde(value: String) -> Result<PathBuf> {
 
     let base_dirs = BaseDirs::new().ok_or_else(|| anyhow!("failed to determine home directory"))?;
     Ok(base_dirs.home_dir().join(value.trim_start_matches("~/")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
+    use super::{FileConfig, build_bridge_config};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn bridge_config_defaults_to_standalone_legacy_mode() {
+        let _guard = env_guard();
+        clear_cbth_env();
+        let config = build_bridge_config(&FileConfig::default(), None).unwrap();
+
+        assert_eq!(config.socket_path.to_string_lossy(), "/tmp/wxcd.sock");
+        assert!(!config.cbth_plugin.enabled);
+        assert_eq!(config.cbth_plugin.mode_name(), "standalone");
+        assert!(!config.cbth_plugin.is_ready_for_rpc());
+        assert_eq!(config.cbth_plugin.socket_path, None);
+    }
+
+    #[test]
+    fn bridge_config_reads_explicit_cbth_plugin_mode() {
+        let _guard = env_guard();
+        clear_cbth_env();
+        let file_config: FileConfig = toml::from_str(
+            r#"
+socket_path = "/tmp/wxcd.sock"
+
+[cbth_plugin]
+enabled = true
+socket_path = "/tmp/cbth-webex.sock"
+plugin_home = "/tmp/wxcd-plugin-home"
+plugin_instance_id = "instance-1"
+plugin_release_id = "release-1"
+manifest_path = "plugin/manifest.json"
+"#,
+        )
+        .unwrap();
+
+        let config = build_bridge_config(&file_config, None).unwrap();
+
+        assert!(config.cbth_plugin.enabled);
+        assert_eq!(config.cbth_plugin.mode_name(), "cbth_plugin");
+        assert!(config.cbth_plugin.is_ready_for_rpc());
+        assert_eq!(
+            config
+                .cbth_plugin
+                .socket_path
+                .as_ref()
+                .unwrap()
+                .to_string_lossy(),
+            "/tmp/cbth-webex.sock"
+        );
+        assert_eq!(config.cbth_plugin.plugin_instance_id, "instance-1");
+        assert_eq!(config.cbth_plugin.plugin_release_id, "release-1");
+    }
+
+    #[test]
+    fn relative_manifest_path_resolves_from_current_release() {
+        let _guard = env_guard();
+        clear_cbth_env();
+        let file_config: FileConfig = toml::from_str(
+            r#"
+state_dir = "/tmp/wxcd"
+
+[cbth_plugin]
+manifest_path = "plugin/manifest.json"
+"#,
+        )
+        .unwrap();
+
+        let config =
+            build_bridge_config(&file_config, Some("/tmp/wxcd/config/wxcd.toml".into())).unwrap();
+
+        assert_eq!(
+            config.cbth_plugin.manifest_path.to_string_lossy(),
+            "/tmp/wxcd/current/plugin/manifest.json"
+        );
+    }
+
+    #[test]
+    fn cbth_environment_enables_plugin_mode() {
+        let _guard = env_guard();
+        clear_cbth_env();
+        set_env("CBTH_PLUGIN_RPC_SOCKET", "/tmp/cbth.sock");
+        set_env("CBTH_PLUGIN_HOME", "/tmp/cbth-plugin-home");
+        set_env("CBTH_PLUGIN_RELEASE_ID", "release-1");
+        set_env("CBTH_PLUGIN_STARTED_AT", "123");
+        remove_env("WXCD_CBTH_PLUGIN");
+        remove_env("WXCD_CBTH_SOCKET_PATH");
+        remove_env("WXCD_PLUGIN_HOME");
+        remove_env("WXCD_PLUGIN_RELEASE_ID");
+        remove_env("WXCD_PLUGIN_INSTANCE_ID");
+
+        let config = build_bridge_config(&FileConfig::default(), None).unwrap();
+
+        assert!(config.cbth_plugin.enabled);
+        assert_eq!(
+            config
+                .cbth_plugin
+                .socket_path
+                .as_ref()
+                .unwrap()
+                .to_string_lossy(),
+            "/tmp/cbth.sock"
+        );
+        assert_eq!(
+            config.cbth_plugin.plugin_home.to_string_lossy(),
+            "/tmp/cbth-plugin-home"
+        );
+        assert_eq!(config.cbth_plugin.plugin_release_id, "release-1");
+        assert_eq!(config.cbth_plugin.plugin_instance_id, "cbth-123");
+
+        remove_env("CBTH_PLUGIN_RPC_SOCKET");
+        remove_env("CBTH_PLUGIN_HOME");
+        remove_env("CBTH_PLUGIN_RELEASE_ID");
+        remove_env("CBTH_PLUGIN_STARTED_AT");
+    }
+
+    #[test]
+    fn cbth_environment_instance_id_overrides_installed_config() {
+        let _guard = env_guard();
+        clear_cbth_env();
+        set_env("CBTH_PLUGIN_RPC_SOCKET", "/tmp/cbth.sock");
+        set_env("CBTH_PLUGIN_STARTED_AT", "456");
+        let file_config: FileConfig = toml::from_str(
+            r#"
+[cbth_plugin]
+plugin_instance_id = "standalone"
+"#,
+        )
+        .unwrap();
+
+        let config = build_bridge_config(&file_config, None).unwrap();
+
+        assert!(config.cbth_plugin.enabled);
+        assert_eq!(config.cbth_plugin.plugin_instance_id, "cbth-456");
+
+        remove_env("CBTH_PLUGIN_RPC_SOCKET");
+        remove_env("CBTH_PLUGIN_STARTED_AT");
+    }
+
+    fn env_guard() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap()
+    }
+
+    fn set_env(key: &str, value: &str) {
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    fn remove_env(key: &str) {
+        unsafe { std::env::remove_var(key) };
+    }
+
+    fn clear_cbth_env() {
+        remove_env("CBTH_PLUGIN_RPC_SOCKET");
+        remove_env("CBTH_PLUGIN_HOME");
+        remove_env("CBTH_PLUGIN_RELEASE_ID");
+        remove_env("CBTH_PLUGIN_STARTED_AT");
+        remove_env("WXCD_CBTH_PLUGIN");
+        remove_env("WXCD_CBTH_SOCKET_PATH");
+        remove_env("WXCD_PLUGIN_HOME");
+        remove_env("WXCD_PLUGIN_RELEASE_ID");
+        remove_env("WXCD_PLUGIN_INSTANCE_ID");
+    }
 }

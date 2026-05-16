@@ -10,6 +10,14 @@ You are operating through the wxcd Webex bridge.
 Keep updates concise, make real code changes when requested, and prefer high-signal summaries.
 """
 
+[cbth_plugin]
+enabled = false
+socket_path = "/tmp/cbth-webex-plugin.sock"
+plugin_home = "~/Library/Application Support/codex-webex-connector/plugin"
+plugin_instance_id = "standalone"
+plugin_release_id = "0.1.0"
+manifest_path = "plugin/manifest.json"
+
 [[repos]]
 name = "codex-webex-connector"
 path = "/Users/hoteng/Program/GitHub/codex-webex-connector"

@@ -16,8 +16,9 @@ use super::{
 use chrono::{Duration, Utc};
 use serde_json::json;
 use wxcd_proto::{
-    AppConfig, BridgeConfig, BridgeSnapshot, LocalSessionMirror, RepoConfig, SessionAuthority,
-    SessionFailure, SessionFailureKind, SessionRecord, SessionState, WebexConfig,
+    AppConfig, BridgeConfig, BridgeSnapshot, CbthPluginConfig, DiagnosticsConfig,
+    LocalSessionMirror, RepoConfig, SessionAuthority, SessionFailure, SessionFailureKind,
+    SessionRecord, SessionState, WebexConfig,
 };
 use wxcd_render::ImportedHistoryTurn;
 
@@ -302,6 +303,14 @@ fn derives_repo_name_from_configured_path() {
             snapshot_interval: 20,
             developer_instructions: "test".to_string(),
             config_path: None,
+            cbth_plugin: CbthPluginConfig {
+                enabled: false,
+                socket_path: None,
+                plugin_home: "/tmp/plugin".into(),
+                plugin_instance_id: "standalone".to_string(),
+                plugin_release_id: "0.1.0".to_string(),
+                manifest_path: "plugin/manifest.json".into(),
+            },
         },
         repos: vec![RepoConfig {
             name: "codex-webex-connector".to_string(),
@@ -319,6 +328,81 @@ fn derives_repo_name_from_configured_path() {
     assert_eq!(
         repo_name_for_cwd(&config, "/tmp/random-repo"),
         "random-repo"
+    );
+}
+
+#[test]
+fn doctor_report_describes_standalone_mode_without_credentials() {
+    let diagnostics = DiagnosticsConfig {
+        bridge: BridgeConfig {
+            socket_path: "/tmp/wxcd.sock".into(),
+            state_dir: "/tmp/wxcd-state".into(),
+            session_title_prefix: "WXCD".to_string(),
+            approval_policy: "on-request".to_string(),
+            sandbox_mode: "workspace-write".to_string(),
+            snapshot_interval: 20,
+            developer_instructions: "test".to_string(),
+            config_path: None,
+            cbth_plugin: CbthPluginConfig {
+                enabled: false,
+                socket_path: None,
+                plugin_home: "/tmp/plugin".into(),
+                plugin_instance_id: "standalone".to_string(),
+                plugin_release_id: "0.1.0".to_string(),
+                manifest_path: "plugin/manifest.json".into(),
+            },
+        },
+        repos: vec![RepoConfig {
+            name: "repo".to_string(),
+            path: "/tmp/repo".into(),
+        }],
+        missing_webex_env: vec!["WEBEX_BOT_TOKEN"],
+    };
+
+    let report = super::render_doctor_report(
+        &diagnostics,
+        &super::ManifestStatus::Valid,
+        &super::RpcStatus::Disabled,
+    );
+
+    assert!(report.contains("mode: standalone"));
+    assert!(report.contains("plugin_rpc: disabled"));
+    assert!(report.contains("webex_credentials: missing WEBEX_BOT_TOKEN"));
+}
+
+#[test]
+fn plugin_manifest_validates_packaging_metadata() {
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("plugin/manifest.json");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path).expect("read plugin manifest"),
+    )
+    .expect("decode plugin manifest");
+    let config = CbthPluginConfig {
+        enabled: false,
+        socket_path: None,
+        plugin_home: "/tmp/plugin".into(),
+        plugin_instance_id: "standalone".to_string(),
+        plugin_release_id: "0.1.0".to_string(),
+        manifest_path,
+    };
+
+    assert_eq!(
+        super::validate_plugin_manifest(&config),
+        super::ManifestStatus::Valid
+    );
+    assert_eq!(
+        manifest
+            .pointer("/entrypoint/binary")
+            .and_then(|value| value.as_str()),
+        Some("../bin/wxcd-supervisor")
+    );
+    assert_eq!(
+        manifest
+            .pointer("/diagnostics/command/0")
+            .and_then(|value| value.as_str()),
+        Some("../bin/wxcd-worker")
     );
 }
 

@@ -1,0 +1,34 @@
+---
+id: 20260513-w2-plugin-packaging-rpc-client-1989c19
+title: W2 Plugin Packaging RPC Client
+status: completed
+created: 2026-05-13
+updated: 2026-05-16
+branch: codex/w2-plugin-packaging-rpc-client
+pr: https://github.com/JoeyTeng/codex-webex-connector/pull/3
+supersedes: []
+superseded_by:
+---
+
+# W2 Plugin Packaging RPC Client
+
+## Summary
+- W2 在 W1 state authority split 之上补齐 webex-connector 的 cbth plugin packaging 基础：plugin manifest、显式 plugin-mode 配置、C1-compatible `plugin.hello` UDS client，以及无需真实 Webex 凭据即可运行的 `wxcd-worker doctor` 诊断面。
+- 运行时仍保持 standalone legacy mode 默认行为，worker 仍直接启动 Codex app-server；cbth-managed app-server、delivery enqueue 和 lifecycle handoff/drain 均留给后续 W3/W4/W5/W6。
+
+## Current State
+- 默认配置为 standalone；只有显式配置 `cbth_plugin.enabled = true` 或设置 `WXCD_CBTH_PLUGIN` 时才进入 cbth plugin diagnostics/RPC readiness 路径。
+- `plugin/manifest.json` 描述当前 release 的 entrypoint、capabilities、config schema 和 doctor command。
+- `wxcd-cbth-rpc` 复制并隔离 C1 `plugin_rpc.rs` 的 v1 frame/type shape，后续共享 crate 出现后可集中替换。
+
+## Evidence
+- Dependency baseline: W1 head `1989c19f45d1c08e20b9bf221e3c538ef10c59d9`.
+- cbth dependency API: C1 PR #78 head `39ae8fe49ba25615385b292cdd6ed1e6628ba460`.
+- Validation: `cargo test` passed locally on 2026-05-13.
+- Review: helper-backed `codex-review` on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..ba9601f` found timeout, installed manifest path, and macOS UDS test-path risks; the follow-up commit fixed all three.
+- Final review: helper-backed `codex-review` on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..30ec21f` found missing runtime handshake and missing `CBTH_*` env support; the follow-up fix adds supervisor startup hello and cbth env derivation.
+- Final review follow-up: clear-context review on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..0b1daa2` found the runtime supervisor hello still lacked a timeout; the follow-up fix bounds startup plugin RPC hello.
+- Final review follow-up: clear-context review on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..de1d5c7` found installed manifest paths could become stale across releases; the follow-up fix uses stable `current/plugin/manifest.json` resolution.
+- Final review follow-up: clear-context review on `1989c19f45d1c08e20b9bf221e3c538ef10c59d9..4703e98` found cbth runtime identity was shadowed by installed `plugin_instance_id = "standalone"`; the follow-up fix lets `CBTH_PLUGIN_STARTED_AT` override file config.
+- PR #3 Codex review follow-up: GitHub review on `4c8501c5f7` found unsupported successful `plugin.hello` protocol versions were accepted and packaged manifest commands pointed at paths that do not exist when resolved from `plugin/manifest.json`; the follow-up validates negotiated protocol versions and uses `../bin/...` command paths.
+- Validation: `cargo test -p wxcd-cbth-rpc`, `cargo test -p wxcd-worker plugin_manifest_validates_packaging_metadata`, and `cargo test` passed locally on 2026-05-16.

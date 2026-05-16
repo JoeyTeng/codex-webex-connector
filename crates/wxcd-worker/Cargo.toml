@@ -14,6 +14,7 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+wxcd-cbth-rpc.workspace = true
 wxcd-codex.workspace = true
 wxcd-eventlog.workspace = true
 wxcd-proto.workspace = true

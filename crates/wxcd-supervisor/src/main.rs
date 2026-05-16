@@ -9,7 +9,12 @@ use tokio::process::Command;
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use wxcd_proto::AppConfig;
+use wxcd_cbth_rpc::{
+    PLUGIN_RPC_PROTOCOL_VERSION_V1, PluginCapability, PluginHelloRequest, PluginRpcClient,
+};
+use wxcd_proto::{AppConfig, CbthPluginConfig};
+
+const PLUGIN_RPC_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Parser)]
 struct Cli {
@@ -40,6 +45,7 @@ async fn main() -> Result<()> {
 
 async fn run_supervisor() -> Result<()> {
     let config = AppConfig::load()?;
+    let _plugin_rpc = connect_cbth_plugin_rpc(&config.bridge.cbth_plugin).await?;
     loop {
         let release_dir = current_release_dir(&config)?;
         let worker_path = release_dir.join("bin").join("wxcd-worker");
@@ -90,6 +96,51 @@ async fn run_supervisor() -> Result<()> {
         }
 
         sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn connect_cbth_plugin_rpc(config: &CbthPluginConfig) -> Result<Option<PluginRpcClient>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    let Some(socket_path) = config.socket_path.as_ref() else {
+        bail!("cbth plugin mode is enabled but no plugin RPC socket is configured");
+    };
+
+    let (client, response) = timeout(PLUGIN_RPC_STARTUP_TIMEOUT, async {
+        let mut client = PluginRpcClient::connect(socket_path).await?;
+        let response = client
+            .plugin_hello(plugin_hello_request(config))
+            .await
+            .context("failed to complete cbth plugin hello")?;
+        Ok::<_, anyhow::Error>((client, response))
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "timed out after {}s completing cbth plugin hello",
+            PLUGIN_RPC_STARTUP_TIMEOUT.as_secs()
+        )
+    })??;
+    info!(
+        "cbth plugin RPC hello completed with protocol version {}",
+        response.protocol_version
+    );
+    Ok(Some(client))
+}
+
+fn plugin_hello_request(config: &CbthPluginConfig) -> PluginHelloRequest {
+    PluginHelloRequest {
+        plugin_name: "webex-connector".to_string(),
+        plugin_instance_id: config.plugin_instance_id.clone(),
+        plugin_release_id: config.plugin_release_id.clone(),
+        protocol_versions: vec![PLUGIN_RPC_PROTOCOL_VERSION_V1],
+        capabilities: vec![
+            PluginCapability::new("diagnostics"),
+            PluginCapability::new("standalone-compatible"),
+        ],
+        plugin_home: config.plugin_home.display().to_string(),
+        pid: std::process::id(),
     }
 }
 

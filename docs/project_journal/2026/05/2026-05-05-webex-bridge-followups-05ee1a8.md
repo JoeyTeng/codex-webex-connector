@@ -28,10 +28,11 @@ superseded_by:
 - W1 persists local mirror merge results back to Data Space snapshots and merges newer local snapshot session fields plus current-installation pending approvals after successful replay.
 - W1 remote replay tombstones prevent stale local mirror snapshots from resurrecting purged sessions, resolved approvals, or remotely archived sessions.
 - Failed session rooms remain routable for in-room recovery commands, `/list all` includes archived sessions for purge discovery, and legacy claim evidence includes archived Codex threads without making archived sessions executable.
+- W2 adds plugin packaging metadata, explicit cbth plugin configuration, a C1-compatible `plugin.hello` RPC client, startup/doctor readiness checks, and installed manifest paths that resolve against the packaged release layout.
 
 ## Next Steps
 - Use `diagnose sessions` and `cleanup failed <session_id>` on degraded sessions whose local Codex thread is missing, unreadable, or not probeable.
-- Plan the next recovery/handoff layer separately from W1.
+- Plan the next recovery/handoff layer separately from W2.
 - Decide whether the long-term Data Space should stay on the bot-owner 1:1 direct room or move to a credential model that can replay shared/group rooms.
 - Investigate whether Webex overview cards can be refreshed reliably, or replace them with a safer update strategy.
 - Decide whether to root-cause the Mercury SDK/service `url`-undefined disconnect regression, or keep watchdog restart as the long-term mitigation.
