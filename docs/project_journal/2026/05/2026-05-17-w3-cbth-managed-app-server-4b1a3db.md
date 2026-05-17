@@ -1,11 +1,11 @@
 ---
 id: 20260517-w3-cbth-managed-app-server-4b1a3db
 title: W3 Cbth Managed App Server
-status: active
+status: completed
 created: 2026-05-17
 updated: 2026-05-17
 branch: codex/w3-cbth-managed-app-server
-pr:
+pr: https://github.com/JoeyTeng/codex-webex-connector/pull/9
 supersedes: []
 superseded_by:
 ---
@@ -25,4 +25,6 @@ superseded_by:
 ## Evidence
 - Dependency baseline: webex `origin/master` head `4b1a3db`.
 - cbth dependency API: C3 PR #88 merge commit `8241b68d58663045fd23d045d95d38a6921d45ec`.
-- Local validation is recorded in the PR body before merge.
+- PR: https://github.com/JoeyTeng/codex-webex-connector/pull/9
+- Local validation: `cargo fmt --check`, `cargo test -p wxcd-supervisor`, `cargo test`, `cargo clippy --workspace --all-targets -- -D warnings`, `bash scripts/smoke-test.sh`, project journal validation, and `git diff --check`.
+- Local review: final `codex-readonly` LGTM in `.codex-tmp/isolated-review-9v4c7gyg`.
