@@ -1,7 +1,7 @@
 use super::{
-    CleanupFailedCommand, DiagnoseCommand, ListCommand, ListMode, LocalMirrorClaimScope,
-    PurgeArchivedCommand, RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerState,
-    abbreviate, apply_thread_probe, attached_session_for_thread,
+    CleanupFailedCommand, CodexConnectionConfig, DiagnoseCommand, ListCommand, ListMode,
+    LocalMirrorClaimScope, PurgeArchivedCommand, RECENT_EVENT_ID_LIMIT, ThreadProbe,
+    ThreadProbeKind, WorkerState, abbreviate, apply_thread_probe, attached_session_for_thread,
     ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
     ensure_session_id_belongs_to_installation, extract_thread_history_turns,
     generate_installation_id, is_control_list_session, is_default_list_session,
@@ -10,8 +10,8 @@ use super::{
     normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
     parse_diagnose_command, parse_list_command, parse_purge_archived_command,
     parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
-    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
-    slice_thread_history_page, validate_purge_archived_session,
+    resolve_codex_connection, session_belongs_to_installation, session_requires_codex_archive,
+    sessions_for_diagnostics, slice_thread_history_page, validate_purge_archived_session,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -24,6 +24,49 @@ use wxcd_render::ImportedHistoryTurn;
 
 const BOT_EMAIL: &str = "codex-webex-connector@webex.bot";
 const BOT_DISPLAY_NAME: &str = "Codex Webex Connector";
+
+fn app_config_with_plugin(enabled: bool) -> AppConfig {
+    AppConfig {
+        webex: WebexConfig {
+            bot_token: "token".to_string(),
+            bot_email: "bot@example.com".to_string(),
+            bot_display_name: Some("Test Bot".to_string()),
+            control_room_ref: "control".to_string(),
+            data_room_ref: "data".to_string(),
+            allowed_user_emails: vec!["user@example.com".to_string()],
+        },
+        bridge: BridgeConfig {
+            socket_path: "/tmp/wxcd.sock".into(),
+            state_dir: "/tmp".into(),
+            session_title_prefix: "WXCD".to_string(),
+            approval_policy: "on-request".to_string(),
+            sandbox_mode: "workspace-write".to_string(),
+            snapshot_interval: 20,
+            developer_instructions: "test".to_string(),
+            config_path: None,
+            cbth_plugin: CbthPluginConfig {
+                enabled,
+                socket_path: if enabled {
+                    Some("/tmp/cbth.sock".into())
+                } else {
+                    None
+                },
+                plugin_home: "/tmp/plugin".into(),
+                plugin_instance_id: if enabled {
+                    "instance-1".to_string()
+                } else {
+                    "standalone".to_string()
+                },
+                plugin_release_id: "0.1.0".to_string(),
+                manifest_path: "plugin/manifest.json".into(),
+            },
+        },
+        repos: vec![RepoConfig {
+            name: "codex-webex-connector".to_string(),
+            path: "/Users/hoteng/Program/GitHub/codex-webex-connector".into(),
+        }],
+    }
+}
 
 #[test]
 fn strips_single_word_mention_prefix() {
@@ -285,38 +328,7 @@ fn recent_event_dedupe_is_bounded() {
 
 #[test]
 fn derives_repo_name_from_configured_path() {
-    let config = AppConfig {
-        webex: WebexConfig {
-            bot_token: "token".to_string(),
-            bot_email: "bot@example.com".to_string(),
-            bot_display_name: Some("Test Bot".to_string()),
-            control_room_ref: "control".to_string(),
-            data_room_ref: "data".to_string(),
-            allowed_user_emails: vec!["user@example.com".to_string()],
-        },
-        bridge: BridgeConfig {
-            socket_path: "/tmp/wxcd.sock".into(),
-            state_dir: "/tmp".into(),
-            session_title_prefix: "WXCD".to_string(),
-            approval_policy: "on-request".to_string(),
-            sandbox_mode: "workspace-write".to_string(),
-            snapshot_interval: 20,
-            developer_instructions: "test".to_string(),
-            config_path: None,
-            cbth_plugin: CbthPluginConfig {
-                enabled: false,
-                socket_path: None,
-                plugin_home: "/tmp/plugin".into(),
-                plugin_instance_id: "standalone".to_string(),
-                plugin_release_id: "0.1.0".to_string(),
-                manifest_path: "plugin/manifest.json".into(),
-            },
-        },
-        repos: vec![RepoConfig {
-            name: "codex-webex-connector".to_string(),
-            path: "/Users/hoteng/Program/GitHub/codex-webex-connector".into(),
-        }],
-    };
+    let config = app_config_with_plugin(false);
 
     assert_eq!(
         repo_name_for_cwd(
@@ -328,6 +340,52 @@ fn derives_repo_name_from_configured_path() {
     assert_eq!(
         repo_name_for_cwd(&config, "/tmp/random-repo"),
         "random-repo"
+    );
+}
+
+#[test]
+fn codex_connection_defaults_to_standalone() {
+    let config = app_config_with_plugin(false);
+
+    let connection = resolve_codex_connection(&config, None).expect("connection");
+
+    assert_eq!(connection, CodexConnectionConfig::Standalone);
+}
+
+#[test]
+fn standalone_connection_ignores_managed_app_server_url() {
+    let config = app_config_with_plugin(false);
+
+    let connection = resolve_codex_connection(&config, Some("ws://127.0.0.1:1234".to_string()))
+        .expect("connection");
+
+    assert_eq!(connection, CodexConnectionConfig::Standalone);
+}
+
+#[test]
+fn codex_connection_uses_supervisor_managed_app_server_url() {
+    let config = app_config_with_plugin(true);
+
+    let connection = resolve_codex_connection(&config, Some("ws://127.0.0.1:1234".to_string()))
+        .expect("connection");
+
+    assert_eq!(
+        connection,
+        CodexConnectionConfig::ManagedAppServer {
+            url: "ws://127.0.0.1:1234".to_string()
+        }
+    );
+}
+
+#[test]
+fn cbth_plugin_mode_requires_supervisor_managed_app_server_url() {
+    let config = app_config_with_plugin(true);
+
+    let error = resolve_codex_connection(&config, None).expect_err("missing managed URL");
+
+    assert!(
+        format!("{error:#}").contains("WXCD_CODEX_APP_SERVER_URL"),
+        "{error:#}"
     );
 }
 
@@ -753,8 +811,10 @@ fn local_mirror_does_not_resurrect_purged_snapshot_only_session() {
 fn local_mirror_skips_snapshot_only_sessions_older_than_remote_snapshot() {
     let installation_id = "ins_current";
     let base_time = Utc::now();
-    let mut state = WorkerState::default();
-    state.remote_snapshot_created_at = Some(base_time + Duration::seconds(2));
+    let mut state = WorkerState {
+        remote_snapshot_created_at: Some(base_time + Duration::seconds(2)),
+        ..WorkerState::default()
+    };
 
     let mut local = managed_session_record("ses_local", SessionState::Idle, false, installation_id);
     local.updated_at = base_time;
@@ -938,8 +998,10 @@ fn local_mirror_restores_current_pending_approvals() {
 fn local_mirror_does_not_readd_remote_resolved_or_snapshot_stale_approvals() {
     let installation_id = "ins_current";
     let base_time = Utc::now();
-    let mut state = WorkerState::default();
-    state.remote_snapshot_created_at = Some(base_time + Duration::seconds(2));
+    let mut state = WorkerState {
+        remote_snapshot_created_at: Some(base_time + Duration::seconds(2)),
+        ..WorkerState::default()
+    };
     state
         .remote_resolved_approval_ids
         .insert("apr_resolved".to_string());
