@@ -2,7 +2,8 @@
 
 - [done] Split session authority so missing or unreadable local Codex threads become degraded sessions hidden from the default active list while remaining diagnosable/cleanable.
 - [done] Add W2 plugin packaging, manifest, compatible cbth plugin RPC hello client, explicit plugin-mode config, and doctor diagnostics without changing standalone runtime behavior.
-- [pending] Decide the next recovery/handoff layer after W2, without folding cbth-managed app-server lease, delivery enqueue, lifecycle hooks, or handoff/drain into W2.
+- [done] Add W3 cbth-managed app-server lease usage for explicit plugin mode, without changing standalone/direct Codex app-server startup.
+- [pending] Decide the next delivery/lifecycle/handoff layer after W3, without folding `delivery.enqueue`, lifecycle hooks, release handoff, or Webex handoff into W3.
 - [pending] Decide whether to keep the 1:1 direct room as the long-term Data Space shape or switch to a credential model that can replay a shared/group room.
 - [pending] Investigate whether Webex overview cards can be refreshed reliably, or replace them with a safer update strategy.
 - [pending] Decide whether to root-cause the underlying Mercury SDK/service `url`-undefined disconnect regression, or keep watchdog restart as the long-term mitigation.

@@ -12,6 +12,9 @@ pub const PLUGIN_RPC_PROTOCOL_VERSION_V1: u32 = 1;
 pub const PLUGIN_RPC_SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[PLUGIN_RPC_PROTOCOL_VERSION_V1];
 pub const PLUGIN_RPC_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const PLUGIN_RPC_HELLO_METHOD: &str = "plugin.hello";
+pub const PLUGIN_RPC_APP_SERVER_ENSURE_METHOD: &str = "app_server.ensure";
+pub const PLUGIN_RPC_APP_SERVER_REFRESH_METHOD: &str = "app_server.refresh";
+pub const PLUGIN_RPC_APP_SERVER_STOP_METHOD: &str = "app_server.stop";
 
 const PLUGIN_RPC_JSONRPC_VERSION: &str = "2.0";
 const FRAME_LENGTH_PREFIX_BYTES: usize = 4;
@@ -161,6 +164,79 @@ pub struct DaemonEndpointHint {
     pub endpoint: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginAppServerEnsureRequest {
+    pub managed_session_id: String,
+    pub bound_thread_id: String,
+    pub session_epoch: i64,
+    pub codex_binary: String,
+    pub lease_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_ttl_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginAppServerRefreshRequest {
+    pub managed_session_id: String,
+    pub lease_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_ttl_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginAppServerStopRequest {
+    pub managed_session_id: String,
+    pub lease_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginAppServerLeaseResponse {
+    pub lease_id: String,
+    pub daemon: PluginAppServerDaemon,
+    pub app_server: PluginAppServerInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_ensure: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginAppServerStopResponse {
+    pub lease_id: String,
+    pub daemon: PluginAppServerDaemon,
+    pub stopped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff_daemon_socket_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginAppServerDaemon {
+    pub socket_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginAppServerInfo {
+    pub managed_session_id: String,
+    pub bound_thread_id: String,
+    pub session_epoch: i64,
+    pub url: String,
+    pub pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid_identity: Option<String>,
+    pub started_at: i64,
+    pub lease_seconds_remaining: u64,
+    pub ownership: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_daemon_socket_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff_daemon_socket_path: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginRpcErrorKind {
@@ -241,24 +317,13 @@ impl PluginRpcClient {
         request: PluginHelloRequest,
     ) -> Result<PluginHelloResponse> {
         let supported_protocol_versions = request.protocol_versions.clone();
-        let id = self.next_request_id();
-        let frame = PluginRpcRequestFrame::plugin_hello(id.clone(), request)?;
-        write_plugin_rpc_frame(&mut self.stream, &frame, self.max_frame_bytes).await?;
-        let response: PluginRpcResponseFrame =
-            read_plugin_rpc_frame(&mut self.stream, self.max_frame_bytes).await?;
-        if response.id != id {
-            bail!(
-                "cbth plugin RPC response id mismatch: expected {}, got {}",
-                id,
-                response.id
-            );
-        }
-        if let Some(error) = response.error {
-            return Err(error).context("cbth plugin hello failed");
-        }
-        let result = response.result.ok_or_else(|| {
-            PluginRpcError::malformed_frame("plugin hello response missing result")
-        })?;
+        let result = self
+            .request_value(
+                PLUGIN_RPC_HELLO_METHOD,
+                serde_json::to_value(request).context("failed to encode plugin hello request")?,
+            )
+            .await
+            .context("cbth plugin hello failed")?;
         let response: PluginHelloResponse =
             serde_json::from_value(result).context("failed to decode plugin hello response")?;
         if !supported_protocol_versions.contains(&response.protocol_version) {
@@ -277,6 +342,85 @@ impl PluginRpcClient {
             .context("cbth plugin hello failed");
         }
         Ok(response)
+    }
+
+    pub async fn app_server_ensure(
+        &mut self,
+        request: PluginAppServerEnsureRequest,
+    ) -> Result<PluginAppServerLeaseResponse> {
+        self.request(
+            PLUGIN_RPC_APP_SERVER_ENSURE_METHOD,
+            request,
+            "failed to decode app_server.ensure response",
+        )
+        .await
+        .context("cbth app_server.ensure failed")
+    }
+
+    pub async fn app_server_refresh(
+        &mut self,
+        request: PluginAppServerRefreshRequest,
+    ) -> Result<PluginAppServerLeaseResponse> {
+        self.request(
+            PLUGIN_RPC_APP_SERVER_REFRESH_METHOD,
+            request,
+            "failed to decode app_server.refresh response",
+        )
+        .await
+        .context("cbth app_server.refresh failed")
+    }
+
+    pub async fn app_server_stop(
+        &mut self,
+        request: PluginAppServerStopRequest,
+    ) -> Result<PluginAppServerStopResponse> {
+        self.request(
+            PLUGIN_RPC_APP_SERVER_STOP_METHOD,
+            request,
+            "failed to decode app_server.stop response",
+        )
+        .await
+        .context("cbth app_server.stop failed")
+    }
+
+    async fn request<T, U>(
+        &mut self,
+        method: &str,
+        request: T,
+        decode_context: &'static str,
+    ) -> Result<U>
+    where
+        T: Serialize,
+        U: DeserializeOwned,
+    {
+        let params = serde_json::to_value(request)
+            .with_context(|| format!("failed to encode {method} request"))?;
+        let result = self.request_value(method, params).await?;
+        serde_json::from_value(result).context(decode_context)
+    }
+
+    async fn request_value(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_request_id();
+        let frame = PluginRpcRequestFrame::new(id.clone(), method, params);
+        write_plugin_rpc_frame(&mut self.stream, &frame, self.max_frame_bytes).await?;
+        let response: PluginRpcResponseFrame =
+            read_plugin_rpc_frame(&mut self.stream, self.max_frame_bytes).await?;
+        if response.id != id {
+            bail!(
+                "cbth plugin RPC response id mismatch: expected {}, got {}",
+                id,
+                response.id
+            );
+        }
+        if let Some(error) = response.error {
+            return Err(error).with_context(|| format!("cbth plugin RPC {method} failed"));
+        }
+        response
+            .result
+            .ok_or_else(|| {
+                PluginRpcError::malformed_frame(format!("{method} response missing result"))
+            })
+            .map_err(Into::into)
     }
 
     fn next_request_id(&mut self) -> String {
@@ -569,5 +713,149 @@ mod tests {
         assert!(error.contains("unsupported plugin RPC protocol version 999"));
         server.await.expect("server");
         std::fs::remove_file(socket_path).ok();
+    }
+
+    #[tokio::test]
+    async fn app_server_lease_methods_roundtrip_against_fake_uds_server() {
+        let socket_path = test_socket_path("app-server");
+        let listener = UnixListener::bind(&socket_path).expect("bind fake server");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+
+            let ensure: PluginRpcRequestFrame =
+                read_plugin_rpc_frame(&mut stream, PLUGIN_RPC_MAX_FRAME_BYTES)
+                    .await
+                    .expect("read ensure");
+            assert_eq!(ensure.method, PLUGIN_RPC_APP_SERVER_ENSURE_METHOD);
+            let ensure_params: PluginAppServerEnsureRequest =
+                serde_json::from_value(ensure.params).expect("decode ensure");
+            assert_eq!(ensure_params.managed_session_id, "managed-1");
+            assert_eq!(ensure_params.bound_thread_id, "thread-1");
+            assert_eq!(ensure_params.session_epoch, 7);
+            assert_eq!(ensure_params.codex_binary, "codex");
+            assert_eq!(ensure_params.lease_id, "lease-1");
+            assert_eq!(ensure_params.lease_ttl_seconds, Some(120));
+            write_plugin_rpc_frame(
+                &mut stream,
+                &PluginRpcResponseFrame::success(
+                    ensure.id,
+                    app_server_result("lease-1", "managed-1", "thread-1", 7),
+                ),
+                PLUGIN_RPC_MAX_FRAME_BYTES,
+            )
+            .await
+            .expect("write ensure response");
+
+            let refresh: PluginRpcRequestFrame =
+                read_plugin_rpc_frame(&mut stream, PLUGIN_RPC_MAX_FRAME_BYTES)
+                    .await
+                    .expect("read refresh");
+            assert_eq!(refresh.method, PLUGIN_RPC_APP_SERVER_REFRESH_METHOD);
+            let refresh_params: PluginAppServerRefreshRequest =
+                serde_json::from_value(refresh.params).expect("decode refresh");
+            assert_eq!(refresh_params.managed_session_id, "managed-1");
+            assert_eq!(refresh_params.lease_id, "lease-1");
+            assert_eq!(refresh_params.lease_ttl_seconds, Some(120));
+            write_plugin_rpc_frame(
+                &mut stream,
+                &PluginRpcResponseFrame::success(
+                    refresh.id,
+                    app_server_result("lease-1", "managed-1", "thread-1", 7),
+                ),
+                PLUGIN_RPC_MAX_FRAME_BYTES,
+            )
+            .await
+            .expect("write refresh response");
+
+            let stop: PluginRpcRequestFrame =
+                read_plugin_rpc_frame(&mut stream, PLUGIN_RPC_MAX_FRAME_BYTES)
+                    .await
+                    .expect("read stop");
+            assert_eq!(stop.method, PLUGIN_RPC_APP_SERVER_STOP_METHOD);
+            let stop_params: PluginAppServerStopRequest =
+                serde_json::from_value(stop.params).expect("decode stop");
+            assert_eq!(stop_params.managed_session_id, "managed-1");
+            assert_eq!(stop_params.lease_id, "lease-1");
+            write_plugin_rpc_frame(
+                &mut stream,
+                &PluginRpcResponseFrame::success(
+                    stop.id,
+                    json!({
+                        "lease_id": "lease-1",
+                        "daemon": {
+                            "socket_path": "/tmp/cbth.sock",
+                        },
+                        "stopped": true,
+                        "handoff_daemon_socket_path": null,
+                    }),
+                ),
+                PLUGIN_RPC_MAX_FRAME_BYTES,
+            )
+            .await
+            .expect("write stop response");
+        });
+
+        let mut client = PluginRpcClient::connect(&socket_path)
+            .await
+            .expect("connect");
+        let ensure = client
+            .app_server_ensure(PluginAppServerEnsureRequest {
+                managed_session_id: "managed-1".to_string(),
+                bound_thread_id: "thread-1".to_string(),
+                session_epoch: 7,
+                codex_binary: "codex".to_string(),
+                lease_id: "lease-1".to_string(),
+                lease_ttl_seconds: Some(120),
+            })
+            .await
+            .expect("ensure");
+        assert_eq!(ensure.app_server.url, "ws://127.0.0.1:1234");
+
+        let refresh = client
+            .app_server_refresh(PluginAppServerRefreshRequest {
+                managed_session_id: "managed-1".to_string(),
+                lease_id: "lease-1".to_string(),
+                lease_ttl_seconds: Some(120),
+            })
+            .await
+            .expect("refresh");
+        assert_eq!(refresh.lease_id, "lease-1");
+
+        let stop = client
+            .app_server_stop(PluginAppServerStopRequest {
+                managed_session_id: "managed-1".to_string(),
+                lease_id: "lease-1".to_string(),
+            })
+            .await
+            .expect("stop");
+        assert!(stop.stopped);
+
+        server.await.expect("server");
+        std::fs::remove_file(socket_path).ok();
+    }
+
+    fn app_server_result(
+        lease_id: &str,
+        managed_session_id: &str,
+        bound_thread_id: &str,
+        session_epoch: i64,
+    ) -> Value {
+        json!({
+            "lease_id": lease_id,
+            "daemon": {
+                "socket_path": "/tmp/cbth.sock",
+            },
+            "app_server": {
+                "managed_session_id": managed_session_id,
+                "bound_thread_id": bound_thread_id,
+                "session_epoch": session_epoch,
+                "url": "ws://127.0.0.1:1234",
+                "pid": 12345,
+                "pid_identity": "pid-start",
+                "started_at": 1000,
+                "lease_seconds_remaining": 60,
+                "ownership": "owned",
+            },
+        })
     }
 }

@@ -42,6 +42,7 @@ const RECENT_EVENT_ID_LIMIT: usize = 1024;
 const INSTALLATION_IDENTITY_FILE: &str = "installation-identity.json";
 const LOCAL_SNAPSHOT_FILE: &str = "bridge-state.json";
 const PLUGIN_RPC_DOCTOR_TIMEOUT: Duration = Duration::from_secs(3);
+const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 
 #[derive(Parser)]
 struct Args {
@@ -154,6 +155,12 @@ struct CreateBridgeSessionInput<'a> {
     installation_id: &'a str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexConnectionConfig {
+    Standalone,
+    ManagedAppServer { url: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct InstallationIdentity {
     installation_id: String,
@@ -213,7 +220,7 @@ async fn run() -> Result<()> {
         .await
         .context("failed to resolve data room reference")?;
 
-    let mut codex = CodexClient::spawn().await?;
+    let mut codex = open_codex_client(&config).await?;
     codex
         .initialize("wxcd-worker", true)
         .await
@@ -412,6 +419,31 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+async fn open_codex_client(config: &AppConfig) -> Result<CodexClient> {
+    match resolve_codex_connection(config, std::env::var(WXCD_CODEX_APP_SERVER_URL_ENV).ok())? {
+        CodexConnectionConfig::Standalone => CodexClient::spawn().await,
+        CodexConnectionConfig::ManagedAppServer { url } => {
+            CodexClient::connect_websocket(&url).await
+        }
+    }
+}
+
+fn resolve_codex_connection(
+    config: &AppConfig,
+    managed_app_server_url: Option<String>,
+) -> Result<CodexConnectionConfig> {
+    if !config.bridge.cbth_plugin.enabled {
+        return Ok(CodexConnectionConfig::Standalone);
+    }
+
+    match managed_app_server_url.filter(|value| !value.trim().is_empty()) {
+        Some(url) => Ok(CodexConnectionConfig::ManagedAppServer { url }),
+        None => {
+            bail!("cbth plugin mode requires {WXCD_CODEX_APP_SERVER_URL_ENV} from wxcd-supervisor")
+        }
+    }
+}
+
 async fn run_doctor() -> Result<()> {
     let diagnostics = AppConfig::load_diagnostics()?;
     let manifest_status = validate_plugin_manifest(&diagnostics.bridge.cbth_plugin);
@@ -547,6 +579,7 @@ fn render_rpc_status(status: &RpcStatus) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_webex_ingress(
     config: &AppConfig,
     webex: &WebexClient,
@@ -1833,6 +1866,7 @@ fn sessions_for_control_list(
         .collect()
 }
 
+#[cfg(test)]
 fn is_default_list_session(session: &SessionRecord, installation_id: &str) -> bool {
     is_control_list_session(session, installation_id, false)
 }
