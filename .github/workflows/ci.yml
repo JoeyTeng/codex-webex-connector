@@ -17,14 +17,16 @@ concurrency:
 
 jobs:
   rust:
-    name: Rust (${{ matrix.os }})
+    name: Rust (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-24.04
-          - macos-15
+        include:
+          - platform: linux
+            os: ubuntu-24.04
+          - platform: macos
+            os: macos-15
 
     steps:
       - name: Checkout
@@ -48,14 +50,16 @@ jobs:
         run: cargo test --locked
 
   sidecar:
-    name: Webex sidecar (${{ matrix.os }})
+    name: Webex sidecar (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-24.04
-          - macos-15
+        include:
+          - platform: linux
+            os: ubuntu-24.04
+          - platform: macos
+            os: macos-15
     defaults:
       run:
         working-directory: sidecars/webex-ws-sidecar
@@ -81,3 +85,35 @@ jobs:
 
       - name: Check Webex sidecar
         run: pnpm run check
+
+  rust-required-check-compat:
+    name: Rust (${{ matrix.os }})
+    runs-on: ubuntu-24.04
+    needs: rust
+    if: ${{ always() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+
+    steps:
+      - name: Check Rust matrix result
+        run: test "${{ needs.rust.result }}" = "success"
+
+  sidecar-required-check-compat:
+    name: Webex sidecar (${{ matrix.os }})
+    runs-on: ubuntu-24.04
+    needs: sidecar
+    if: ${{ always() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+
+    steps:
+      - name: Check Webex sidecar matrix result
+        run: test "${{ needs.sidecar.result }}" = "success"
