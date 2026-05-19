@@ -15,10 +15,11 @@ use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use wxcd_cbth_rpc::{
-    PLUGIN_RPC_PROTOCOL_VERSION_V1, PluginAppServerEnsureRequest, PluginAppServerRefreshRequest,
-    PluginAppServerStopRequest, PluginCapability, PluginDeliveryEnqueueRequest,
-    PluginDeliveryTarget, PluginHelloRequest, PluginHelloResponse, PluginRpcClient, PluginRpcError,
-    PluginRpcErrorKind, PluginRpcRequestFrame, PluginRpcResponseFrame,
+    PLUGIN_RPC_PLUGIN_LIFECYCLE_CAPABILITY, PLUGIN_RPC_PROTOCOL_VERSION_V1,
+    PluginAppServerEnsureRequest, PluginAppServerRefreshRequest, PluginAppServerStopRequest,
+    PluginCapability, PluginDeliveryEnqueueRequest, PluginDeliveryTarget, PluginHelloRequest,
+    PluginHelloResponse, PluginRpcClient, PluginRpcError, PluginRpcErrorKind,
+    PluginRpcRequestFrame, PluginRpcResponseFrame,
     SERVICE_CAPABILITY_DELIVERY_OWNED_CODEX_APP_SERVER_TARGET_V1, read_plugin_rpc_frame,
     write_plugin_rpc_frame,
 };
@@ -40,6 +41,8 @@ const PLUGIN_DELIVERY_BROKER_SOCKET_DIR: &str = "/tmp";
 const PLUGIN_DELIVERY_BROKER_SOCKET_MODE: u32 = 0o600;
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
+const WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV: &str = "WXCD_SUPERVISOR_SHUTDOWN_MARKER";
+const SUPERVISOR_SHUTDOWN_MARKER_FILE: &str = "supervisor-shutdown-requested.json";
 
 #[derive(Parser)]
 struct Cli {
@@ -72,6 +75,8 @@ async fn run_supervisor() -> Result<()> {
     let config = AppConfig::load()?;
     loop {
         let release_dir = current_release_dir(&config)?;
+        let shutdown_marker_path = supervisor_shutdown_marker_path(&config.bridge.cbth_plugin);
+        clear_supervisor_shutdown_marker(&shutdown_marker_path).await?;
         let worker_path = release_dir.join("bin").join("wxcd-worker");
         let sidecar_path = release_dir
             .join("sidecars")
@@ -108,6 +113,7 @@ async fn run_supervisor() -> Result<()> {
             delivery_broker
                 .as_ref()
                 .map(|broker| broker.socket_path.as_path()),
+            Some(&shutdown_marker_path),
         );
         let mut worker = match worker_command
             .stdout(Stdio::inherit())
@@ -248,6 +254,10 @@ async fn run_supervisor() -> Result<()> {
             && !delivery_broker_task_finished
         {
             broker.shutdown().await;
+        }
+        if supervisor_shutdown_was_requested(&shutdown_marker_path).await? {
+            info!("worker requested supervisor shutdown for lifecycle transition");
+            return Ok(());
         }
         sleep(Duration::from_secs(2)).await;
     }
@@ -520,8 +530,10 @@ fn configure_worker_environment(
     config_path: Option<&Path>,
     app_server_url: Option<&str>,
     delivery_broker_socket_path: Option<&Path>,
+    shutdown_marker_path: Option<&Path>,
 ) {
     command.env_remove(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV);
+    command.env_remove(WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV);
     if let Some(config_path) = config_path {
         command.env("WXCD_CONFIG_PATH", config_path);
     }
@@ -530,6 +542,9 @@ fn configure_worker_environment(
     }
     if let Some(socket_path) = delivery_broker_socket_path {
         command.env(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV, socket_path);
+    }
+    if let Some(marker_path) = shutdown_marker_path {
+        command.env(WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV, marker_path);
     }
 }
 
@@ -991,10 +1006,36 @@ fn plugin_hello_request(config: &CbthPluginConfig) -> PluginHelloRequest {
         capabilities: vec![
             PluginCapability::new("diagnostics"),
             PluginCapability::new("standalone-compatible"),
+            PluginCapability::new(PLUGIN_RPC_PLUGIN_LIFECYCLE_CAPABILITY),
         ],
         plugin_home: config.plugin_home.display().to_string(),
         pid: std::process::id(),
     }
+}
+
+fn supervisor_shutdown_marker_path(config: &CbthPluginConfig) -> PathBuf {
+    config.plugin_home.join(SUPERVISOR_SHUTDOWN_MARKER_FILE)
+}
+
+async fn clear_supervisor_shutdown_marker(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to remove stale {}", path.display()))
+        }
+    }
+}
+
+async fn supervisor_shutdown_was_requested(path: &Path) -> Result<bool> {
+    if !tokio::fs::try_exists(path)
+        .await
+        .with_context(|| format!("failed to inspect {}", path.display()))?
+    {
+        return Ok(false);
+    }
+    clear_supervisor_shutdown_marker(path).await?;
+    Ok(true)
 }
 
 async fn activate_release(release_dir: PathBuf) -> Result<()> {
@@ -1263,7 +1304,7 @@ mod tests {
         let mut command = Command::new("worker");
         command.env(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV, "/tmp/stale.sock");
 
-        configure_worker_environment(&mut command, None, None, None);
+        configure_worker_environment(&mut command, None, None, None, None);
 
         let broker_env = command
             .as_std()
@@ -1277,7 +1318,7 @@ mod tests {
         let mut command = Command::new("worker");
         let socket_path = Path::new("/tmp/current.sock");
 
-        configure_worker_environment(&mut command, None, None, Some(socket_path));
+        configure_worker_environment(&mut command, None, None, Some(socket_path), None);
 
         let broker_env = command
             .as_std()
@@ -1287,6 +1328,40 @@ mod tests {
             broker_env,
             Some((_, Some(value))) if value == socket_path.as_os_str()
         ));
+    }
+
+    #[test]
+    fn worker_command_env_sets_supervisor_shutdown_marker() {
+        let mut command = Command::new("worker");
+        let marker_path = Path::new("/tmp/wxcd-supervisor-shutdown.json");
+
+        configure_worker_environment(&mut command, None, None, None, Some(marker_path));
+
+        let marker_env = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV);
+        assert!(matches!(
+            marker_env,
+            Some((_, Some(value))) if value == marker_path.as_os_str()
+        ));
+    }
+
+    #[test]
+    fn supervisor_shutdown_marker_lives_in_plugin_home() {
+        let config = CbthPluginConfig {
+            enabled: true,
+            socket_path: Some("/tmp/cbth.sock".into()),
+            plugin_home: "/tmp/plugin-home".into(),
+            plugin_instance_id: "instance-1".to_string(),
+            plugin_release_id: "release-1".to_string(),
+            manifest_path: "/tmp/plugin/manifest.json".into(),
+        };
+
+        assert_eq!(
+            supervisor_shutdown_marker_path(&config),
+            PathBuf::from("/tmp/plugin-home").join(SUPERVISOR_SHUTDOWN_MARKER_FILE)
+        );
     }
 
     fn broker_delivery_request(target: PluginDeliveryTarget) -> PluginDeliveryEnqueueRequest {

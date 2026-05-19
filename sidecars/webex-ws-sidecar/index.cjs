@@ -15,6 +15,7 @@ const WebexCore = require("@webex/webex-core").default;
 const token = process.env.WEBEX_BOT_TOKEN;
 const socketPath = process.env.WXCD_SOCKET_PATH || "/tmp/wxcd.sock";
 const botEmail = (process.env.WEBEX_BOT_EMAIL || "").toLowerCase();
+const ingressRetryDelayMs = Number.parseInt(process.env.WXCD_INGRESS_RETRY_DELAY_MS || "1000", 10);
 
 if (!token) {
   throw new Error("WEBEX_BOT_TOKEN is required");
@@ -27,6 +28,11 @@ const webex = new WebexCore({
 });
 
 let exitingForRestart = false;
+let shuttingDown = false;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 async function fetchJson(url) {
   const response = await fetch(url, {
@@ -42,10 +48,53 @@ async function fetchJson(url) {
   return await response.json();
 }
 
-function sendEnvelope(envelope) {
+function isRetryableWorkerAck(ack) {
+  const detail = String(ack?.detail || "");
+  return (
+    ack?.healthy === false ||
+    /quiescing|shutting down|not accepting new Webex work/i.test(detail)
+  );
+}
+
+function workerAckError(ack) {
+  const error = new Error(`worker rejected ingress: ${ack?.detail || "negative ack"}`);
+  error.retryable = isRetryableWorkerAck(ack);
+  error.ack = ack;
+  return error;
+}
+
+function decodeWorkerAck(line) {
+  const ack = JSON.parse(line);
+  if (ack?.ok === true) {
+    return ack;
+  }
+  if (ack?.ok === false) {
+    throw workerAckError(ack);
+  }
+  throw new Error(`invalid worker ingress ack: ${line}`);
+}
+
+function markRetryableSocketError(error) {
+  if (["ECONNREFUSED", "ECONNRESET", "ENOENT", "EPIPE"].includes(error?.code)) {
+    error.retryable = true;
+  }
+  return error;
+}
+
+function sendEnvelopeOnce(envelope) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath);
+    let settled = false;
     let buffer = "";
+
+    function finish(callback, value) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      callback(value);
+    }
+
     socket.on("connect", () => {
       socket.write(JSON.stringify(envelope));
       socket.write("\n");
@@ -53,13 +102,46 @@ function sendEnvelope(envelope) {
     socket.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
       if (buffer.includes("\n")) {
-        resolve();
+        const line = buffer.slice(0, buffer.indexOf("\n")).trim();
+        try {
+          finish(resolve, decodeWorkerAck(line));
+        } catch (error) {
+          finish(reject, error);
+        }
         socket.end();
       }
     });
-    socket.on("error", reject);
-    socket.on("end", resolve);
+    socket.on("error", (error) => finish(reject, markRetryableSocketError(error)));
+    socket.on("end", () => {
+      if (!settled) {
+        finish(reject, new Error("worker closed ingress socket before ack"));
+      }
+    });
   });
+}
+
+async function sendEnvelope(envelope) {
+  let nextLogAt = 0;
+  for (;;) {
+    try {
+      await sendEnvelopeOnce(envelope);
+      return;
+    } catch (error) {
+      if (!error?.retryable || shuttingDown) {
+        throw error;
+      }
+      const now = Date.now();
+      if (now >= nextLogAt) {
+        console.error("worker ingress temporarily unavailable; retrying", {
+          message: error.message,
+          code: error.code,
+          ack: error.ack,
+        });
+        nextLogAt = now + 10000;
+      }
+      await sleep(Number.isFinite(ingressRetryDelayMs) ? ingressRetryDelayMs : 1000);
+    }
+  }
 }
 
 function ingressEventId(payload) {
@@ -171,6 +253,7 @@ async function main() {
 }
 
 async function shutdown() {
+  shuttingDown = true;
   try {
     if (typeof webex.messages.stopListening === "function") {
       await webex.messages.stopListening();

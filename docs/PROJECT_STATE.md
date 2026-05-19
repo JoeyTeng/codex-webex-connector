@@ -6,8 +6,10 @@
 - W2 plugin packaging/RPC client foundation 已落地：standalone legacy mode 仍是默认路径，显式 cbth plugin mode 支持 manifest、`plugin.hello` UDS readiness check 和 `wxcd-worker doctor`。
 - W3 cbth-managed app-server usage 已落地：显式 cbth plugin mode 由 supervisor 通过 C3 `app_server.ensure/refresh/stop` 管理 loopback Codex app-server 租约，worker 通过 managed `ws://` endpoint 连接；standalone/direct mode 仍默认直接启动 `codex app-server --listen stdio://`。
 - W4 delivery enqueue routing 已落地：Webex async/background notifications 通过 supervisor-owned broker 调用 cbth C5 `delivery.enqueue` delivery-owned `codex_app_server` target；普通 Webex user-message forwarding 仍走 W3 direct app-server path。
+- W5 lifecycle hooks 已落地：显式 cbth plugin mode 提供 C7 `plugin.health_check`、`plugin.quiesce`、`plugin.drain`、`plugin.shutdown`、`plugin.unquiesce` 的保守实现；quiesce/shutdown 后拒绝新的 Webex 外部 ingress，drain 等待已接收 handler 完成并在 cbth plugin home 持久化 local session mirror 后返回。
 - GitHub pull requests run `codex/review-gate` through the repository workflow.
 - 详细历史、验证证据和迁移前 tracker 原文已移入 `docs/project_journal/`：
+  - W5 lifecycle hooks：`docs/project_journal/2026/05/2026-05-19-w5-lifecycle-hooks-ab986d1.md`
   - W4 delivery enqueue routing：`docs/project_journal/2026/05/2026-05-19-w4-delivery-enqueue-41d6ec5.md`
   - W3 cbth-managed app-server：`docs/project_journal/2026/05/2026-05-17-w3-cbth-managed-app-server-4b1a3db.md`
   - W2 plugin packaging/RPC client：`docs/project_journal/2026/05/2026-05-13-w2-plugin-packaging-rpc-client-1989c19.md`
@@ -20,7 +22,7 @@
 - Summary: 生产 bridge 依赖 bot-owner 1:1 direct room 作为 Data Space；Webex Mercury 断连由 sidecar watchdog 自恢复；session-room slash commands 已支持 Webex mention prefixes；recovery cleanup commands 已部署并记录在 `docs/COMMANDS.md`。
 - Next Steps:
   - 使用 `diagnose sessions` 和 `cleanup failed <session_id>` 处理 degraded / missing-local-thread sessions。
-  - 后续 workstream 再处理 lifecycle hooks、release handoff 或 Webex handoff。
+  - 后续 workstream 再处理 W6 optional handoff export/import 和 live service/plugin upgrade smoke。
 - Blockers:
   - 当前 Webex bot token 仍不能 replay group-room Data Space history。
   - Webex overview card refresh 仍可能返回 `Invalid roomId`，目前仅作为 best-effort。
@@ -33,6 +35,7 @@
 - Session recovery cleanup commands and user-facing command documentation are current.
 - W3 adds cbth-managed app-server leases for explicit plugin mode while preserving standalone/direct Codex app-server startup as the default.
 - W4 routes async/background notifications through cbth delivery-owned `delivery.enqueue` while preserving normal user-message forwarding on the W3 direct app-server path.
+- W5 adds conservative cbth lifecycle hooks while preserving W3/W4 forwarding and delivery routing semantics.
 - W2 added plugin packaging metadata, explicit cbth plugin config, C1-compatible hello client tests, and doctor diagnostics without requiring Webex credentials.
 - Isolated live Webex E2E passed for `resume local`, `/history`, ordinary session turns, `attach`, recovery cleanup, and cleanup of temporary rooms/processes/root.
 - Top-level trackers were migrated to short entrypoints; complete pre-migration contents are preserved in the legacy snapshot journal.

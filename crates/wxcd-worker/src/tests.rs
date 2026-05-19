@@ -1,24 +1,30 @@
 use super::{
     ASYNC_NOTIFICATION_INGRESS_ACK_TIMEOUT, C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS,
-    CleanupFailedCommand, CodexConnectionConfig, DiagnoseCommand, ListCommand, ListMode,
+    CleanupFailedCommand, CodexConnectionConfig, DiagnoseCommand, LifecycleAdmissionPhase,
+    LifecycleCommand, LifecycleCommandResponse, LifecycleControl, ListCommand, ListMode,
     LocalMirrorClaimScope, PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT, PurgeArchivedCommand,
     RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerState, abbreviate,
     apply_thread_probe, attached_session_for_thread, build_async_notification_delivery_request,
-    ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
-    ensure_session_id_belongs_to_installation, extract_thread_history_turns,
-    generate_installation_id, ingress_requires_processing_ack, ingress_uses_delivery_enqueue,
-    is_control_list_session, is_default_list_session, is_failed_session_room_command,
-    load_local_snapshot_with_metadata, load_or_create_installation_identity,
-    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
-    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
-    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
-    repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
-    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
+    durable_local_snapshot_path, ensure_approval_belongs_to_installation,
+    ensure_failed_cleanup_target, ensure_session_id_belongs_to_installation,
+    extract_thread_history_turns, generate_installation_id, handle_lifecycle_command,
+    ingress_requires_processing_ack, ingress_uses_delivery_enqueue, is_control_list_session,
+    is_default_list_session, is_failed_session_room_command,
+    load_durable_local_snapshot_with_metadata, load_local_snapshot_with_metadata,
+    load_or_create_installation_identity, normalize_control_command_text,
+    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
+    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
+    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
+    resolve_codex_connection, resolve_delivery_broker_connection, session_belongs_to_installation,
+    session_requires_codex_archive, sessions_for_diagnostics,
     should_process_async_notification_event, slice_thread_history_page,
     validate_purge_archived_session, webex_delivery_idempotency_key,
+    write_supervisor_shutdown_marker_at,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
+use std::sync::Arc;
+use wxcd_cbth_rpc::{PluginDrainRequest, PluginHealthCheckRequest, PluginShutdownRequest};
 use wxcd_proto::{
     AppConfig, BridgeConfig, BridgeSnapshot, CbthPluginConfig, DiagnosticsConfig,
     LocalSessionMirror, RepoConfig, SessionAuthority, SessionFailure, SessionFailureKind,
@@ -1485,6 +1491,195 @@ async fn local_snapshot_writer_metadata_round_trips() {
         Some("ins_current")
     );
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[test]
+fn durable_snapshot_uses_plugin_home_in_cbth_plugin_mode() {
+    let mut config = app_config_with_plugin(true);
+    config.bridge.state_dir = "/tmp/wxcd-state".into();
+    config.bridge.cbth_plugin.plugin_home = "/tmp/wxcd-plugin-home".into();
+
+    assert_eq!(
+        durable_local_snapshot_path(&config),
+        std::path::PathBuf::from("/tmp/wxcd-plugin-home/bridge-state.json")
+    );
+}
+
+#[tokio::test]
+async fn durable_snapshot_loader_falls_back_to_legacy_state_dir_snapshot() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-snapshot-fallback-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let plugin_home = state_dir.join("plugin-home");
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+    let snapshot_path = state_dir.join("bridge-state.json");
+    let snapshot = BridgeSnapshot {
+        created_at: Utc::now(),
+        writer_installation_id: Some("ins_legacy".to_string()),
+        sessions: Vec::new(),
+        pending_approvals: Vec::new(),
+    };
+    tokio::fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap())
+        .await
+        .unwrap();
+    let mut config = app_config_with_plugin(true);
+    config.bridge.state_dir = state_dir.clone();
+    config.bridge.cbth_plugin.plugin_home = plugin_home;
+
+    let loaded = load_durable_local_snapshot_with_metadata(&config)
+        .await
+        .unwrap();
+
+    assert!(loaded.metadata.existed);
+    assert_eq!(
+        loaded.metadata.writer_installation_id.as_deref(),
+        Some("ins_legacy")
+    );
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_drain_persists_plugin_home_snapshot_before_reporting_complete() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-lifecycle-drain-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let plugin_home = state_dir.join("plugin-home");
+    let mut config = app_config_with_plugin(true);
+    config.bridge.state_dir = state_dir.clone();
+    config.bridge.cbth_plugin.plugin_home = plugin_home.clone();
+    let mut state = WorkerState::default();
+    state.set_executable_installation("ins_current");
+    state.upsert_session(managed_session_record(
+        "ses_current",
+        SessionState::Idle,
+        false,
+        "ins_current",
+    ));
+
+    let response = handle_lifecycle_command(
+        &config,
+        &mut state,
+        LifecycleCommand::Drain(PluginDrainRequest {
+            reason: "upgrade".to_string(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        response,
+        LifecycleCommandResponse::Drain(response) if response.drained
+    ));
+    let snapshot_path = plugin_home.join("bridge-state.json");
+    let loaded = load_local_snapshot_with_metadata(&snapshot_path)
+        .await
+        .unwrap();
+    assert!(loaded.metadata.existed);
+    assert_eq!(
+        loaded.metadata.writer_installation_id.as_deref(),
+        Some("ins_current")
+    );
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_quiesce_blocks_new_external_work_until_unquiesce() {
+    let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
+    let work_permit = lifecycle
+        .try_begin_external_work()
+        .expect("active lifecycle accepts work");
+
+    assert_eq!(lifecycle.in_flight_count(), 1);
+    assert!(lifecycle.quiesce());
+    assert!(lifecycle.try_begin_external_work().is_err());
+    assert!(
+        !lifecycle
+            .wait_until_drained(std::time::Duration::from_millis(5))
+            .await
+    );
+    drop(work_permit);
+    assert!(
+        lifecycle
+            .wait_until_drained(std::time::Duration::from_secs(1))
+            .await
+    );
+    assert!(lifecycle.unquiesce());
+    assert!(lifecycle.try_begin_external_work().is_ok());
+}
+
+#[tokio::test]
+async fn lifecycle_shutdown_timeout_restores_previous_phase() {
+    let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
+    let work_permit = lifecycle
+        .try_begin_external_work()
+        .expect("active lifecycle accepts work");
+    let previous_phase = lifecycle.begin_shutdown().expect("shutdown begins");
+
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::ShuttingDown);
+    assert!(
+        !lifecycle
+            .wait_until_drained(std::time::Duration::from_millis(5))
+            .await
+    );
+    lifecycle.restore_shutdown_phase(previous_phase);
+
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Active);
+    drop(work_permit);
+    assert!(lifecycle.try_begin_external_work().is_ok());
+}
+
+#[tokio::test]
+async fn lifecycle_shutdown_writes_supervisor_marker_before_accepting() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-lifecycle-shutdown-marker-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let marker_path = state_dir.join("supervisor-shutdown-requested.json");
+    let mut config = app_config_with_plugin(true);
+    config.bridge.state_dir = state_dir.clone();
+    config.bridge.cbth_plugin.plugin_home = state_dir.join("plugin-home");
+
+    write_supervisor_shutdown_marker_at(
+        &marker_path,
+        &config,
+        &PluginShutdownRequest {
+            reason: "upgrade".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let marker: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&marker_path).await.unwrap()).unwrap();
+    assert_eq!(
+        marker
+            .get("plugin_instance_id")
+            .and_then(|value| value.as_str()),
+        Some("instance-1")
+    );
+    assert_eq!(
+        marker
+            .get("plugin_release_id")
+            .and_then(|value| value.as_str()),
+        Some("0.1.0")
+    );
+    assert_eq!(
+        marker.get("reason").and_then(|value| value.as_str()),
+        Some("upgrade")
+    );
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[test]
+fn pre_active_health_requires_quiesced_admission_fence() {
+    let active = LifecycleControl::new(LifecycleAdmissionPhase::Active);
+    let quiesced = LifecycleControl::new(LifecycleAdmissionPhase::Quiescing);
+    let request = PluginHealthCheckRequest::pre_active();
+
+    assert!(!active.health_check(&request, true).healthy);
+    assert!(quiesced.health_check(&request, true).healthy);
 }
 
 #[test]

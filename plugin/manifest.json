@@ -16,6 +16,9 @@
     },
     {
       "name": "standalone-compatible"
+    },
+    {
+      "name": "plugin-lifecycle-v1"
     }
   ],
   "config_schema": {
@@ -36,6 +39,14 @@
       "WXCD_PLUGIN_HOME": {
         "type": "string",
         "description": "Writable plugin home managed by cbth."
+      },
+      "WXCD_CBTH_LIFECYCLE_SOCKET": {
+        "type": "string",
+        "description": "Optional dedicated Unix-domain socket path for cbth lifecycle RPC."
+      },
+      "WXCD_CBTH_PRE_ACTIVE": {
+        "type": "boolean",
+        "description": "Start with Webex external work admission quiesced for shadow health checks."
       }
     },
     "required": []
