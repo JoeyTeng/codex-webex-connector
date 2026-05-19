@@ -188,11 +188,23 @@ struct QueuedLifecycleCommand {
 enum LifecycleCommand {
     Drain(PluginDrainRequest),
     Shutdown(PluginShutdownRequest),
+    Unquiesce(PluginUnquiesceRequest),
 }
 
 enum LifecycleCommandResponse {
     Drain(PluginDrainResponse),
     Ack(PluginLifecycleAckResponse),
+}
+
+struct LifecycleUnquiesceContext<'a, 'event_log> {
+    config: &'a AppConfig,
+    webex: &'a WebexClient,
+    event_log: &'a EventLog<'event_log>,
+    state: &'a mut WorkerState,
+    codex: &'a mut CodexClient,
+    installation: &'a InstallationIdentity,
+    lifecycle: &'a LifecycleControl,
+    startup_reconcile_pending: &'a mut bool,
 }
 
 struct LifecycleRpcResponse {
@@ -615,18 +627,22 @@ async fn run() -> Result<()> {
         }
         state.rebuild_session_indexes();
     }
-    reconcile_sessions(
-        &config,
-        &webex,
-        &event_log,
-        &mut state,
-        &mut codex,
-        &installation,
-    )
-    .await?;
-
     let healthy = Arc::new(AtomicBool::new(false));
     let lifecycle = Arc::new(LifecycleControl::new(initial_lifecycle_phase()));
+    let mut startup_reconcile_pending = lifecycle.phase() == LifecycleAdmissionPhase::Quiescing;
+    if startup_reconcile_pending {
+        info!("pre-active lifecycle mode enabled, deferring startup reconcile until unquiesce");
+    } else {
+        reconcile_sessions(
+            &config,
+            &webex,
+            &event_log,
+            &mut state,
+            &mut codex,
+            &installation,
+        )
+        .await?;
+    }
     let (work_tx, mut work_rx) = mpsc::channel(256);
     let listener = UnixListener::bind(&config.bridge.socket_path).with_context(|| {
         format!(
@@ -686,11 +702,25 @@ async fn run() -> Result<()> {
                             response_flushed,
                         } = command;
                         let should_shutdown = matches!(&command, LifecycleCommand::Shutdown(_));
-                        let result = handle_lifecycle_command(
-                            &config,
-                            &mut state,
-                            command,
-                        ).await.map_err(|error| format!("{error:#}"));
+                        let result = match command {
+                            LifecycleCommand::Unquiesce(request) => {
+                                handle_lifecycle_unquiesce(
+                                    LifecycleUnquiesceContext {
+                                        config: &config,
+                                        webex: &webex,
+                                        event_log: &event_log,
+                                        state: &mut state,
+                                        codex: &mut codex,
+                                        installation: &installation,
+                                        lifecycle: lifecycle.as_ref(),
+                                        startup_reconcile_pending: &mut startup_reconcile_pending,
+                                    },
+                                    request,
+                                )
+                                .await
+                            }
+                            command => handle_lifecycle_command(&config, &mut state, command).await,
+                        }.map_err(|error| format!("{error:#}"));
                         let shutdown_accepted = should_shutdown
                             && matches!(
                                 result.as_ref(),
@@ -2733,7 +2763,36 @@ async fn handle_lifecycle_command(
                 accepted: true,
             }))
         }
+        LifecycleCommand::Unquiesce(_) => bail!("unquiesce must be handled by the worker loop"),
     }
+}
+
+async fn handle_lifecycle_unquiesce(
+    ctx: LifecycleUnquiesceContext<'_, '_>,
+    request: PluginUnquiesceRequest,
+) -> Result<LifecycleCommandResponse> {
+    if ctx.lifecycle.phase() == LifecycleAdmissionPhase::ShuttingDown {
+        return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+            accepted: false,
+        }));
+    }
+    if *ctx.startup_reconcile_pending {
+        reconcile_sessions(
+            ctx.config,
+            ctx.webex,
+            ctx.event_log,
+            ctx.state,
+            ctx.codex,
+            ctx.installation,
+        )
+        .await?;
+        *ctx.startup_reconcile_pending = false;
+    }
+    let accepted = ctx.lifecycle.unquiesce();
+    info!("lifecycle unquiesce completed: {}", request.reason);
+    Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+        accepted,
+    }))
 }
 
 async fn wait_for_lifecycle_response_flush(response_flushed: Option<oneshot::Receiver<()>>) {
@@ -3067,12 +3126,25 @@ async fn handle_lifecycle_rpc_frame(
             }
         }
         PLUGIN_RPC_PLUGIN_UNQUIESCE_METHOD => {
-            decode_lifecycle_params::<PluginUnquiesceRequest>(&frame).map(|_| {
-                serde_json::to_value(PluginLifecycleAckResponse {
-                    accepted: lifecycle.unquiesce(),
-                })
-                .expect("unquiesce response serializes")
-            })
+            match decode_lifecycle_params::<PluginUnquiesceRequest>(&frame) {
+                Ok(request) => lifecycle_command_response(
+                    events_tx,
+                    LifecycleCommand::Unquiesce(request),
+                    None,
+                )
+                .await
+                .and_then(|response| match response {
+                    LifecycleCommandResponse::Ack(response) => serde_json::to_value(response)
+                        .map_err(|error| {
+                            PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
+                        }),
+                    LifecycleCommandResponse::Drain(_) => Err(PluginRpcError::new(
+                        PluginRpcErrorKind::Internal,
+                        "unquiesce command returned drain response",
+                    )),
+                }),
+                Err(error) => Err(error),
+            }
         }
         PLUGIN_RPC_PLUGIN_HANDOFF_EXPORT_METHOD | PLUGIN_RPC_PLUGIN_HANDOFF_IMPORT_METHOD => {
             Err(PluginRpcError::new(
