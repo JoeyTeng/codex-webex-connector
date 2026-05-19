@@ -5,6 +5,9 @@
   "description": "Webex websocket ingress sidecar for wxcd",
   "main": "index.cjs",
   "packageManager": "pnpm@10.15.0",
+  "scripts": {
+    "check": "node --check index.cjs && node check-runtime-imports.cjs"
+  },
   "license": "MIT",
   "dependencies": {
     "@babel/runtime-corejs2": "7.29.2",
