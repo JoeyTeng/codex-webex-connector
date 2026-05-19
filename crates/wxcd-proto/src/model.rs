@@ -149,7 +149,21 @@ pub struct BridgeSnapshot {
 pub enum WebexIngressEnvelope {
     MessageCreated(WebexMessageEvent),
     AttachmentActionCreated(WebexAttachmentActionEvent),
+    AsyncNotification(WebexAsyncNotificationEvent),
     HealthCheck,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebexAsyncNotificationEvent {
+    pub event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    pub created: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,23 +2,27 @@ use super::{
     CleanupFailedCommand, CodexConnectionConfig, DiagnoseCommand, ListCommand, ListMode,
     LocalMirrorClaimScope, PurgeArchivedCommand, RECENT_EVENT_ID_LIMIT, ThreadProbe,
     ThreadProbeKind, WorkerState, abbreviate, apply_thread_probe, attached_session_for_thread,
-    ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
-    ensure_session_id_belongs_to_installation, extract_thread_history_turns,
-    generate_installation_id, is_control_list_session, is_default_list_session,
+    build_async_notification_delivery_request, ensure_approval_belongs_to_installation,
+    ensure_failed_cleanup_target, ensure_session_id_belongs_to_installation,
+    extract_thread_history_turns, generate_installation_id, ingress_requires_processing_ack,
+    ingress_uses_delivery_enqueue, is_control_list_session, is_default_list_session,
     is_failed_session_room_command, load_local_snapshot_with_metadata,
     load_or_create_installation_identity, normalize_control_command_text,
     normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
     parse_diagnose_command, parse_list_command, parse_purge_archived_command,
     parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
-    resolve_codex_connection, session_belongs_to_installation, session_requires_codex_archive,
-    sessions_for_diagnostics, slice_thread_history_page, validate_purge_archived_session,
+    resolve_codex_connection, resolve_delivery_broker_connection, session_belongs_to_installation,
+    session_requires_codex_archive, sessions_for_diagnostics,
+    should_process_async_notification_event, slice_thread_history_page,
+    validate_purge_archived_session, webex_delivery_idempotency_key,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
 use wxcd_proto::{
     AppConfig, BridgeConfig, BridgeSnapshot, CbthPluginConfig, DiagnosticsConfig,
     LocalSessionMirror, RepoConfig, SessionAuthority, SessionFailure, SessionFailureKind,
-    SessionRecord, SessionState, WebexConfig,
+    SessionRecord, SessionState, WebexAsyncNotificationEvent, WebexConfig, WebexIngressEnvelope,
+    WebexMessageEvent,
 };
 use wxcd_render::ImportedHistoryTurn;
 
@@ -387,6 +391,147 @@ fn cbth_plugin_mode_requires_supervisor_managed_app_server_url() {
         format!("{error:#}").contains("WXCD_CODEX_APP_SERVER_URL"),
         "{error:#}"
     );
+}
+
+#[test]
+fn delivery_broker_defaults_to_none_for_standalone_mode() {
+    let config = app_config_with_plugin(false);
+
+    let broker = resolve_delivery_broker_connection(
+        &config,
+        Some("/tmp/wxcd-delivery-broker.sock".to_string()),
+    )
+    .expect("broker");
+
+    assert_eq!(broker, None);
+}
+
+#[test]
+fn cbth_plugin_mode_allows_missing_delivery_broker_socket() {
+    let config = app_config_with_plugin(true);
+
+    let broker = resolve_delivery_broker_connection(&config, None).expect("broker");
+
+    assert_eq!(broker, None);
+}
+
+#[test]
+fn async_notification_builds_delivery_owned_enqueue_request() {
+    let mut state = WorkerState::default();
+    let session = session_record("ses_1", SessionState::Idle, false);
+    state.upsert_session(session);
+    let notification = WebexAsyncNotificationEvent {
+        event_id: "event-1".to_string(),
+        session_id: Some("ses_1".to_string()),
+        thread_id: None,
+        summary: "background job finished".to_string(),
+        payload: Some(json!({"result": "done"})),
+        created: Utc::now(),
+    };
+
+    let request =
+        build_async_notification_delivery_request(&state, &notification).expect("request");
+
+    assert_eq!(request.source_thread_id, "thread-ses_1");
+    assert_eq!(request.summary, "background job finished");
+    assert_eq!(
+        request.idempotency_key,
+        webex_delivery_idempotency_key("event-1")
+    );
+    assert!(is_c5_ascii_token(&request.idempotency_key));
+    assert_eq!(request.target.driver, "codex_app_server");
+    assert_eq!(request.target.app_server_lease_id, None);
+    assert_eq!(request.target.codex_binary, None);
+    assert_eq!(request.max_delivery_attempts, Some(3));
+    assert_eq!(request.redelivery_window_seconds, Some(3600));
+    assert_eq!(
+        request
+            .inline_payload
+            .as_ref()
+            .expect("payload")
+            .pointer("/payload/result")
+            .and_then(serde_json::Value::as_str),
+        Some("done")
+    );
+}
+
+#[test]
+fn async_notification_rejects_non_executable_session_id() {
+    let mut state = WorkerState::default();
+    state.upsert_session(session_record("ses_archived", SessionState::Archived, true));
+    let notification = WebexAsyncNotificationEvent {
+        event_id: "event-archived".to_string(),
+        session_id: Some("ses_archived".to_string()),
+        thread_id: None,
+        summary: "background job finished".to_string(),
+        payload: None,
+        created: Utc::now(),
+    };
+
+    let error = build_async_notification_delivery_request(&state, &notification)
+        .expect_err("archived session should not be executable");
+
+    assert!(
+        format!("{error:#}").contains("not executable by this worker"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn async_notification_idempotency_key_is_c5_token_safe() {
+    let key = webex_delivery_idempotency_key("webex/event:1 with spaces");
+
+    assert!(key.starts_with("webex-delivery-"));
+    assert!(is_c5_ascii_token(&key));
+    assert_eq!(
+        key,
+        webex_delivery_idempotency_key("webex/event:1 with spaces")
+    );
+}
+
+#[test]
+fn async_notification_event_is_remembered_only_after_enqueue_success() {
+    let mut state = WorkerState::default();
+    let event_id = "event-retry";
+
+    assert!(should_process_async_notification_event(&state, event_id));
+    assert!(should_process_async_notification_event(&state, event_id));
+
+    state.remember_event(event_id);
+
+    assert!(!should_process_async_notification_event(&state, event_id));
+}
+
+fn is_c5_ascii_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+#[test]
+fn normal_user_message_ingress_does_not_use_delivery_enqueue() {
+    let message = WebexIngressEnvelope::MessageCreated(WebexMessageEvent {
+        event_id: "event-message".to_string(),
+        room_id: "room-ses_1".to_string(),
+        message_id: "message-1".to_string(),
+        person_email: "user@example.com".to_string(),
+        text: "normal user turn".to_string(),
+        created: Utc::now(),
+    });
+    let async_notification = WebexIngressEnvelope::AsyncNotification(WebexAsyncNotificationEvent {
+        event_id: "event-async".to_string(),
+        session_id: Some("ses_1".to_string()),
+        thread_id: None,
+        summary: "background job finished".to_string(),
+        payload: None,
+        created: Utc::now(),
+    });
+
+    assert!(!ingress_uses_delivery_enqueue(&message));
+    assert!(ingress_uses_delivery_enqueue(&async_notification));
+    assert!(!ingress_requires_processing_ack(&message));
+    assert!(ingress_requires_processing_ack(&async_notification));
 }
 
 #[test]

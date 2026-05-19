@@ -1,3 +1,4 @@
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -5,16 +6,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use wxcd_cbth_rpc::{
     PLUGIN_RPC_PROTOCOL_VERSION_V1, PluginAppServerEnsureRequest, PluginAppServerRefreshRequest,
-    PluginAppServerStopRequest, PluginCapability, PluginHelloRequest, PluginRpcClient,
+    PluginAppServerStopRequest, PluginCapability, PluginDeliveryEnqueueRequest,
+    PluginDeliveryTarget, PluginHelloRequest, PluginHelloResponse, PluginRpcClient, PluginRpcError,
+    PluginRpcErrorKind, PluginRpcRequestFrame, PluginRpcResponseFrame,
+    SERVICE_CAPABILITY_DELIVERY_OWNED_CODEX_APP_SERVER_TARGET_V1, read_plugin_rpc_frame,
+    write_plugin_rpc_frame,
 };
 use wxcd_proto::{AppConfig, CbthPluginConfig};
 
@@ -25,7 +30,11 @@ const PLUGIN_APP_SERVER_REFRESH_SAFETY_MARGIN_SECONDS: u64 = 5;
 const PLUGIN_APP_SERVER_ENSURE_TIMEOUT: Duration = Duration::from_secs(20);
 const PLUGIN_APP_SERVER_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const PLUGIN_APP_SERVER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(6);
+const PLUGIN_DELIVERY_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(20);
+const PLUGIN_DELIVERY_BROKER_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+const PLUGIN_DELIVERY_BROKER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(6);
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
+const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
 
 #[derive(Parser)]
 struct Cli {
@@ -71,6 +80,17 @@ async fn run_supervisor() -> Result<()> {
         }
         let mut managed_app_server =
             ensure_cbth_managed_app_server(&config.bridge.cbth_plugin).await?;
+        let mut delivery_broker =
+            match start_delivery_broker(&config.bridge.cbth_plugin, &config.bridge.state_dir).await
+            {
+                Ok(broker) => broker,
+                Err(error) => {
+                    if let Some(app_server) = managed_app_server {
+                        app_server.shutdown().await;
+                    }
+                    return Err(error);
+                }
+            };
 
         info!("starting worker from {}", worker_path.display());
         let mut worker_command = Command::new(&worker_path);
@@ -79,6 +99,9 @@ async fn run_supervisor() -> Result<()> {
         }
         if let Some(app_server) = managed_app_server.as_ref() {
             worker_command.env(WXCD_CODEX_APP_SERVER_URL_ENV, &app_server.url);
+        }
+        if let Some(broker) = delivery_broker.as_ref() {
+            worker_command.env(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV, &broker.socket_path);
         }
         let mut worker = match worker_command
             .stdout(Stdio::inherit())
@@ -89,6 +112,9 @@ async fn run_supervisor() -> Result<()> {
             Err(error) => {
                 if let Some(app_server) = managed_app_server {
                     app_server.shutdown().await;
+                }
+                if let Some(broker) = delivery_broker {
+                    broker.shutdown().await;
                 }
                 return Err(error).context("failed to spawn wxcd-worker");
             }
@@ -110,6 +136,9 @@ async fn run_supervisor() -> Result<()> {
                 if let Some(app_server) = managed_app_server {
                     app_server.shutdown().await;
                 }
+                if let Some(broker) = delivery_broker {
+                    broker.shutdown().await;
+                }
                 return Err(error).context("failed to spawn webex sidecar");
             }
         };
@@ -120,37 +149,86 @@ async fn run_supervisor() -> Result<()> {
             if let Some(app_server) = managed_app_server {
                 app_server.shutdown().await;
             }
+            if let Some(broker) = delivery_broker {
+                broker.shutdown().await;
+            }
             return Err(error);
         }
         info!("worker health check passed");
 
         let mut app_server_task_finished = false;
-        if let Some(app_server) = managed_app_server.as_mut() {
-            tokio::select! {
-                status = worker.wait() => {
-                    error!("worker exited: {status:?}");
-                    sidecar.kill().await.ok();
-                }
-                status = sidecar.wait() => {
-                    error!("sidecar exited: {status:?}");
-                    worker.kill().await.ok();
-                }
-                result = app_server.wait() => {
-                    app_server_task_finished = true;
-                    error!("cbth-managed app-server lease task exited: {result:#?}");
-                    worker.kill().await.ok();
-                    sidecar.kill().await.ok();
+        let mut delivery_broker_task_finished = false;
+        match (managed_app_server.as_mut(), delivery_broker.as_mut()) {
+            (Some(app_server), Some(broker)) => {
+                tokio::select! {
+                    status = worker.wait() => {
+                        error!("worker exited: {status:?}");
+                        sidecar.kill().await.ok();
+                    }
+                    status = sidecar.wait() => {
+                        error!("sidecar exited: {status:?}");
+                        worker.kill().await.ok();
+                    }
+                    result = app_server.wait() => {
+                        app_server_task_finished = true;
+                        error!("cbth-managed app-server lease task exited: {result:#?}");
+                        worker.kill().await.ok();
+                        sidecar.kill().await.ok();
+                    }
+                    result = broker.wait() => {
+                        delivery_broker_task_finished = true;
+                        error!("cbth delivery broker task exited: {result:#?}");
+                        worker.kill().await.ok();
+                        sidecar.kill().await.ok();
+                    }
                 }
             }
-        } else {
-            tokio::select! {
-                status = worker.wait() => {
-                    error!("worker exited: {status:?}");
-                    sidecar.kill().await.ok();
+            (Some(app_server), None) => {
+                tokio::select! {
+                    status = worker.wait() => {
+                        error!("worker exited: {status:?}");
+                        sidecar.kill().await.ok();
+                    }
+                    status = sidecar.wait() => {
+                        error!("sidecar exited: {status:?}");
+                        worker.kill().await.ok();
+                    }
+                    result = app_server.wait() => {
+                        app_server_task_finished = true;
+                        error!("cbth-managed app-server lease task exited: {result:#?}");
+                        worker.kill().await.ok();
+                        sidecar.kill().await.ok();
+                    }
                 }
-                status = sidecar.wait() => {
-                    error!("sidecar exited: {status:?}");
-                    worker.kill().await.ok();
+            }
+            (None, Some(broker)) => {
+                tokio::select! {
+                    status = worker.wait() => {
+                        error!("worker exited: {status:?}");
+                        sidecar.kill().await.ok();
+                    }
+                    status = sidecar.wait() => {
+                        error!("sidecar exited: {status:?}");
+                        worker.kill().await.ok();
+                    }
+                    result = broker.wait() => {
+                        delivery_broker_task_finished = true;
+                        error!("cbth delivery broker task exited: {result:#?}");
+                        worker.kill().await.ok();
+                        sidecar.kill().await.ok();
+                    }
+                }
+            }
+            (None, None) => {
+                tokio::select! {
+                    status = worker.wait() => {
+                        error!("worker exited: {status:?}");
+                        sidecar.kill().await.ok();
+                    }
+                    status = sidecar.wait() => {
+                        error!("sidecar exited: {status:?}");
+                        worker.kill().await.ok();
+                    }
                 }
             }
         }
@@ -160,11 +238,21 @@ async fn run_supervisor() -> Result<()> {
         {
             app_server.shutdown().await;
         }
+        if let Some(broker) = delivery_broker
+            && !delivery_broker_task_finished
+        {
+            broker.shutdown().await;
+        }
         sleep(Duration::from_secs(2)).await;
     }
 }
 
-async fn connect_cbth_plugin_rpc(config: &CbthPluginConfig) -> Result<Option<PluginRpcClient>> {
+struct PluginRpcSession {
+    client: PluginRpcClient,
+    hello: PluginHelloResponse,
+}
+
+async fn connect_cbth_plugin_rpc(config: &CbthPluginConfig) -> Result<Option<PluginRpcSession>> {
     if !config.enabled {
         return Ok(None);
     }
@@ -191,7 +279,10 @@ async fn connect_cbth_plugin_rpc(config: &CbthPluginConfig) -> Result<Option<Plu
         "cbth plugin RPC hello completed with protocol version {}",
         response.protocol_version
     );
-    Ok(Some(client))
+    Ok(Some(PluginRpcSession {
+        client,
+        hello: response,
+    }))
 }
 
 struct ManagedCodexAppServer {
@@ -232,15 +323,57 @@ impl ManagedCodexAppServer {
     }
 }
 
+struct ManagedDeliveryBroker {
+    socket_path: PathBuf,
+    stop_tx: Option<oneshot::Sender<()>>,
+    task: JoinHandle<Result<()>>,
+}
+
+impl ManagedDeliveryBroker {
+    async fn wait(&mut self) -> Result<()> {
+        (&mut self.task)
+            .await
+            .context("cbth delivery broker task panicked")?
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        match timeout(PLUGIN_DELIVERY_BROKER_TASK_STOP_TIMEOUT, &mut self.task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => warn!("cbth delivery broker shutdown failed: {error:#}"),
+            Ok(Err(error)) => warn!("cbth delivery broker task panicked: {error:#}"),
+            Err(_) => {
+                warn!(
+                    "timed out after {}s stopping cbth delivery broker",
+                    PLUGIN_DELIVERY_BROKER_TASK_STOP_TIMEOUT.as_secs()
+                );
+                self.task.abort();
+                match self.task.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => warn!("aborted cbth delivery broker failed: {error:#}"),
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => warn!("aborted cbth delivery broker task panicked: {error:#}"),
+                }
+            }
+        }
+        remove_stale_delivery_broker_socket(&self.socket_path)
+            .await
+            .ok();
+    }
+}
+
 async fn ensure_cbth_managed_app_server(
     config: &CbthPluginConfig,
 ) -> Result<Option<ManagedCodexAppServer>> {
     if !config.enabled {
         return Ok(None);
     }
-    let mut client = connect_cbth_plugin_rpc(config)
+    let session = connect_cbth_plugin_rpc(config)
         .await?
         .context("cbth plugin mode is enabled but plugin RPC did not connect")?;
+    let mut client = session.client;
     let request = plugin_app_server_ensure_request(config)?;
     let managed_session_id = request.managed_session_id.clone();
     let lease_id = request.lease_id.clone();
@@ -274,6 +407,270 @@ async fn ensure_cbth_managed_app_server(
         stop_tx: Some(stop_tx),
         task,
     }))
+}
+
+async fn start_delivery_broker(
+    config: &CbthPluginConfig,
+    state_dir: &Path,
+) -> Result<Option<ManagedDeliveryBroker>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    let session = connect_cbth_plugin_rpc(config)
+        .await?
+        .context("cbth plugin mode is enabled but plugin RPC did not connect")?;
+    if !service_supports_delivery_owned_target(&session.hello) {
+        warn!(
+            "cbth plugin service is missing `{}` capability; W4 async delivery broker is disabled",
+            SERVICE_CAPABILITY_DELIVERY_OWNED_CODEX_APP_SERVER_TARGET_V1
+        );
+        return Ok(None);
+    }
+    tokio::fs::create_dir_all(state_dir)
+        .await
+        .with_context(|| format!("failed to create state dir {}", state_dir.display()))?;
+    let socket_path = delivery_broker_socket_path(state_dir);
+    remove_stale_delivery_broker_socket(&socket_path).await?;
+    let listener = UnixListener::bind(&socket_path).with_context(|| {
+        format!(
+            "failed to bind cbth delivery broker socket {}",
+            socket_path.display()
+        )
+    })?;
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let codex_binary = supervisor_codex_binary();
+    let task = tokio::spawn(run_delivery_broker(
+        listener,
+        config.clone(),
+        codex_binary,
+        stop_rx,
+    ));
+    info!("cbth delivery broker ready at {}", socket_path.display());
+    Ok(Some(ManagedDeliveryBroker {
+        socket_path,
+        stop_tx: Some(stop_tx),
+        task,
+    }))
+}
+
+async fn run_delivery_broker(
+    listener: UnixListener,
+    config: CbthPluginConfig,
+    codex_binary: String,
+    mut stop_rx: oneshot::Receiver<()>,
+) -> Result<()> {
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.context("failed to accept cbth delivery broker connection")?;
+                let config = config.clone();
+                let codex_binary = codex_binary.clone();
+                connections.spawn(async move {
+                    handle_delivery_broker_connection(
+                        stream,
+                        &config,
+                        &codex_binary,
+                    ).await
+                });
+            }
+            joined = connections.join_next(), if !connections.is_empty() => {
+                if let Some(result) = joined {
+                    log_delivery_broker_connection_result(result);
+                }
+            }
+            _ = &mut stop_rx => {
+                connections.abort_all();
+                while let Some(result) = connections.join_next().await {
+                    log_delivery_broker_connection_result(result);
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn log_delivery_broker_connection_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!("cbth delivery broker connection failed: {error:#}"),
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => warn!("cbth delivery broker connection task panicked: {error:#}"),
+    }
+}
+
+async fn handle_delivery_broker_connection(
+    mut stream: UnixStream,
+    config: &CbthPluginConfig,
+    codex_binary: &str,
+) -> Result<()> {
+    let frame: PluginRpcRequestFrame = timeout(
+        PLUGIN_DELIVERY_BROKER_FRAME_TIMEOUT,
+        read_plugin_rpc_frame(&mut stream, wxcd_cbth_rpc::PLUGIN_RPC_MAX_FRAME_BYTES),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out after {}s reading delivery broker frame",
+            PLUGIN_DELIVERY_BROKER_FRAME_TIMEOUT.as_secs()
+        )
+    })?
+    .context("failed to read delivery broker frame")?;
+    let response = if frame.method != wxcd_cbth_rpc::PLUGIN_RPC_DELIVERY_ENQUEUE_METHOD {
+        PluginRpcResponseFrame::failure(
+            frame.id,
+            PluginRpcError::new(
+                PluginRpcErrorKind::MethodNotFound,
+                format!(
+                    "delivery broker only supports {}",
+                    wxcd_cbth_rpc::PLUGIN_RPC_DELIVERY_ENQUEUE_METHOD
+                ),
+            ),
+        )
+    } else {
+        match serde_json::from_value::<PluginDeliveryEnqueueRequest>(frame.params) {
+            Ok(request) => {
+                match forward_brokered_delivery_enqueue(config, request, codex_binary).await {
+                    Ok(result) => PluginRpcResponseFrame::success(frame.id, result),
+                    Err(error) => PluginRpcResponseFrame::failure(frame.id, error),
+                }
+            }
+            Err(error) => PluginRpcResponseFrame::failure(
+                frame.id,
+                PluginRpcError::new(
+                    PluginRpcErrorKind::InvalidRequest,
+                    format!("invalid delivery.enqueue request: {error}"),
+                ),
+            ),
+        }
+    };
+    write_plugin_rpc_frame(
+        &mut stream,
+        &response,
+        wxcd_cbth_rpc::PLUGIN_RPC_MAX_FRAME_BYTES,
+    )
+    .await
+    .context("failed to write delivery broker response")?;
+    Ok(())
+}
+
+async fn forward_brokered_delivery_enqueue(
+    config: &CbthPluginConfig,
+    request: PluginDeliveryEnqueueRequest,
+    codex_binary: &str,
+) -> Result<serde_json::Value, PluginRpcError> {
+    let request = prepare_brokered_delivery_request(request, codex_binary)?;
+    let mut session = connect_cbth_plugin_rpc(config)
+        .await
+        .map_err(plugin_rpc_error_from_anyhow)?
+        .ok_or_else(|| {
+            PluginRpcError::new(
+                PluginRpcErrorKind::TransientDaemonUnavailable,
+                "cbth plugin RPC is disabled for delivery broker",
+            )
+        })?;
+    if !service_supports_delivery_owned_target(&session.hello) {
+        return Err(PluginRpcError::new(
+            PluginRpcErrorKind::MissingCapability,
+            format!(
+                "cbth plugin service is missing `{}` capability required for delivery-owned enqueue",
+                SERVICE_CAPABILITY_DELIVERY_OWNED_CODEX_APP_SERVER_TARGET_V1
+            ),
+        ));
+    }
+    let result = timeout(
+        PLUGIN_DELIVERY_ENQUEUE_TIMEOUT,
+        session.client.delivery_enqueue(request),
+    )
+    .await
+    .map_err(|_| {
+        PluginRpcError::new(
+            PluginRpcErrorKind::TransientDaemonUnavailable,
+            format!(
+                "timed out after {}s forwarding delivery.enqueue",
+                PLUGIN_DELIVERY_ENQUEUE_TIMEOUT.as_secs()
+            ),
+        )
+    })?;
+    result.map_err(plugin_rpc_error_from_anyhow)
+}
+
+fn prepare_brokered_delivery_request(
+    mut request: PluginDeliveryEnqueueRequest,
+    codex_binary: &str,
+) -> Result<PluginDeliveryEnqueueRequest, PluginRpcError> {
+    if request.target.driver != "codex_app_server" {
+        return Err(PluginRpcError::new(
+            PluginRpcErrorKind::InvalidRequest,
+            "delivery broker only supports codex_app_server target driver",
+        ));
+    }
+    if request.target.app_server_lease_id.is_some() {
+        return Err(PluginRpcError::new(
+            PluginRpcErrorKind::PolicyBlocked,
+            "delivery broker only supports delivery-owned target mode",
+        ));
+    }
+    request.target = PluginDeliveryTarget {
+        driver: "codex_app_server".to_string(),
+        app_server_lease_id: None,
+        managed_session_id: None,
+        session_epoch: None,
+        codex_binary: Some(codex_binary.to_string()),
+    };
+    Ok(request)
+}
+
+fn plugin_rpc_error_from_anyhow(error: anyhow::Error) -> PluginRpcError {
+    error
+        .downcast_ref::<PluginRpcError>()
+        .cloned()
+        .unwrap_or_else(|| PluginRpcError::new(PluginRpcErrorKind::Internal, format!("{error:#}")))
+}
+
+fn service_supports_delivery_owned_target(response: &PluginHelloResponse) -> bool {
+    response.service_capabilities.iter().any(|capability| {
+        capability.name == SERVICE_CAPABILITY_DELIVERY_OWNED_CODEX_APP_SERVER_TARGET_V1
+    })
+}
+
+fn supervisor_codex_binary() -> String {
+    std::env::var("WXCD_CODEX_PATH").unwrap_or_else(|_| "codex".to_string())
+}
+
+fn delivery_broker_socket_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("wxcd-cbth-delivery-broker.sock")
+}
+
+async fn remove_stale_delivery_broker_socket(socket_path: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(socket_path).await {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            tokio::fs::remove_file(socket_path).await.with_context(|| {
+                format!(
+                    "failed to remove stale cbth delivery broker socket {}",
+                    socket_path.display()
+                )
+            })?;
+        }
+        Ok(_) => {
+            bail!(
+                "refusing to replace non-socket cbth delivery broker path {}",
+                socket_path.display()
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect cbth delivery broker socket {}",
+                    socket_path.display()
+                )
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn run_plugin_app_server_lease(
@@ -356,9 +753,10 @@ async fn cleanup_plugin_app_server_lease_after_error(
     lease_id: &str,
 ) {
     match connect_cbth_plugin_rpc(config).await {
-        Ok(Some(mut client)) => {
+        Ok(Some(mut session)) => {
             if let Err(error) =
-                stop_plugin_app_server_lease(&mut client, managed_session_id, lease_id).await
+                stop_plugin_app_server_lease(&mut session.client, managed_session_id, lease_id)
+                    .await
             {
                 warn!(
                     "failed to stop cbth-managed app-server lease after refresh error: {error:#}"
@@ -592,6 +990,80 @@ mod tests {
             request.lease_ttl_seconds,
             Some(PLUGIN_APP_SERVER_LEASE_TTL_SECONDS)
         );
+    }
+
+    #[test]
+    fn service_capability_detects_c5_delivery_owned_target() {
+        let response = PluginHelloResponse {
+            protocol_version: PLUGIN_RPC_PROTOCOL_VERSION_V1,
+            service_capabilities: vec![
+                wxcd_cbth_rpc::ServiceCapability::new("delivery-driver-codex-app-server-v1"),
+                wxcd_cbth_rpc::ServiceCapability::new(
+                    SERVICE_CAPABILITY_DELIVERY_OWNED_CODEX_APP_SERVER_TARGET_V1,
+                ),
+            ],
+            policy: wxcd_cbth_rpc::PluginRpcPolicy {
+                max_frame_bytes: wxcd_cbth_rpc::PLUGIN_RPC_MAX_FRAME_BYTES,
+                requires_idempotency_key: true,
+            },
+            daemon_endpoint: None,
+        };
+
+        assert!(service_supports_delivery_owned_target(&response));
+    }
+
+    #[test]
+    fn brokered_delivery_request_forces_delivery_owned_codex_target() {
+        let request = broker_delivery_request(PluginDeliveryTarget {
+            driver: "codex_app_server".to_string(),
+            app_server_lease_id: None,
+            managed_session_id: Some("worker-supplied-session".to_string()),
+            session_epoch: Some(99),
+            codex_binary: Some("/tmp/worker-codex".to_string()),
+        });
+
+        let prepared =
+            prepare_brokered_delivery_request(request, "/usr/local/bin/codex").expect("prepared");
+
+        assert_eq!(prepared.target.driver, "codex_app_server");
+        assert_eq!(prepared.target.app_server_lease_id, None);
+        assert_eq!(prepared.target.managed_session_id, None);
+        assert_eq!(prepared.target.session_epoch, None);
+        assert_eq!(
+            prepared.target.codex_binary.as_deref(),
+            Some("/usr/local/bin/codex")
+        );
+    }
+
+    #[test]
+    fn brokered_delivery_request_rejects_explicit_lease() {
+        let request = broker_delivery_request(PluginDeliveryTarget {
+            driver: "codex_app_server".to_string(),
+            app_server_lease_id: Some("lease-1".to_string()),
+            managed_session_id: None,
+            session_epoch: None,
+            codex_binary: None,
+        });
+
+        let error = prepare_brokered_delivery_request(request, "codex")
+            .expect_err("explicit lease should fail");
+
+        assert_eq!(error.kind, PluginRpcErrorKind::PolicyBlocked);
+    }
+
+    fn broker_delivery_request(target: PluginDeliveryTarget) -> PluginDeliveryEnqueueRequest {
+        PluginDeliveryEnqueueRequest {
+            source_thread_id: "thread-1".to_string(),
+            summary: "deliver async result".to_string(),
+            idempotency_key: "webex-delivery:event-1".to_string(),
+            inline_payload: Some(serde_json::json!({"text": "done"})),
+            artifact: None,
+            delivery_policy: None,
+            max_delivery_attempts: Some(2),
+            redelivery_window_seconds: Some(3600),
+            target,
+            plugin_metadata: Some(serde_json::json!({"webex_event_id": "event-1"})),
+        }
     }
 
     #[test]
