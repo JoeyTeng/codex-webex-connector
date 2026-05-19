@@ -8,6 +8,9 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -20,15 +23,15 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
-          - macos-latest
+          - ubuntu-24.04
+          - macos-15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
 
@@ -42,8 +45,14 @@ jobs:
         run: cargo test --locked
 
   sidecar:
-    name: Webex sidecar
-    runs-on: ubuntu-latest
+    name: Webex sidecar (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
     defaults:
       run:
         working-directory: sidecars/webex-ws-sidecar
@@ -52,11 +61,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+
       - name: Enable Corepack
-        run: corepack enable
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.15.0 --activate
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Check JavaScript syntax
         run: node --check index.cjs
+
+      - name: Check Webex package imports
+        run: |
+          node <<'EOF'
+          const modules = [
+            "@webex/internal-plugin-device",
+            "@webex/plugin-logger",
+            "@webex/plugin-rooms",
+            "@webex/plugin-people",
+            "@webex/plugin-messages",
+            "@webex/plugin-attachment-actions",
+          ];
+          for (const moduleName of modules) {
+            require(moduleName);
+          }
+          const WebexCore = require("@webex/webex-core").default;
+          if (typeof WebexCore !== "function") {
+            throw new Error("@webex/webex-core default export is not a constructor");
+          }
+          EOF
