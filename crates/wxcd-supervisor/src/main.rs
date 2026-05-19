@@ -97,15 +97,16 @@ async fn run_supervisor() -> Result<()> {
 
         info!("starting worker from {}", worker_path.display());
         let mut worker_command = Command::new(&worker_path);
-        if let Some(config_path) = &config.bridge.config_path {
-            worker_command.env("WXCD_CONFIG_PATH", config_path);
-        }
-        if let Some(app_server) = managed_app_server.as_ref() {
-            worker_command.env(WXCD_CODEX_APP_SERVER_URL_ENV, &app_server.url);
-        }
-        if let Some(broker) = delivery_broker.as_ref() {
-            worker_command.env(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV, &broker.socket_path);
-        }
+        configure_worker_environment(
+            &mut worker_command,
+            config.bridge.config_path.as_deref(),
+            managed_app_server
+                .as_ref()
+                .map(|app_server| app_server.url.as_str()),
+            delivery_broker
+                .as_ref()
+                .map(|broker| broker.socket_path.as_path()),
+        );
         let mut worker = match worker_command
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -467,7 +468,13 @@ async fn run_delivery_broker(
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted.context("failed to accept cbth delivery broker connection")?;
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        warn!("failed to accept cbth delivery broker connection: {error:#}");
+                        continue;
+                    }
+                };
                 let config = config.clone();
                 let codex_binary = codex_binary.clone();
                 connections.spawn(async move {
@@ -503,6 +510,24 @@ fn log_delivery_broker_connection_result(
         Ok(Err(error)) => warn!("cbth delivery broker connection failed: {error:#}"),
         Err(error) if error.is_cancelled() => {}
         Err(error) => warn!("cbth delivery broker connection task panicked: {error:#}"),
+    }
+}
+
+fn configure_worker_environment(
+    command: &mut Command,
+    config_path: Option<&Path>,
+    app_server_url: Option<&str>,
+    delivery_broker_socket_path: Option<&Path>,
+) {
+    command.env_remove(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV);
+    if let Some(config_path) = config_path {
+        command.env("WXCD_CONFIG_PATH", config_path);
+    }
+    if let Some(app_server_url) = app_server_url {
+        command.env(WXCD_CODEX_APP_SERVER_URL_ENV, app_server_url);
+    }
+    if let Some(socket_path) = delivery_broker_socket_path {
+        command.env(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV, socket_path);
     }
 }
 
@@ -1221,6 +1246,37 @@ mod tests {
 
         assert_eq!(mapped.kind, PluginRpcErrorKind::TransientDaemonUnavailable);
         assert!(mapped.retryable);
+    }
+
+    #[test]
+    fn worker_command_env_removes_inherited_delivery_broker_socket_when_absent() {
+        let mut command = Command::new("worker");
+        command.env(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV, "/tmp/stale.sock");
+
+        configure_worker_environment(&mut command, None, None, None);
+
+        let broker_env = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV);
+        assert!(matches!(broker_env, Some((_, None))));
+    }
+
+    #[test]
+    fn worker_command_env_sets_current_delivery_broker_socket() {
+        let mut command = Command::new("worker");
+        let socket_path = Path::new("/tmp/current.sock");
+
+        configure_worker_environment(&mut command, None, None, Some(socket_path));
+
+        let broker_env = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV);
+        assert!(matches!(
+            broker_env,
+            Some((_, Some(value))) if value == socket_path.as_os_str()
+        ));
     }
 
     fn broker_delivery_request(target: PluginDeliveryTarget) -> PluginDeliveryEnqueueRequest {

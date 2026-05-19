@@ -730,9 +730,13 @@ fn build_async_notification_delivery_request(
     if summary.is_empty() {
         bail!("async notification summary must not be empty");
     }
+    let event_id = notification.event_id.trim();
+    if event_id.is_empty() {
+        bail!("async notification event_id must not be empty");
+    }
     let payload = json!({
         "kind": "webex_async_notification",
-        "event_id": notification.event_id,
+        "event_id": event_id,
         "session_id": session_id,
         "thread_id": thread_id,
         "summary": summary,
@@ -742,7 +746,7 @@ fn build_async_notification_delivery_request(
     Ok(PluginDeliveryEnqueueRequest {
         source_thread_id: thread_id.to_string(),
         summary: summary.to_string(),
-        idempotency_key: webex_delivery_idempotency_key(&notification.event_id),
+        idempotency_key: webex_delivery_idempotency_key(event_id),
         inline_payload: Some(payload),
         artifact: None,
         delivery_policy: None,
@@ -757,7 +761,7 @@ fn build_async_notification_delivery_request(
         },
         plugin_metadata: Some(json!({
             "kind": "webex_async_notification",
-            "webex_event_id": notification.event_id,
+            "webex_event_id": event_id,
             "session_id": session_id,
             "thread_id": thread_id,
         })),

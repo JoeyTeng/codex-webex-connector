@@ -478,6 +478,29 @@ fn async_notification_rejects_non_executable_session_id() {
 }
 
 #[test]
+fn async_notification_rejects_empty_event_id() {
+    let mut state = WorkerState::default();
+    let session = session_record("ses_1", SessionState::Idle, false);
+    state.upsert_session(session);
+    let notification = WebexAsyncNotificationEvent {
+        event_id: "   ".to_string(),
+        session_id: Some("ses_1".to_string()),
+        thread_id: None,
+        summary: "background job finished".to_string(),
+        payload: None,
+        created: Utc::now(),
+    };
+
+    let error = build_async_notification_delivery_request(&state, &notification)
+        .expect_err("empty event id should fail");
+
+    assert!(
+        format!("{error:#}").contains("event_id must not be empty"),
+        "{error:#}"
+    );
+}
+
+#[test]
 fn async_notification_idempotency_key_is_c5_token_safe() {
     let key = webex_delivery_idempotency_key("webex/event:1 with spaces");
 
