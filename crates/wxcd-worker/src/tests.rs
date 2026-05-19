@@ -23,6 +23,7 @@ use super::{
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
+use std::path::Path;
 use std::sync::Arc;
 use wxcd_cbth_rpc::{PluginDrainRequest, PluginHealthCheckRequest, PluginShutdownRequest};
 use wxcd_proto::{
@@ -77,6 +78,15 @@ fn app_config_with_plugin(enabled: bool) -> AppConfig {
             path: "/Users/hoteng/Program/GitHub/codex-webex-connector".into(),
         }],
     }
+}
+
+fn app_config_with_state_dir(state_dir: &Path, plugin_enabled: bool) -> AppConfig {
+    let mut config = app_config_with_plugin(plugin_enabled);
+    config.bridge.state_dir = state_dir.to_path_buf();
+    if plugin_enabled {
+        config.bridge.cbth_plugin.plugin_home = state_dir.join("plugin-home");
+    }
+    config
 }
 
 #[test]
@@ -1850,12 +1860,9 @@ async fn installation_identity_persists_and_loads() {
     ));
     tokio::fs::create_dir_all(&state_dir).await.unwrap();
 
-    let created = load_or_create_installation_identity(&state_dir)
-        .await
-        .unwrap();
-    let loaded = load_or_create_installation_identity(&state_dir)
-        .await
-        .unwrap();
+    let config = app_config_with_state_dir(&state_dir, false);
+    let created = load_or_create_installation_identity(&config).await.unwrap();
+    let loaded = load_or_create_installation_identity(&config).await.unwrap();
 
     assert_eq!(created, loaded);
     assert!(created.installation_id.starts_with("ins_"));
@@ -1870,7 +1877,8 @@ async fn installation_identity_lookup_error_is_not_treated_as_missing() {
         "a".repeat(300)
     ));
 
-    let error = load_or_create_installation_identity(&state_dir)
+    let config = app_config_with_state_dir(&state_dir, false);
+    let error = load_or_create_installation_identity(&config)
         .await
         .unwrap_err();
 
@@ -1898,12 +1906,9 @@ async fn installation_identity_recovers_from_snapshot_writer() {
         .await
         .unwrap();
 
-    let recovered = load_or_create_installation_identity(&state_dir)
-        .await
-        .unwrap();
-    let loaded = load_or_create_installation_identity(&state_dir)
-        .await
-        .unwrap();
+    let config = app_config_with_state_dir(&state_dir, false);
+    let recovered = load_or_create_installation_identity(&config).await.unwrap();
+    let loaded = load_or_create_installation_identity(&config).await.unwrap();
 
     assert_eq!(recovered.installation_id, "ins_recovered");
     assert_eq!(loaded, recovered);
@@ -1921,12 +1926,9 @@ async fn installation_identity_mints_when_snapshot_recovery_is_malformed() {
     let snapshot_path = state_dir.join("bridge-state.json");
     tokio::fs::write(&snapshot_path, "{not json").await.unwrap();
 
-    let created = load_or_create_installation_identity(&state_dir)
-        .await
-        .unwrap();
-    let loaded = load_or_create_installation_identity(&state_dir)
-        .await
-        .unwrap();
+    let config = app_config_with_state_dir(&state_dir, false);
+    let created = load_or_create_installation_identity(&config).await.unwrap();
+    let loaded = load_or_create_installation_identity(&config).await.unwrap();
 
     assert!(created.installation_id.starts_with("ins_"));
     assert_eq!(loaded, created);
@@ -1952,12 +1954,44 @@ async fn installation_identity_mints_for_legacy_snapshot_without_writer() {
         .await
         .unwrap();
 
-    let created = load_or_create_installation_identity(&state_dir)
-        .await
-        .unwrap();
+    let config = app_config_with_state_dir(&state_dir, false);
+    let created = load_or_create_installation_identity(&config).await.unwrap();
 
     assert!(created.installation_id.starts_with("ins_"));
     assert_ne!(created.installation_id, "ins_recovered");
+
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn installation_identity_recovers_from_plugin_home_snapshot_writer() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-installation-plugin-home-recovery-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+    let config = app_config_with_state_dir(&state_dir, true);
+    let snapshot_path = config
+        .bridge
+        .cbth_plugin
+        .plugin_home
+        .join("bridge-state.json");
+    tokio::fs::create_dir_all(snapshot_path.parent().unwrap())
+        .await
+        .unwrap();
+    let snapshot = BridgeSnapshot {
+        created_at: Utc::now(),
+        writer_installation_id: Some("ins_plugin_home".to_string()),
+        sessions: Vec::new(),
+        pending_approvals: Vec::new(),
+    };
+    tokio::fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap())
+        .await
+        .unwrap();
+
+    let recovered = load_or_create_installation_identity(&config).await.unwrap();
+
+    assert_eq!(recovered.installation_id, "ins_plugin_home");
 
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }

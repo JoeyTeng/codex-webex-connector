@@ -58,6 +58,7 @@ const PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT: Duration =
 const ASYNC_NOTIFICATION_INGRESS_ACK_TIMEOUT: Duration =
     Duration::from_secs(C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS + 45);
 const PLUGIN_LIFECYCLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
 const WXCD_CBTH_LIFECYCLE_SOCKET_ENV: &str = "WXCD_CBTH_LIFECYCLE_SOCKET";
@@ -181,6 +182,7 @@ enum WorkerQueueItem {
 struct QueuedLifecycleCommand {
     command: LifecycleCommand,
     completion: oneshot::Sender<std::result::Result<LifecycleCommandResponse, String>>,
+    response_flushed: Option<oneshot::Receiver<()>>,
 }
 
 enum LifecycleCommand {
@@ -191,6 +193,11 @@ enum LifecycleCommand {
 enum LifecycleCommandResponse {
     Drain(PluginDrainResponse),
     Ack(PluginLifecycleAckResponse),
+}
+
+struct LifecycleRpcResponse {
+    frame: PluginRpcResponseFrame,
+    response_flushed: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,7 +458,7 @@ async fn run() -> Result<()> {
                 )
             })?;
     }
-    let installation = load_or_create_installation_identity(&config.bridge.state_dir).await?;
+    let installation = load_or_create_installation_identity(&config).await?;
 
     remove_stale_socket(&config.bridge.socket_path).await?;
 
@@ -673,21 +680,25 @@ async fn run() -> Result<()> {
                         }
                     }
                     WorkerQueueItem::Lifecycle(command) => {
-                        let should_shutdown = matches!(command.command, LifecycleCommand::Shutdown(_));
+                        let QueuedLifecycleCommand {
+                            command,
+                            completion,
+                            response_flushed,
+                        } = command;
+                        let should_shutdown = matches!(&command, LifecycleCommand::Shutdown(_));
                         let result = handle_lifecycle_command(
                             &config,
                             &mut state,
-                            command.command,
+                            command,
                         ).await.map_err(|error| format!("{error:#}"));
                         let shutdown_accepted = should_shutdown
                             && matches!(
-                                result,
-                                Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
-                                    accepted: true,
-                                }))
+                                result.as_ref(),
+                                Ok(LifecycleCommandResponse::Ack(response)) if response.accepted
                             );
-                        let _ = command.completion.send(result);
+                        let _ = completion.send(result);
                         if shutdown_accepted {
+                            wait_for_lifecycle_response_flush(response_flushed).await;
                             info!("lifecycle shutdown requested, stopping worker");
                             break;
                         }
@@ -2725,6 +2736,20 @@ async fn handle_lifecycle_command(
     }
 }
 
+async fn wait_for_lifecycle_response_flush(response_flushed: Option<oneshot::Receiver<()>>) {
+    let Some(response_flushed) = response_flushed else {
+        return;
+    };
+    match timeout(PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT, response_flushed).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => warn!("lifecycle shutdown response writer dropped before flush confirmation"),
+        Err(_) => warn!(
+            "timed out after {}s waiting for lifecycle shutdown response flush",
+            PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT.as_secs()
+        ),
+    }
+}
+
 async fn persist_durable_lifecycle_mirror(config: &AppConfig, state: &WorkerState) -> Result<()> {
     persist_local_snapshot(&durable_local_snapshot_path(config), &state.to_snapshot()).await
 }
@@ -2903,9 +2928,12 @@ async fn handle_lifecycle_control_connection(
                 Err(error) => return Err(anyhow!(error)),
             };
         let response = handle_lifecycle_rpc_frame(frame, &events_tx, &healthy, &lifecycle).await;
-        write_plugin_rpc_frame(&mut stream, &response, PLUGIN_RPC_MAX_FRAME_BYTES)
+        write_plugin_rpc_frame(&mut stream, &response.frame, PLUGIN_RPC_MAX_FRAME_BYTES)
             .await
             .map_err(anyhow::Error::from)?;
+        if let Some(response_flushed) = response.response_flushed {
+            let _ = response_flushed.send(());
+        }
     }
 }
 
@@ -2914,7 +2942,8 @@ async fn handle_lifecycle_rpc_frame(
     events_tx: &mpsc::Sender<WorkerQueueItem>,
     healthy: &Arc<AtomicBool>,
     lifecycle: &Arc<LifecycleControl>,
-) -> PluginRpcResponseFrame {
+) -> LifecycleRpcResponse {
+    let mut response_flushed = None;
     let result = match frame.method.as_str() {
         PLUGIN_RPC_PLUGIN_HEALTH_CHECK_METHOD => {
             decode_lifecycle_params::<PluginHealthCheckRequest>(&frame).map(|request| {
@@ -2945,22 +2974,26 @@ async fn handle_lifecycle_rpc_frame(
                         })
                         .expect("drain response serializes"))
                     } else {
-                        lifecycle_command_response(events_tx, LifecycleCommand::Drain(request))
-                            .await
-                            .and_then(|response| match response {
-                                LifecycleCommandResponse::Drain(response) => {
-                                    serde_json::to_value(response).map_err(|error| {
-                                        PluginRpcError::new(
-                                            PluginRpcErrorKind::Internal,
-                                            error.to_string(),
-                                        )
-                                    })
-                                }
-                                LifecycleCommandResponse::Ack(_) => Err(PluginRpcError::new(
-                                    PluginRpcErrorKind::Internal,
-                                    "drain command returned ack response",
-                                )),
-                            })
+                        lifecycle_command_response(
+                            events_tx,
+                            LifecycleCommand::Drain(request),
+                            None,
+                        )
+                        .await
+                        .and_then(|response| match response {
+                            LifecycleCommandResponse::Drain(response) => {
+                                serde_json::to_value(response).map_err(|error| {
+                                    PluginRpcError::new(
+                                        PluginRpcErrorKind::Internal,
+                                        error.to_string(),
+                                    )
+                                })
+                            }
+                            LifecycleCommandResponse::Ack(_) => Err(PluginRpcError::new(
+                                PluginRpcErrorKind::Internal,
+                                "drain command returned ack response",
+                            )),
+                        })
                     }
                 }
                 Err(error) => Err(error),
@@ -2972,13 +3005,16 @@ async fn handle_lifecycle_rpc_frame(
                     let previous_phase = match lifecycle.begin_shutdown() {
                         Some(previous_phase) => previous_phase,
                         None => {
-                            return PluginRpcResponseFrame::success(
-                                frame.id,
-                                serde_json::to_value(PluginLifecycleAckResponse {
-                                    accepted: false,
-                                })
-                                .expect("shutdown response serializes"),
-                            );
+                            return LifecycleRpcResponse {
+                                frame: PluginRpcResponseFrame::success(
+                                    frame.id,
+                                    serde_json::to_value(PluginLifecycleAckResponse {
+                                        accepted: false,
+                                    })
+                                    .expect("shutdown response serializes"),
+                                ),
+                                response_flushed: None,
+                            };
                         }
                     };
                     if !lifecycle
@@ -2991,9 +3027,12 @@ async fn handle_lifecycle_rpc_frame(
                                 .expect("shutdown response serializes"),
                         )
                     } else {
+                        let (flushed_tx, flushed_rx) = oneshot::channel();
+                        response_flushed = Some(flushed_tx);
                         match lifecycle_command_response(
                             events_tx,
                             LifecycleCommand::Shutdown(request),
+                            Some(flushed_rx),
                         )
                         .await
                         {
@@ -3048,20 +3087,28 @@ async fn handle_lifecycle_rpc_frame(
     };
 
     match result {
-        Ok(value) => PluginRpcResponseFrame::success(frame.id, value),
-        Err(error) => PluginRpcResponseFrame::failure(frame.id, error),
+        Ok(value) => LifecycleRpcResponse {
+            frame: PluginRpcResponseFrame::success(frame.id, value),
+            response_flushed,
+        },
+        Err(error) => LifecycleRpcResponse {
+            frame: PluginRpcResponseFrame::failure(frame.id, error),
+            response_flushed,
+        },
     }
 }
 
 async fn lifecycle_command_response(
     events_tx: &mpsc::Sender<WorkerQueueItem>,
     command: LifecycleCommand,
+    response_flushed: Option<oneshot::Receiver<()>>,
 ) -> std::result::Result<LifecycleCommandResponse, PluginRpcError> {
     let (completion, response) = oneshot::channel();
     events_tx
         .send(WorkerQueueItem::Lifecycle(QueuedLifecycleCommand {
             command,
             completion,
+            response_flushed,
         }))
         .await
         .map_err(|_| {
@@ -3913,7 +3960,8 @@ async fn persist_local_snapshot(path: &Path, snapshot: &wxcd_proto::BridgeSnapsh
     Ok(())
 }
 
-async fn load_or_create_installation_identity(state_dir: &Path) -> Result<InstallationIdentity> {
+async fn load_or_create_installation_identity(config: &AppConfig) -> Result<InstallationIdentity> {
+    let state_dir = &config.bridge.state_dir;
     let path = state_dir.join(INSTALLATION_IDENTITY_FILE);
     if tokio::fs::try_exists(&path)
         .await
@@ -3933,7 +3981,7 @@ async fn load_or_create_installation_identity(state_dir: &Path) -> Result<Instal
         return Ok(identity);
     }
 
-    let identity = match recover_installation_identity_from_snapshot(state_dir).await? {
+    let identity = match recover_installation_identity_from_snapshot(config).await? {
         Some(identity) => identity,
         None => InstallationIdentity {
             installation_id: generate_installation_id(Utc::now()),
@@ -3945,14 +3993,34 @@ async fn load_or_create_installation_identity(state_dir: &Path) -> Result<Instal
 }
 
 async fn recover_installation_identity_from_snapshot(
-    state_dir: &Path,
+    config: &AppConfig,
 ) -> Result<Option<InstallationIdentity>> {
-    let snapshot_path = state_dir.join(LOCAL_SNAPSHOT_FILE);
-    if !tokio::fs::try_exists(&snapshot_path).await.unwrap_or(false) {
+    let durable_path = durable_local_snapshot_path(config);
+    let legacy_path = config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE);
+    let paths = if durable_path == legacy_path {
+        vec![durable_path]
+    } else {
+        vec![durable_path, legacy_path]
+    };
+
+    for snapshot_path in paths {
+        if let Some(identity) =
+            recover_installation_identity_from_snapshot_path(&snapshot_path).await?
+        {
+            return Ok(Some(identity));
+        }
+    }
+    Ok(None)
+}
+
+async fn recover_installation_identity_from_snapshot_path(
+    snapshot_path: &Path,
+) -> Result<Option<InstallationIdentity>> {
+    if !tokio::fs::try_exists(snapshot_path).await.unwrap_or(false) {
         return Ok(None);
     }
 
-    let content = match tokio::fs::read_to_string(&snapshot_path).await {
+    let content = match tokio::fs::read_to_string(snapshot_path).await {
         Ok(content) => content,
         Err(error) => {
             warn!(
