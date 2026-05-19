@@ -1,4 +1,5 @@
-use std::os::unix::fs::FileTypeExt;
+use std::fs::Permissions;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,6 +35,7 @@ const PLUGIN_DELIVERY_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(20);
 const PLUGIN_DELIVERY_BROKER_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 const PLUGIN_DELIVERY_BROKER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(6);
 const PLUGIN_DELIVERY_BROKER_SOCKET_DIR: &str = "/tmp";
+const PLUGIN_DELIVERY_BROKER_SOCKET_MODE: u32 = 0o600;
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
 
@@ -435,12 +437,15 @@ async fn start_delivery_broker(
             socket_path.display()
         )
     })?;
+    set_delivery_broker_socket_permissions(&socket_path).await?;
+    let expected_peer_uid = delivery_broker_socket_owner_uid(&socket_path).await?;
     let (stop_tx, stop_rx) = oneshot::channel();
     let codex_binary = supervisor_codex_binary();
     let task = tokio::spawn(run_delivery_broker(
         listener,
         config.clone(),
         codex_binary,
+        expected_peer_uid,
         stop_rx,
     ));
     info!("cbth delivery broker ready at {}", socket_path.display());
@@ -455,6 +460,7 @@ async fn run_delivery_broker(
     listener: UnixListener,
     config: CbthPluginConfig,
     codex_binary: String,
+    expected_peer_uid: u32,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     let mut connections = JoinSet::new();
@@ -469,6 +475,7 @@ async fn run_delivery_broker(
                         stream,
                         &config,
                         &codex_binary,
+                        expected_peer_uid,
                     ).await
                 });
             }
@@ -503,7 +510,9 @@ async fn handle_delivery_broker_connection(
     mut stream: UnixStream,
     config: &CbthPluginConfig,
     codex_binary: &str,
+    expected_peer_uid: u32,
 ) -> Result<()> {
+    authenticate_delivery_broker_client(&stream, expected_peer_uid)?;
     let frame: PluginRpcRequestFrame = timeout(
         PLUGIN_DELIVERY_BROKER_FRAME_TIMEOUT,
         read_plugin_rpc_frame(&mut stream, wxcd_cbth_rpc::PLUGIN_RPC_MAX_FRAME_BYTES),
@@ -622,10 +631,20 @@ fn prepare_brokered_delivery_request(
 }
 
 fn plugin_rpc_error_from_anyhow(error: anyhow::Error) -> PluginRpcError {
-    error
-        .downcast_ref::<PluginRpcError>()
-        .cloned()
-        .unwrap_or_else(|| PluginRpcError::new(PluginRpcErrorKind::Internal, format!("{error:#}")))
+    if let Some(error) = error.downcast_ref::<PluginRpcError>() {
+        return error.clone();
+    }
+    if error.downcast_ref::<std::io::Error>().is_some()
+        || error
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    {
+        return PluginRpcError::new(
+            PluginRpcErrorKind::TransientDaemonUnavailable,
+            format!("{error:#}"),
+        );
+    }
+    PluginRpcError::new(PluginRpcErrorKind::Internal, format!("{error:#}"))
 }
 
 fn service_supports_delivery_owned_target(response: &PluginHelloResponse) -> bool {
@@ -657,6 +676,55 @@ fn stable_fnv1a_hex(value: &str) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+async fn set_delivery_broker_socket_permissions(socket_path: &Path) -> Result<()> {
+    tokio::fs::set_permissions(
+        socket_path,
+        Permissions::from_mode(PLUGIN_DELIVERY_BROKER_SOCKET_MODE),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to set cbth delivery broker socket permissions on {}",
+            socket_path.display()
+        )
+    })
+}
+
+async fn delivery_broker_socket_owner_uid(socket_path: &Path) -> Result<u32> {
+    let metadata = tokio::fs::symlink_metadata(socket_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inspect cbth delivery broker socket {}",
+                socket_path.display()
+            )
+        })?;
+    Ok(metadata.uid())
+}
+
+fn authenticate_delivery_broker_client(
+    stream: &UnixStream,
+    expected_peer_uid: u32,
+) -> Result<(), PluginRpcError> {
+    let credentials = stream.peer_cred().map_err(|error| {
+        PluginRpcError::new(
+            PluginRpcErrorKind::TransientDaemonUnavailable,
+            format!("failed to read delivery broker peer credentials: {error}"),
+        )
+    })?;
+    if credentials.uid() != expected_peer_uid {
+        return Err(PluginRpcError::new(
+            PluginRpcErrorKind::PolicyBlocked,
+            format!(
+                "delivery broker peer uid {} does not match expected uid {}",
+                credentials.uid(),
+                expected_peer_uid
+            ),
+        ));
+    }
+    Ok(())
 }
 
 async fn remove_stale_delivery_broker_socket(socket_path: &Path) -> Result<()> {
@@ -1090,6 +1158,69 @@ mod tests {
             rendered.len() < 80,
             "broker socket path should stay comfortably below Unix socket path limits: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn delivery_broker_peer_auth_accepts_same_uid() {
+        let (_client, server) = UnixStream::pair().expect("unix stream pair");
+        let expected_uid = server.peer_cred().expect("peer credentials").uid();
+
+        authenticate_delivery_broker_client(&server, expected_uid).expect("authenticated");
+    }
+
+    #[tokio::test]
+    async fn delivery_broker_peer_auth_rejects_wrong_uid() {
+        let (_client, server) = UnixStream::pair().expect("unix stream pair");
+        let peer_uid = server.peer_cred().expect("peer credentials").uid();
+
+        let error = authenticate_delivery_broker_client(&server, peer_uid.wrapping_add(1))
+            .expect_err("wrong uid should fail");
+
+        assert_eq!(error.kind, PluginRpcErrorKind::PolicyBlocked);
+    }
+
+    #[tokio::test]
+    async fn delivery_broker_socket_permissions_are_owner_only() {
+        let socket_path = Path::new(PLUGIN_DELIVERY_BROKER_SOCKET_DIR).join(format!(
+            "wxcd-perm-{}-{}.sock",
+            std::process::id(),
+            stable_fnv1a_hex(
+                &SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock")
+                    .as_nanos()
+                    .to_string()
+            )
+        ));
+        let _ = tokio::fs::remove_file(&socket_path).await;
+        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+
+        set_delivery_broker_socket_permissions(&socket_path)
+            .await
+            .expect("set socket permissions");
+
+        let metadata = tokio::fs::symlink_metadata(&socket_path)
+            .await
+            .expect("socket metadata");
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            PLUGIN_DELIVERY_BROKER_SOCKET_MODE
+        );
+
+        drop(listener);
+        tokio::fs::remove_file(&socket_path)
+            .await
+            .expect("remove test socket");
+    }
+
+    #[test]
+    fn broker_anyhow_io_errors_remain_retryable_transient_errors() {
+        let error = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "cbth restarting");
+
+        let mapped = plugin_rpc_error_from_anyhow(anyhow::Error::new(error));
+
+        assert_eq!(mapped.kind, PluginRpcErrorKind::TransientDaemonUnavailable);
+        assert!(mapped.retryable);
     }
 
     fn broker_delivery_request(target: PluginDeliveryTarget) -> PluginDeliveryEnqueueRequest {
