@@ -10,13 +10,13 @@ use super::{
     extract_thread_history_turns, generate_installation_id, handle_lifecycle_command,
     ingress_requires_processing_ack, ingress_uses_delivery_enqueue, is_control_list_session,
     is_default_list_session, is_failed_session_room_command,
-    load_durable_local_snapshot_with_metadata, load_local_snapshot_with_metadata,
-    load_or_create_installation_identity, normalize_control_command_text,
-    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
-    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
-    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
-    resolve_codex_connection, resolve_delivery_broker_connection, session_belongs_to_installation,
-    session_requires_codex_archive, sessions_for_diagnostics,
+    lifecycle_control_socket_path_from_env, load_durable_local_snapshot_with_metadata,
+    load_local_snapshot_with_metadata, load_or_create_installation_identity,
+    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
+    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
+    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
+    repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
+    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
     should_process_async_notification_event, slice_thread_history_page,
     validate_purge_archived_session, webex_delivery_idempotency_key,
     write_supervisor_shutdown_marker_at,
@@ -1502,6 +1502,19 @@ fn durable_snapshot_uses_plugin_home_in_cbth_plugin_mode() {
     assert_eq!(
         durable_local_snapshot_path(&config),
         std::path::PathBuf::from("/tmp/wxcd-plugin-home/bridge-state.json")
+    );
+}
+
+#[test]
+fn lifecycle_socket_empty_env_falls_back_to_plugin_home() {
+    let mut config = app_config_with_plugin(true);
+    config.bridge.cbth_plugin.plugin_home = "/tmp/wxcd-plugin-home".into();
+
+    assert_eq!(
+        lifecycle_control_socket_path_from_env(&config, Some(std::ffi::OsStr::new(""))),
+        Some(std::path::PathBuf::from(
+            "/tmp/wxcd-plugin-home/lifecycle.sock"
+        ))
     );
 }
 

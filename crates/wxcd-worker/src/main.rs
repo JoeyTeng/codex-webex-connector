@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -2741,11 +2742,22 @@ fn durable_local_snapshot_path(config: &AppConfig) -> PathBuf {
 }
 
 fn lifecycle_control_socket_path(config: &AppConfig) -> Option<PathBuf> {
+    lifecycle_control_socket_path_from_env(
+        config,
+        std::env::var_os(WXCD_CBTH_LIFECYCLE_SOCKET_ENV).as_deref(),
+    )
+}
+
+fn lifecycle_control_socket_path_from_env(
+    config: &AppConfig,
+    socket_env: Option<&OsStr>,
+) -> Option<PathBuf> {
     if !config.bridge.cbth_plugin.enabled {
         return None;
     }
     Some(
-        std::env::var_os(WXCD_CBTH_LIFECYCLE_SOCKET_ENV)
+        socket_env
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| config.bridge.cbth_plugin.plugin_home.join("lifecycle.sock")),
     )

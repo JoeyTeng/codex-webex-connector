@@ -81,6 +81,12 @@ function markRetryableSocketError(error) {
   return error;
 }
 
+function retryableSocketCloseError(message) {
+  const error = new Error(message);
+  error.retryable = true;
+  return error;
+}
+
 function sendEnvelopeOnce(envelope) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath);
@@ -114,7 +120,7 @@ function sendEnvelopeOnce(envelope) {
     socket.on("error", (error) => finish(reject, markRetryableSocketError(error)));
     socket.on("end", () => {
       if (!settled) {
-        finish(reject, new Error("worker closed ingress socket before ack"));
+        finish(reject, retryableSocketCloseError("worker closed ingress socket before ack"));
       }
     });
   });
