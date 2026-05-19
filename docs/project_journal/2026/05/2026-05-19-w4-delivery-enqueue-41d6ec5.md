@@ -22,6 +22,7 @@ superseded_by:
 - In explicit cbth plugin mode, `wxcd-supervisor` exposes the local delivery broker only when the cbth service advertises the C5 `delivery-owned-codex-app-server-target-v1` capability; otherwise W3 normal forwarding can still run and async notifications fail with an explicit broker-unavailable ACK.
 - The broker only accepts same-user local clients and delivery-owned `codex_app_server` enqueue requests, strips worker-supplied target assertions, injects the supervisor-selected Codex binary, rejects explicit lease targets, and keeps accepting after transient local accept errors.
 - The broker binds a short runtime socket under `/tmp` keyed by plugin/runtime identity, so long configured state directories do not prevent supervisor startup.
+- Async delivery enqueue, broker RPC, and ingress ACK timeout budgets cover the C5 `codex_app_server` acceptance window with transport margin.
 - The supervisor clears inherited delivery broker socket environment when no broker is available, preserving the explicit broker-unavailable async ACK path.
 - `wxcd-worker` accepts `async_notification` ingress events, resolves them to an existing Webex session/thread, builds stable idempotent inline-payload delivery requests, and leaves `message_created` session turns on the existing direct app-server path.
 

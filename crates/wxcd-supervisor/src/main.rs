@@ -31,7 +31,9 @@ const PLUGIN_APP_SERVER_REFRESH_SAFETY_MARGIN_SECONDS: u64 = 5;
 const PLUGIN_APP_SERVER_ENSURE_TIMEOUT: Duration = Duration::from_secs(20);
 const PLUGIN_APP_SERVER_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const PLUGIN_APP_SERVER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(6);
-const PLUGIN_DELIVERY_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(20);
+const C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS: u64 = 60;
+const PLUGIN_DELIVERY_ENQUEUE_TIMEOUT: Duration =
+    Duration::from_secs(C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS + 15);
 const PLUGIN_DELIVERY_BROKER_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 const PLUGIN_DELIVERY_BROKER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(6);
 const PLUGIN_DELIVERY_BROKER_SOCKET_DIR: &str = "/tmp";
@@ -1246,6 +1248,14 @@ mod tests {
 
         assert_eq!(mapped.kind, PluginRpcErrorKind::TransientDaemonUnavailable);
         assert!(mapped.retryable);
+    }
+
+    #[test]
+    fn delivery_enqueue_timeout_covers_c5_acceptance_window() {
+        assert!(
+            PLUGIN_DELIVERY_ENQUEUE_TIMEOUT
+                >= Duration::from_secs(C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS + 10)
+        );
     }
 
     #[test]

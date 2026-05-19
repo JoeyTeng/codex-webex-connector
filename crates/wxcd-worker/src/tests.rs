@@ -1,18 +1,19 @@
 use super::{
+    ASYNC_NOTIFICATION_INGRESS_ACK_TIMEOUT, C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS,
     CleanupFailedCommand, CodexConnectionConfig, DiagnoseCommand, ListCommand, ListMode,
-    LocalMirrorClaimScope, PurgeArchivedCommand, RECENT_EVENT_ID_LIMIT, ThreadProbe,
-    ThreadProbeKind, WorkerState, abbreviate, apply_thread_probe, attached_session_for_thread,
-    build_async_notification_delivery_request, ensure_approval_belongs_to_installation,
-    ensure_failed_cleanup_target, ensure_session_id_belongs_to_installation,
-    extract_thread_history_turns, generate_installation_id, ingress_requires_processing_ack,
-    ingress_uses_delivery_enqueue, is_control_list_session, is_default_list_session,
-    is_failed_session_room_command, load_local_snapshot_with_metadata,
-    load_or_create_installation_identity, normalize_control_command_text,
-    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
-    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
-    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
-    resolve_codex_connection, resolve_delivery_broker_connection, session_belongs_to_installation,
-    session_requires_codex_archive, sessions_for_diagnostics,
+    LocalMirrorClaimScope, PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT, PurgeArchivedCommand,
+    RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerState, abbreviate,
+    apply_thread_probe, attached_session_for_thread, build_async_notification_delivery_request,
+    ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
+    ensure_session_id_belongs_to_installation, extract_thread_history_turns,
+    generate_installation_id, ingress_requires_processing_ack, ingress_uses_delivery_enqueue,
+    is_control_list_session, is_default_list_session, is_failed_session_room_command,
+    load_local_snapshot_with_metadata, load_or_create_installation_identity,
+    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
+    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
+    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
+    repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
+    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
     should_process_async_notification_event, slice_thread_history_page,
     validate_purge_archived_session, webex_delivery_idempotency_key,
 };
@@ -523,6 +524,18 @@ fn async_notification_event_is_remembered_only_after_enqueue_success() {
     state.remember_event(event_id);
 
     assert!(!should_process_async_notification_event(&state, event_id));
+}
+
+#[test]
+fn async_notification_timeouts_cover_c5_acceptance_window() {
+    assert!(
+        PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT
+            >= std::time::Duration::from_secs(C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS + 20)
+    );
+    assert!(
+        ASYNC_NOTIFICATION_INGRESS_ACK_TIMEOUT
+            >= PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT + std::time::Duration::from_secs(10)
+    );
 }
 
 fn is_c5_ascii_token(value: &str) -> bool {
