@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
@@ -61,6 +63,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
 
       - name: Install Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -75,25 +79,5 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Check JavaScript syntax
-        run: node --check index.cjs
-
-      - name: Check Webex package imports
-        run: |
-          node <<'EOF'
-          const modules = [
-            "@webex/internal-plugin-device",
-            "@webex/plugin-logger",
-            "@webex/plugin-rooms",
-            "@webex/plugin-people",
-            "@webex/plugin-messages",
-            "@webex/plugin-attachment-actions",
-          ];
-          for (const moduleName of modules) {
-            require(moduleName);
-          }
-          const WebexCore = require("@webex/webex-core").default;
-          if (typeof WebexCore !== "function") {
-            throw new Error("@webex/webex-core default export is not a constructor");
-          }
-          EOF
+      - name: Check Webex sidecar
+        run: pnpm run check
