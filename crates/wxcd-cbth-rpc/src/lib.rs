@@ -15,6 +15,11 @@ pub const PLUGIN_RPC_HELLO_METHOD: &str = "plugin.hello";
 pub const PLUGIN_RPC_APP_SERVER_ENSURE_METHOD: &str = "app_server.ensure";
 pub const PLUGIN_RPC_APP_SERVER_REFRESH_METHOD: &str = "app_server.refresh";
 pub const PLUGIN_RPC_APP_SERVER_STOP_METHOD: &str = "app_server.stop";
+pub const PLUGIN_RPC_DELIVERY_ENQUEUE_METHOD: &str = "delivery.enqueue";
+pub const PLUGIN_RPC_DELIVERY_INSPECT_METHOD: &str = "delivery.inspect";
+pub const PLUGIN_RPC_DELIVERY_MANUALIZE_METHOD: &str = "delivery.manualize";
+pub const SERVICE_CAPABILITY_DELIVERY_OWNED_CODEX_APP_SERVER_TARGET_V1: &str =
+    "delivery-owned-codex-app-server-target-v1";
 
 const PLUGIN_RPC_JSONRPC_VERSION: &str = "2.0";
 const FRAME_LENGTH_PREFIX_BYTES: usize = 4;
@@ -192,6 +197,78 @@ pub struct PluginAppServerStopRequest {
     pub lease_id: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDeliveryTarget {
+    pub driver: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_server_lease_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_epoch: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_binary: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDeliveryArtifactReference {
+    pub artifact_id: String,
+    pub relative_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_filename: Option<String>,
+    pub size_bytes: i64,
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_until: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDeliveryEnqueueRequest {
+    pub source_thread_id: String,
+    pub summary: String,
+    pub idempotency_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_payload: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<PluginDeliveryArtifactReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_policy: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_delivery_attempts: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redelivery_window_seconds: Option<i64>,
+    pub target: PluginDeliveryTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_metadata: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDeliveryInspectRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_server_lease_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDeliveryManualizeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    pub manualize_key: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct PluginAppServerLeaseResponse {
@@ -266,6 +343,24 @@ pub struct PluginRpcError {
 }
 
 impl PluginRpcError {
+    pub fn new(kind: PluginRpcErrorKind, message: impl Into<String>) -> Self {
+        let retryable = matches!(
+            kind,
+            PluginRpcErrorKind::Io | PluginRpcErrorKind::TransientDaemonUnavailable
+        );
+        Self {
+            kind,
+            message: message.into(),
+            retryable,
+            details: None,
+        }
+    }
+
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
     pub fn malformed_frame(message: impl Into<String>) -> Self {
         Self {
             kind: PluginRpcErrorKind::MalformedFrame,
@@ -381,6 +476,18 @@ impl PluginRpcClient {
         )
         .await
         .context("cbth app_server.stop failed")
+    }
+
+    pub async fn delivery_enqueue(
+        &mut self,
+        request: PluginDeliveryEnqueueRequest,
+    ) -> Result<Value> {
+        self.request_value(
+            PLUGIN_RPC_DELIVERY_ENQUEUE_METHOD,
+            serde_json::to_value(request).context("failed to encode delivery.enqueue request")?,
+        )
+        .await
+        .context("cbth delivery.enqueue failed")
     }
 
     async fn request<T, U>(
@@ -832,6 +939,140 @@ mod tests {
 
         server.await.expect("server");
         std::fs::remove_file(socket_path).ok();
+    }
+
+    #[tokio::test]
+    async fn delivery_enqueue_replays_idempotency_key_against_fake_uds_server() {
+        let socket_path = test_socket_path("delivery-enqueue");
+        let listener = UnixListener::bind(&socket_path).expect("bind fake server");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+
+            for expected_state in ["accepted_observation_pending", "idempotent_replay"] {
+                let frame: PluginRpcRequestFrame =
+                    read_plugin_rpc_frame(&mut stream, PLUGIN_RPC_MAX_FRAME_BYTES)
+                        .await
+                        .expect("read delivery enqueue");
+                assert_eq!(frame.method, PLUGIN_RPC_DELIVERY_ENQUEUE_METHOD);
+                let request: PluginDeliveryEnqueueRequest =
+                    serde_json::from_value(frame.params).expect("decode delivery enqueue");
+                assert_eq!(request.source_thread_id, "thread-1");
+                assert_eq!(request.summary, "deliver async result");
+                assert_eq!(request.idempotency_key, "webex-delivery:event-1");
+                assert_eq!(request.target.driver, "codex_app_server");
+                assert_eq!(request.target.app_server_lease_id, None);
+                assert_eq!(request.target.codex_binary.as_deref(), Some("codex"));
+                write_plugin_rpc_frame(
+                    &mut stream,
+                    &PluginRpcResponseFrame::success(
+                        frame.id,
+                        json!({
+                            "delivery": {
+                                "idempotency_key": request.idempotency_key,
+                            },
+                            "target": {
+                                "driver": "codex_app_server",
+                                "ownership": "delivery_owned",
+                            },
+                            "driver_state": expected_state,
+                        }),
+                    ),
+                    PLUGIN_RPC_MAX_FRAME_BYTES,
+                )
+                .await
+                .expect("write delivery enqueue response");
+            }
+        });
+
+        let mut client = PluginRpcClient::connect(&socket_path)
+            .await
+            .expect("connect");
+        let request = delivery_enqueue_request();
+        let first = client
+            .delivery_enqueue(request.clone())
+            .await
+            .expect("first enqueue");
+        let replay = client
+            .delivery_enqueue(request)
+            .await
+            .expect("replay enqueue");
+
+        assert_eq!(first["driver_state"], "accepted_observation_pending");
+        assert_eq!(replay["driver_state"], "idempotent_replay");
+        server.await.expect("server");
+        std::fs::remove_file(socket_path).ok();
+    }
+
+    #[tokio::test]
+    async fn delivery_enqueue_preserves_retryable_rpc_error() {
+        let socket_path = test_socket_path("delivery-error");
+        let listener = UnixListener::bind(&socket_path).expect("bind fake server");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let frame: PluginRpcRequestFrame =
+                read_plugin_rpc_frame(&mut stream, PLUGIN_RPC_MAX_FRAME_BYTES)
+                    .await
+                    .expect("read delivery enqueue");
+            assert_eq!(frame.method, PLUGIN_RPC_DELIVERY_ENQUEUE_METHOD);
+            write_plugin_rpc_frame(
+                &mut stream,
+                &PluginRpcResponseFrame::failure(
+                    frame.id,
+                    PluginRpcError::new(
+                        PluginRpcErrorKind::TransientDaemonUnavailable,
+                        "daemon is restarting",
+                    ),
+                ),
+                PLUGIN_RPC_MAX_FRAME_BYTES,
+            )
+            .await
+            .expect("write delivery enqueue error");
+        });
+
+        let mut client = PluginRpcClient::connect(&socket_path)
+            .await
+            .expect("connect");
+        let error = client
+            .delivery_enqueue(delivery_enqueue_request())
+            .await
+            .expect_err("enqueue should fail");
+        let rpc_error = error
+            .downcast_ref::<PluginRpcError>()
+            .expect("plugin rpc error in chain");
+
+        assert_eq!(
+            rpc_error.kind,
+            PluginRpcErrorKind::TransientDaemonUnavailable
+        );
+        assert!(rpc_error.retryable);
+        server.await.expect("server");
+        std::fs::remove_file(socket_path).ok();
+    }
+
+    fn delivery_enqueue_request() -> PluginDeliveryEnqueueRequest {
+        PluginDeliveryEnqueueRequest {
+            source_thread_id: "thread-1".to_string(),
+            summary: "deliver async result".to_string(),
+            idempotency_key: "webex-delivery:event-1".to_string(),
+            inline_payload: Some(json!({
+                "kind": "webex_async_notification",
+                "text": "done",
+            })),
+            artifact: None,
+            delivery_policy: None,
+            max_delivery_attempts: Some(2),
+            redelivery_window_seconds: Some(3600),
+            target: PluginDeliveryTarget {
+                driver: "codex_app_server".to_string(),
+                app_server_lease_id: None,
+                managed_session_id: None,
+                session_epoch: None,
+                codex_binary: Some("codex".to_string()),
+            },
+            plugin_metadata: Some(json!({
+                "webex_event_id": "event-1",
+            })),
+        }
     }
 
     fn app_server_result(
