@@ -5,7 +5,7 @@ status: completed
 created: 2026-05-19
 updated: 2026-05-19
 branch: codex/w4-delivery-enqueue
-pr:
+pr: https://github.com/JoeyTeng/codex-webex-connector/pull/12
 supersedes: []
 superseded_by:
 ---
