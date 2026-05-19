@@ -1607,6 +1607,48 @@ async fn lifecycle_drain_persists_plugin_home_snapshot_before_reporting_complete
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 
+#[test]
+fn lifecycle_codex_in_flight_count_tracks_current_executable_work() {
+    let mut state = WorkerState::default();
+    state.set_executable_installation("ins_current");
+    state.upsert_session(managed_session_record(
+        "ses_idle",
+        SessionState::Idle,
+        false,
+        "ins_current",
+    ));
+    let mut running =
+        managed_session_record("ses_running", SessionState::Running, false, "ins_current");
+    running.active_turn_id = Some("turn_running".to_string());
+    state.upsert_session(running);
+    state.upsert_session(managed_session_record(
+        "ses_creating",
+        SessionState::Creating,
+        false,
+        "ins_current",
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_waiting",
+        SessionState::WaitingApproval,
+        false,
+        "ins_current",
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_foreign",
+        SessionState::Running,
+        false,
+        "ins_other",
+    ));
+    state.upsert_session(managed_session_record(
+        "ses_archived",
+        SessionState::Running,
+        true,
+        "ins_current",
+    ));
+
+    assert_eq!(state.lifecycle_codex_in_flight_count(), 3);
+}
+
 #[tokio::test]
 async fn lifecycle_quiesce_blocks_new_external_work_until_unquiesce() {
     let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));

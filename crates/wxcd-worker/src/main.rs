@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, mpsc, oneshot};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use wxcd_cbth_rpc::{
@@ -59,6 +59,7 @@ const ASYNC_NOTIFICATION_INGRESS_ACK_TIMEOUT: Duration =
     Duration::from_secs(C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS + 45);
 const PLUGIN_LIFECYCLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+const PLUGIN_LIFECYCLE_CODEX_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
 const WXCD_CBTH_LIFECYCLE_SOCKET_ENV: &str = "WXCD_CBTH_LIFECYCLE_SOCKET";
@@ -194,6 +195,14 @@ enum LifecycleCommand {
 enum LifecycleCommandResponse {
     Drain(PluginDrainResponse),
     Ack(PluginLifecycleAckResponse),
+}
+
+struct LifecycleCommandContext<'a, 'event_log> {
+    config: &'a AppConfig,
+    webex: &'a WebexClient,
+    event_log: &'a EventLog<'event_log>,
+    state: &'a mut WorkerState,
+    codex: &'a mut CodexClient,
 }
 
 struct LifecycleUnquiesceContext<'a, 'event_log> {
@@ -719,7 +728,19 @@ async fn run() -> Result<()> {
                                 )
                                 .await
                             }
-                            command => handle_lifecycle_command(&config, &mut state, command).await,
+                            command => {
+                                handle_lifecycle_command_with_runtime_drain(
+                                    LifecycleCommandContext {
+                                        config: &config,
+                                        webex: &webex,
+                                        event_log: &event_log,
+                                        state: &mut state,
+                                        codex: &mut codex,
+                                    },
+                                    command,
+                                )
+                                .await
+                            }
                         }.map_err(|error| format!("{error:#}"));
                         let shutdown_accepted = should_shutdown
                             && matches!(
@@ -2742,6 +2763,7 @@ async fn persist_snapshot(
     Ok(())
 }
 
+#[cfg(test)]
 async fn handle_lifecycle_command(
     config: &AppConfig,
     state: &mut WorkerState,
@@ -2764,6 +2786,114 @@ async fn handle_lifecycle_command(
             }))
         }
         LifecycleCommand::Unquiesce(_) => bail!("unquiesce must be handled by the worker loop"),
+    }
+}
+
+async fn handle_lifecycle_command_with_runtime_drain(
+    ctx: LifecycleCommandContext<'_, '_>,
+    command: LifecycleCommand,
+) -> Result<LifecycleCommandResponse> {
+    let mut ctx = ctx;
+    match command {
+        LifecycleCommand::Drain(request) => {
+            let in_flight_count = drain_codex_runtime(&mut ctx).await?;
+            persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+            if in_flight_count > 0 {
+                warn!(
+                    "lifecycle drain incomplete: {in_flight_count} Codex events or sessions remain in flight"
+                );
+                return Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                    drained: false,
+                    in_flight_count: Some(in_flight_count),
+                }));
+            }
+            info!("lifecycle drain completed: {}", request.reason);
+            Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                drained: true,
+                in_flight_count: Some(0),
+            }))
+        }
+        LifecycleCommand::Shutdown(request) => {
+            let in_flight_count = drain_codex_runtime(&mut ctx).await?;
+            persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+            if in_flight_count > 0 {
+                warn!(
+                    "lifecycle shutdown rejected: {in_flight_count} Codex events or sessions remain in flight"
+                );
+                return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                    accepted: false,
+                }));
+            }
+            write_supervisor_shutdown_marker(ctx.config, &request).await?;
+            info!("lifecycle shutdown accepted: {}", request.reason);
+            Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                accepted: true,
+            }))
+        }
+        LifecycleCommand::Unquiesce(_) => bail!("unquiesce must be handled by the worker loop"),
+    }
+}
+
+async fn drain_codex_runtime(ctx: &mut LifecycleCommandContext<'_, '_>) -> Result<u64> {
+    let deadline = Instant::now() + PLUGIN_LIFECYCLE_DRAIN_TIMEOUT;
+    loop {
+        process_pending_codex_events(ctx).await?;
+        let in_flight_count = lifecycle_runtime_in_flight_count(ctx);
+        if in_flight_count == 0 {
+            return Ok(0);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(in_flight_count);
+        }
+        let wait_interval = lifecycle_runtime_wait_interval(remaining);
+        match timeout(wait_interval, ctx.codex.events().recv()).await {
+            Ok(Some(event)) => {
+                handle_codex_event(
+                    ctx.config,
+                    ctx.webex,
+                    ctx.event_log,
+                    ctx.state,
+                    ctx.codex,
+                    event,
+                )
+                .await?;
+            }
+            Ok(None) => return Ok(lifecycle_runtime_in_flight_count(ctx)),
+            Err(_) => {}
+        }
+    }
+}
+
+async fn process_pending_codex_events(ctx: &mut LifecycleCommandContext<'_, '_>) -> Result<()> {
+    loop {
+        let event = match ctx.codex.events().try_recv() {
+            Ok(event) => event,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(()),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+        };
+        handle_codex_event(
+            ctx.config,
+            ctx.webex,
+            ctx.event_log,
+            ctx.state,
+            ctx.codex,
+            event,
+        )
+        .await?;
+    }
+}
+
+fn lifecycle_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_, '_>) -> u64 {
+    ctx.state.lifecycle_codex_in_flight_count() + ctx.codex.events().len() as u64
+}
+
+fn lifecycle_runtime_wait_interval(remaining: Duration) -> Duration {
+    if remaining < PLUGIN_LIFECYCLE_CODEX_DRAIN_POLL_INTERVAL {
+        remaining
+    } else {
+        PLUGIN_LIFECYCLE_CODEX_DRAIN_POLL_INTERVAL
     }
 }
 
@@ -4378,6 +4508,22 @@ impl WorkerState {
 
     fn should_index_session_thread(&self, session: &SessionRecord) -> bool {
         session.state != SessionState::Failed && self.should_route_session_room(session)
+    }
+
+    fn lifecycle_codex_in_flight_count(&self) -> u64 {
+        self.sessions
+            .values()
+            .filter(|session| self.should_route_session_room(session))
+            .filter(|session| {
+                session.active_turn_id.is_some()
+                    || matches!(
+                        session.state,
+                        SessionState::Creating
+                            | SessionState::Running
+                            | SessionState::WaitingApproval
+                    )
+            })
+            .count() as u64
     }
 
     fn remember_event(&mut self, event_id: &str) -> bool {
