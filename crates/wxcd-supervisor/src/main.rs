@@ -33,6 +33,7 @@ const PLUGIN_APP_SERVER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(6);
 const PLUGIN_DELIVERY_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(20);
 const PLUGIN_DELIVERY_BROKER_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 const PLUGIN_DELIVERY_BROKER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(6);
+const PLUGIN_DELIVERY_BROKER_SOCKET_DIR: &str = "/tmp";
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
 
@@ -426,10 +427,7 @@ async fn start_delivery_broker(
         );
         return Ok(None);
     }
-    tokio::fs::create_dir_all(state_dir)
-        .await
-        .with_context(|| format!("failed to create state dir {}", state_dir.display()))?;
-    let socket_path = delivery_broker_socket_path(state_dir);
+    let socket_path = delivery_broker_socket_path(config, state_dir);
     remove_stale_delivery_broker_socket(&socket_path).await?;
     let listener = UnixListener::bind(&socket_path).with_context(|| {
         format!(
@@ -640,8 +638,25 @@ fn supervisor_codex_binary() -> String {
     std::env::var("WXCD_CODEX_PATH").unwrap_or_else(|_| "codex".to_string())
 }
 
-fn delivery_broker_socket_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("wxcd-cbth-delivery-broker.sock")
+fn delivery_broker_socket_path(config: &CbthPluginConfig, state_dir: &Path) -> PathBuf {
+    Path::new(PLUGIN_DELIVERY_BROKER_SOCKET_DIR).join(format!(
+        "wxcd-delivery-{}.sock",
+        stable_fnv1a_hex(&format!(
+            "{}\n{}\n{}",
+            config.plugin_instance_id,
+            config.plugin_release_id,
+            state_dir.display()
+        ))
+    ))
+}
+
+fn stable_fnv1a_hex(value: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 async fn remove_stale_delivery_broker_socket(socket_path: &Path) -> Result<()> {
@@ -1049,6 +1064,32 @@ mod tests {
             .expect_err("explicit lease should fail");
 
         assert_eq!(error.kind, PluginRpcErrorKind::PolicyBlocked);
+    }
+
+    #[test]
+    fn delivery_broker_socket_path_stays_short_with_long_state_dir() {
+        let config = CbthPluginConfig {
+            enabled: true,
+            socket_path: Some("/tmp/cbth.sock".into()),
+            plugin_home: "/tmp/plugin".into(),
+            plugin_instance_id: "instance-with-a-long-managed-runtime-name".repeat(4),
+            plugin_release_id: "release-with-a-long-managed-runtime-name".repeat(4),
+            manifest_path: "/tmp/plugin/manifest.json".into(),
+        };
+        let long_state_dir = PathBuf::from(format!(
+            "/Users/very-long-managed-user-name/Library/Application Support/{}",
+            "codex-webex-connector/".repeat(8)
+        ));
+
+        let socket_path = delivery_broker_socket_path(&config, &long_state_dir);
+        let rendered = socket_path.to_string_lossy();
+
+        assert!(socket_path.starts_with(PLUGIN_DELIVERY_BROKER_SOCKET_DIR));
+        assert!(!socket_path.starts_with(&long_state_dir));
+        assert!(
+            rendered.len() < 80,
+            "broker socket path should stay comfortably below Unix socket path limits: {rendered}"
+        );
     }
 
     fn broker_delivery_request(target: PluginDeliveryTarget) -> PluginDeliveryEnqueueRequest {

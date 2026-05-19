@@ -21,6 +21,7 @@ superseded_by:
 - `wxcd-cbth-rpc` carries the merged C5 delivery request shape and a `delivery.enqueue` client method.
 - In explicit cbth plugin mode, `wxcd-supervisor` exposes the local delivery broker only when the cbth service advertises the C5 `delivery-owned-codex-app-server-target-v1` capability; otherwise W3 normal forwarding can still run and async notifications fail with an explicit broker-unavailable ACK.
 - The broker only accepts delivery-owned `codex_app_server` enqueue requests, strips worker-supplied target assertions, injects the supervisor-selected Codex binary, and rejects explicit lease targets.
+- The broker binds a short runtime socket under `/tmp` keyed by plugin/runtime identity, so long configured state directories do not prevent supervisor startup.
 - `wxcd-worker` accepts `async_notification` ingress events, resolves them to an existing Webex session/thread, builds stable idempotent inline-payload delivery requests, and leaves `message_created` session turns on the existing direct app-server path.
 
 ## Evidence
