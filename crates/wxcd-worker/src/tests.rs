@@ -1676,10 +1676,15 @@ async fn lifecycle_shutdown_writes_supervisor_marker_before_accepting() {
 fn pre_active_health_requires_quiesced_admission_fence() {
     let active = LifecycleControl::new(LifecycleAdmissionPhase::Active);
     let quiesced = LifecycleControl::new(LifecycleAdmissionPhase::Quiescing);
+    let shutting_down = LifecycleControl::new(LifecycleAdmissionPhase::ShuttingDown);
     let request = PluginHealthCheckRequest::pre_active();
+    let active_request = PluginHealthCheckRequest::active();
 
     assert!(!active.health_check(&request, true).healthy);
     assert!(quiesced.health_check(&request, true).healthy);
+    assert!(!quiesced.health_check(&active_request, true).healthy);
+    assert!(!shutting_down.health_check(&request, true).healthy);
+    assert!(!shutting_down.health_check(&active_request, true).healthy);
 }
 
 #[test]

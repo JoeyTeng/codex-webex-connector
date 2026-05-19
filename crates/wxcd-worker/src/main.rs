@@ -293,10 +293,13 @@ impl LifecycleControl {
     async fn wait_until_drained(&self, timeout_after: Duration) -> bool {
         timeout(timeout_after, async {
             loop {
+                let notified = self.drained.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if self.in_flight_count() == 0 {
                     return;
                 }
-                self.drained.notified().await;
+                notified.await;
             }
         })
         .await
@@ -329,14 +332,31 @@ impl LifecycleControl {
             };
         }
 
+        let phase = self.phase();
+        if phase == LifecycleAdmissionPhase::ShuttingDown {
+            return PluginHealthCheckResponse {
+                healthy: false,
+                message: Some("worker is shutting down".to_string()),
+            };
+        }
+
         if matches!(request.mode, PluginLifecycleMode::PreActive)
-            && self.phase() == LifecycleAdmissionPhase::Active
+            && phase == LifecycleAdmissionPhase::Active
         {
             return PluginHealthCheckResponse {
                 healthy: false,
                 message: Some(
                     "pre-active health check requires quiesced Webex work admission".to_string(),
                 ),
+            };
+        }
+
+        if matches!(request.mode, PluginLifecycleMode::Active)
+            && phase != LifecycleAdmissionPhase::Active
+        {
+            return PluginHealthCheckResponse {
+                healthy: false,
+                message: Some("worker is quiesced and not accepting Webex work".to_string()),
             };
         }
 
