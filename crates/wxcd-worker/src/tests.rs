@@ -20,8 +20,8 @@ use super::{
     repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
     session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
     should_process_async_notification_event, slice_thread_history_page,
-    validate_purge_archived_session, webex_delivery_idempotency_key, worker_active_check_ack,
-    write_supervisor_shutdown_marker_at,
+    validate_purge_archived_session, wait_for_lifecycle_response_flush,
+    webex_delivery_idempotency_key, worker_active_check_ack, write_supervisor_shutdown_marker_at,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -1799,6 +1799,15 @@ async fn lifecycle_command_response_preserves_typed_worker_errors() {
 
     assert_eq!(error.kind, PluginRpcErrorKind::TransientDaemonUnavailable);
     assert!(error.retryable);
+}
+
+#[tokio::test]
+async fn lifecycle_response_flush_reports_dropped_writer() {
+    let (flushed_tx, flushed_rx) = tokio::sync::oneshot::channel();
+    drop(flushed_tx);
+
+    assert!(!wait_for_lifecycle_response_flush(Some(flushed_rx)).await);
+    assert!(wait_for_lifecycle_response_flush(None).await);
 }
 
 #[tokio::test]

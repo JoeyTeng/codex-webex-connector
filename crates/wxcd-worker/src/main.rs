@@ -199,7 +199,10 @@ struct QueuedLifecycleCommand {
 
 enum LifecycleCommand {
     Drain(PluginDrainRequest),
-    Shutdown(PluginShutdownRequest),
+    Shutdown {
+        request: PluginShutdownRequest,
+        previous_phase: LifecycleAdmissionPhase,
+    },
     Unquiesce {
         request: PluginUnquiesceRequest,
         token: LifecycleTransitionToken,
@@ -792,7 +795,12 @@ async fn run() -> Result<()> {
                             )));
                             continue;
                         }
-                        let should_shutdown = matches!(&command, LifecycleCommand::Shutdown(_));
+                        let shutdown_previous_phase = match &command {
+                            LifecycleCommand::Shutdown { previous_phase, .. } => {
+                                Some(*previous_phase)
+                            }
+                            _ => None,
+                        };
                         let result = match command {
                             LifecycleCommand::Unquiesce { request, token } => {
                                 handle_lifecycle_unquiesce(
@@ -829,16 +837,28 @@ async fn run() -> Result<()> {
                         }.map_err(|error| {
                             PluginRpcError::new(PluginRpcErrorKind::Internal, format!("{error:#}"))
                         });
-                        let shutdown_accepted = should_shutdown
+                        let shutdown_accepted = shutdown_previous_phase.is_some()
                             && matches!(
                                 result.as_ref(),
                                 Ok(LifecycleCommandResponse::Ack(response)) if response.accepted
                             );
-                        let _ = completion.send(result);
                         if shutdown_accepted {
-                            wait_for_lifecycle_response_flush(response_flushed).await;
-                            info!("lifecycle shutdown requested, stopping worker");
-                            break;
+                            let completion_delivered = completion.send(result).is_ok();
+                            if completion_delivered
+                                && wait_for_lifecycle_response_flush(response_flushed).await
+                            {
+                                info!("lifecycle shutdown requested, stopping worker");
+                                break;
+                            }
+                            if let Some(previous_phase) = shutdown_previous_phase {
+                                lifecycle.restore_shutdown_phase(previous_phase);
+                            }
+                            clear_supervisor_shutdown_marker().await;
+                            warn!(
+                                "lifecycle shutdown accepted locally but response was not delivered; continuing worker"
+                            );
+                        } else {
+                            let _ = completion.send(result);
                         }
                     }
                 }
@@ -2865,7 +2885,7 @@ async fn handle_lifecycle_command(
                 in_flight_count: Some(0),
             }))
         }
-        LifecycleCommand::Shutdown(request) => {
+        LifecycleCommand::Shutdown { request, .. } => {
             write_supervisor_shutdown_marker(config, &request).await?;
             info!("lifecycle shutdown accepted: {}", request.reason);
             Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
@@ -2915,7 +2935,7 @@ async fn handle_lifecycle_command_with_runtime_drain(
                 in_flight_count: Some(0),
             }))
         }
-        LifecycleCommand::Shutdown(request) => {
+        LifecycleCommand::Shutdown { request, .. } => {
             let ingress_in_flight_count = ctx.lifecycle.in_flight_count();
             if ingress_in_flight_count > 0 {
                 persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
@@ -3080,17 +3100,25 @@ async fn handle_lifecycle_unquiesce(
     }))
 }
 
-async fn wait_for_lifecycle_response_flush(response_flushed: Option<oneshot::Receiver<()>>) {
+async fn wait_for_lifecycle_response_flush(
+    response_flushed: Option<oneshot::Receiver<()>>,
+) -> bool {
     let Some(response_flushed) = response_flushed else {
-        return;
+        return true;
     };
     match timeout(PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT, response_flushed).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => warn!("lifecycle shutdown response writer dropped before flush confirmation"),
-        Err(_) => warn!(
-            "timed out after {}s waiting for lifecycle shutdown response flush",
-            PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT.as_secs()
-        ),
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => {
+            warn!("lifecycle shutdown response writer dropped before flush confirmation");
+            false
+        }
+        Err(_) => {
+            warn!(
+                "timed out after {}s waiting for lifecycle shutdown response flush",
+                PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT.as_secs()
+            );
+            false
+        }
     }
 }
 
@@ -3177,6 +3205,20 @@ fn supervisor_shutdown_marker_path() -> Option<PathBuf> {
         None
     } else {
         Some(PathBuf::from(path))
+    }
+}
+
+async fn clear_supervisor_shutdown_marker() {
+    let Some(path) = supervisor_shutdown_marker_path() else {
+        return;
+    };
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            "failed to clear supervisor shutdown marker {} after undelivered shutdown response: {error:#}",
+            path.display()
+        ),
     }
 }
 
@@ -3382,7 +3424,10 @@ async fn handle_lifecycle_rpc_frame(
                         response_flushed = Some(flushed_tx);
                         match lifecycle_command_response(
                             events_tx,
-                            LifecycleCommand::Shutdown(request),
+                            LifecycleCommand::Shutdown {
+                                request,
+                                previous_phase,
+                            },
                             Some(flushed_rx),
                         )
                         .await

@@ -294,15 +294,21 @@ async function forwardMessage(payload) {
   if (!message.text || personEmail === botEmail) {
     return;
   }
-  await sendEnvelope({
-    kind: "message_created",
-    event_id: ingressEventId(payload),
-    room_id: message.roomId,
-    message_id: message.id,
-    person_email: personEmail,
-    text: message.text,
-    created: message.created || new Date().toISOString(),
-  });
+  await sendEnvelope(
+    {
+      kind: "message_created",
+      event_id: ingressEventId(payload),
+      room_id: message.roomId,
+      message_id: message.id,
+      person_email: personEmail,
+      text: message.text,
+      created: message.created || new Date().toISOString(),
+    },
+    {
+      retryLifecycleRejection: true,
+      retryUnavailable: true,
+    }
+  );
 }
 
 async function forwardAttachmentAction(payload) {
@@ -311,16 +317,22 @@ async function forwardAttachmentAction(payload) {
   if (personEmail === botEmail) {
     return;
   }
-  await sendEnvelope({
-    kind: "attachment_action_created",
-    event_id: ingressEventId(payload),
-    room_id: action.roomId,
-    attachment_action_id: action.id,
-    person_email: personEmail,
-    message_id: action.messageId || null,
-    inputs: action.inputs || {},
-    created: action.created || new Date().toISOString(),
-  });
+  await sendEnvelope(
+    {
+      kind: "attachment_action_created",
+      event_id: ingressEventId(payload),
+      room_id: action.roomId,
+      attachment_action_id: action.id,
+      person_email: personEmail,
+      message_id: action.messageId || null,
+      inputs: action.inputs || {},
+      created: action.created || new Date().toISOString(),
+    },
+    {
+      retryLifecycleRejection: true,
+      retryUnavailable: true,
+    }
+  );
 }
 
 async function main() {
