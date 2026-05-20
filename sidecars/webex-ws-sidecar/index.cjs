@@ -78,9 +78,6 @@ function queueSidecarDrainStateWrite() {
         `${JSON.stringify(snapshot, null, 2)}\n`,
         "utf8"
       );
-    })
-    .catch((error) => {
-      console.error("failed to persist sidecar drain state", error);
     });
   return sidecarDrainStateWrite;
 }
@@ -90,7 +87,11 @@ async function clearSidecarDrainState() {
     return;
   }
   sidecarInFlightCount = 0;
-  await queueSidecarDrainStateWrite();
+  try {
+    await queueSidecarDrainStateWrite();
+  } catch (error) {
+    console.error("failed to persist cleared sidecar drain state", error);
+  }
   try {
     await fs.rm(sidecarDrainStatePath, { force: true });
   } catch (error) {
@@ -100,12 +101,23 @@ async function clearSidecarDrainState() {
 
 async function withSidecarDrainTracking(callback) {
   sidecarInFlightCount += 1;
-  await queueSidecarDrainStateWrite();
+  try {
+    await queueSidecarDrainStateWrite();
+  } catch (error) {
+    sidecarInFlightCount = Math.max(0, sidecarInFlightCount - 1);
+    console.error("failed to persist sidecar drain state before processing ingress", error);
+    throw error;
+  }
   try {
     return await callback();
   } finally {
     sidecarInFlightCount = Math.max(0, sidecarInFlightCount - 1);
-    await queueSidecarDrainStateWrite();
+    try {
+      await queueSidecarDrainStateWrite();
+    } catch (error) {
+      console.error("failed to persist sidecar drain state after processing ingress", error);
+      throw error;
+    }
   }
 }
 

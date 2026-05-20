@@ -2125,6 +2125,36 @@ fn sidecar_active_check_waits_for_unquiesce() {
 }
 
 #[test]
+fn lifecycle_unquiesce_activation_claim_fences_new_transitions() {
+    let lifecycle = LifecycleControl::new(LifecycleAdmissionPhase::Quiescing);
+    let token = lifecycle
+        .prepare_unquiesce()
+        .expect("quiesced lifecycle prepares unquiesce");
+    let activation = lifecycle
+        .begin_unquiesce_activation(token)
+        .expect("current unquiesce token is claimed");
+
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Activating);
+    assert!(lifecycle.begin_quiesce().is_none());
+    assert!(lifecycle.begin_shutdown().is_none());
+    assert!(!lifecycle.unquiesce_if_current(token));
+    assert!(lifecycle.complete_unquiesce_activation(activation));
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Active);
+}
+
+#[test]
+fn lifecycle_cancelled_unquiesce_does_not_claim_activation() {
+    let lifecycle = LifecycleControl::new(LifecycleAdmissionPhase::Quiescing);
+    let stale = lifecycle
+        .prepare_unquiesce()
+        .expect("quiesced lifecycle prepares unquiesce");
+    assert!(lifecycle.quiesce());
+
+    assert!(lifecycle.begin_unquiesce_activation(stale).is_none());
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Quiescing);
+}
+
+#[test]
 fn executable_indexes_only_include_current_installation_sessions() {
     let installation_id = "ins_current";
     let mut state = WorkerState::default();

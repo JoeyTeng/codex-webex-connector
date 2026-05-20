@@ -248,6 +248,7 @@ struct LifecycleRpcResponse {
 enum LifecycleAdmissionPhase {
     Active,
     Quiescing,
+    Activating,
     ShuttingDown,
 }
 
@@ -309,7 +310,7 @@ impl LifecycleControl {
                     generation: state.generation,
                 })
             }
-            LifecycleAdmissionPhase::ShuttingDown => None,
+            LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown => None,
         }
     }
 
@@ -326,6 +327,46 @@ impl LifecycleControl {
         state.phase == LifecycleAdmissionPhase::Quiescing && state.generation == token.generation
     }
 
+    fn begin_unquiesce_activation(
+        &self,
+        token: LifecycleTransitionToken,
+    ) -> Option<LifecycleTransitionToken> {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        if state.phase != LifecycleAdmissionPhase::Quiescing || state.generation != token.generation
+        {
+            return None;
+        }
+        state.phase = LifecycleAdmissionPhase::Activating;
+        state.generation = state.generation.wrapping_add(1);
+        Some(LifecycleTransitionToken {
+            generation: state.generation,
+        })
+    }
+
+    fn complete_unquiesce_activation(&self, token: LifecycleTransitionToken) -> bool {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        if state.phase != LifecycleAdmissionPhase::Activating
+            || state.generation != token.generation
+        {
+            return false;
+        }
+        state.phase = LifecycleAdmissionPhase::Active;
+        state.generation = state.generation.wrapping_add(1);
+        state.phase_started_at = Utc::now();
+        true
+    }
+
+    fn cancel_unquiesce_activation(&self, token: LifecycleTransitionToken) {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        if state.phase == LifecycleAdmissionPhase::Activating
+            && state.generation == token.generation
+        {
+            state.phase = LifecycleAdmissionPhase::Quiescing;
+            state.generation = state.generation.wrapping_add(1);
+            state.phase_started_at = Utc::now();
+        }
+    }
+
     fn prepare_unquiesce(&self) -> Option<LifecycleTransitionToken> {
         let state = self.phase.lock().expect("lifecycle phase poisoned");
         match state.phase {
@@ -334,14 +375,16 @@ impl LifecycleControl {
                     generation: state.generation,
                 })
             }
-            LifecycleAdmissionPhase::ShuttingDown => None,
+            LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown => None,
         }
     }
 
     fn unquiesce_if_current(&self, token: LifecycleTransitionToken) -> bool {
         let mut state = self.phase.lock().expect("lifecycle phase poisoned");
-        if state.phase == LifecycleAdmissionPhase::ShuttingDown
-            || state.generation != token.generation
+        if matches!(
+            state.phase,
+            LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown
+        ) || state.generation != token.generation
         {
             return false;
         }
@@ -354,7 +397,7 @@ impl LifecycleControl {
     fn begin_shutdown(&self) -> Option<LifecyclePhaseState> {
         let mut state = self.phase.lock().expect("lifecycle phase poisoned");
         match state.phase {
-            LifecycleAdmissionPhase::ShuttingDown => None,
+            LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown => None,
             LifecycleAdmissionPhase::Active | LifecycleAdmissionPhase::Quiescing => {
                 let previous = *state;
                 state.phase = LifecycleAdmissionPhase::ShuttingDown;
@@ -392,6 +435,9 @@ impl LifecycleControl {
             LifecycleAdmissionPhase::Quiescing => {
                 Err("plugin is quiescing and is not accepting new Webex work".to_string())
             }
+            LifecycleAdmissionPhase::Activating => {
+                Err("plugin is activating and is not accepting new Webex work".to_string())
+            }
             LifecycleAdmissionPhase::ShuttingDown => {
                 Err("plugin is shutting down and is not accepting new Webex work".to_string())
             }
@@ -423,6 +469,9 @@ impl LifecycleControl {
                 } else {
                     Err("plugin is quiescing and is not accepting new Webex work".to_string())
                 }
+            }
+            LifecycleAdmissionPhase::Activating => {
+                Err("plugin is activating and is not accepting new Webex work".to_string())
             }
             LifecycleAdmissionPhase::ShuttingDown => {
                 if sidecar_received_at
@@ -3318,7 +3367,22 @@ async fn handle_lifecycle_unquiesce(
         }));
     }
     if *ctx.startup_reconcile_pending {
-        reconcile_sessions(
+        let Some(activation_token) = ctx.lifecycle.begin_unquiesce_activation(token) else {
+            return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                accepted: false,
+            }));
+        };
+        if Instant::now() >= ctx.response_expires_at {
+            ctx.lifecycle.cancel_unquiesce_activation(activation_token);
+            warn!(
+                "lifecycle unquiesce expired before startup reconcile: {}",
+                request.reason
+            );
+            return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                accepted: false,
+            }));
+        }
+        if let Err(error) = reconcile_sessions(
             ctx.config,
             ctx.webex,
             ctx.event_log,
@@ -3326,8 +3390,29 @@ async fn handle_lifecycle_unquiesce(
             ctx.codex,
             ctx.installation,
         )
-        .await?;
+        .await
+        {
+            ctx.lifecycle.cancel_unquiesce_activation(activation_token);
+            return Err(error);
+        }
         *ctx.startup_reconcile_pending = false;
+        if Instant::now() >= ctx.response_expires_at {
+            ctx.lifecycle.cancel_unquiesce_activation(activation_token);
+            warn!(
+                "lifecycle unquiesce expired after startup reconcile: {}",
+                request.reason
+            );
+            return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                accepted: false,
+            }));
+        }
+        let accepted = ctx
+            .lifecycle
+            .complete_unquiesce_activation(activation_token);
+        info!("lifecycle unquiesce completed: {}", request.reason);
+        return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+            accepted,
+        }));
     }
     if Instant::now() >= ctx.response_expires_at {
         warn!(
@@ -4043,6 +4128,9 @@ fn worker_active_check_ack(
         detail: Some(match phase {
             LifecycleAdmissionPhase::Quiescing => {
                 "worker is quiescing and not accepting new Webex work".to_string()
+            }
+            LifecycleAdmissionPhase::Activating => {
+                "worker is activating and not accepting new Webex work".to_string()
             }
             LifecycleAdmissionPhase::ShuttingDown => "worker is shutting down".to_string(),
             LifecycleAdmissionPhase::Active => unreachable!("active phase handled above"),

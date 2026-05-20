@@ -1033,11 +1033,13 @@ fn plugin_hello_request(config: &CbthPluginConfig) -> PluginHelloRequest {
 }
 
 fn supervisor_shutdown_marker_path(config: &CbthPluginConfig) -> PathBuf {
+    let scope_hash = stable_fnv1a_hex(&format!(
+        "{}\n{}",
+        config.plugin_instance_id, config.plugin_release_id
+    ));
     config.plugin_home.join(format!(
-        "{}-{}--{}.json",
-        SUPERVISOR_SHUTDOWN_MARKER_FILE_PREFIX,
-        ascii_token_component(&config.plugin_instance_id),
-        ascii_token_component(&config.plugin_release_id)
+        "{}-{}.json",
+        SUPERVISOR_SHUTDOWN_MARKER_FILE_PREFIX, scope_hash
     ))
 }
 
@@ -1437,8 +1439,10 @@ mod tests {
 
         assert_eq!(
             supervisor_shutdown_marker_path(&config),
-            PathBuf::from("/tmp/plugin-home")
-                .join("supervisor-shutdown-requested-instance-1--release-1.json")
+            PathBuf::from("/tmp/plugin-home").join(format!(
+                "supervisor-shutdown-requested-{}.json",
+                stable_fnv1a_hex("instance-1\nrelease-1")
+            ))
         );
     }
 
@@ -1461,6 +1465,25 @@ mod tests {
             supervisor_shutdown_marker_path(&current),
             supervisor_shutdown_marker_path(&previous)
         );
+    }
+
+    #[test]
+    fn supervisor_shutdown_marker_filename_is_bounded() {
+        let config = CbthPluginConfig {
+            enabled: true,
+            socket_path: Some("/tmp/cbth.sock".into()),
+            plugin_home: "/tmp/plugin-home".into(),
+            plugin_instance_id: "instance-".repeat(128),
+            plugin_release_id: "release-".repeat(128),
+            manifest_path: "/tmp/plugin/manifest.json".into(),
+        };
+        let marker_path = supervisor_shutdown_marker_path(&config);
+        let file_name = marker_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("marker path has UTF-8 file name");
+
+        assert!(file_name.len() < 255, "{file_name}");
     }
 
     #[tokio::test]
