@@ -29,7 +29,7 @@ const deferredIngressReplayMaxAgeMs = Number.parseInt(
 );
 const sidecarDrainStateHeartbeatMs = 30000;
 const pluginHome = process.env.WXCD_PLUGIN_HOME || process.env.CBTH_PLUGIN_HOME || "";
-const pluginInstanceId = process.env.WXCD_PLUGIN_INSTANCE_ID || "standalone";
+const pluginInstanceId = process.env.WXCD_PLUGIN_INSTANCE_ID || defaultPluginInstanceId(pluginHome);
 const pluginReleaseId = process.env.WXCD_PLUGIN_RELEASE_ID || process.env.CBTH_PLUGIN_RELEASE_ID || "unknown";
 const deferredIngressDir = pluginHome ? path.join(pluginHome, "webex-sidecar-deferred-ingress") : "";
 const deferredIngressQuarantineDir = pluginHome
@@ -81,6 +81,10 @@ function stableFnv1aHex(value) {
     hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
   }
   return hash.toString(16).padStart(16, "0");
+}
+
+function defaultPluginInstanceId(pluginHomePath) {
+  return pluginHomePath ? `plugin-home-${stableFnv1aHex(pluginHomePath)}` : "standalone";
 }
 
 function finitePositiveDurationMs(value, fallback) {

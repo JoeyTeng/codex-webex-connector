@@ -25,10 +25,11 @@ use super::{
     should_process_async_notification_event, should_process_codex_events,
     sidecar_drain_in_flight_count, sidecar_drain_in_flight_count_after,
     sidecar_drain_state_file_prefix, sidecar_drain_state_liveness, sidecar_received_before_cutoff,
-    slice_thread_history_page, stable_fnv1a_hex, startup_snapshot_persist_now,
-    validate_purge_archived_session, wait_for_lifecycle_response_flush,
-    webex_delivery_idempotency_key, worker_active_check_ack, worker_ingress_socket_path_for,
-    worker_ingress_socket_path_from_env, write_supervisor_shutdown_marker_at,
+    slice_thread_history_page, stable_fnv1a_hex, startup_reconcile_required,
+    startup_snapshot_persist_now, validate_purge_archived_session,
+    wait_for_lifecycle_response_flush, webex_delivery_idempotency_key, worker_active_check_ack,
+    worker_ingress_socket_path_for, worker_ingress_socket_path_from_env,
+    write_supervisor_shutdown_marker_at,
 };
 use chrono::{Duration, TimeZone, Utc};
 use serde_json::json;
@@ -1646,6 +1647,13 @@ fn pre_active_startup_gates_codex_event_processing() {
 fn pre_active_lifecycle_does_not_drain_codex_runtime() {
     assert!(!should_drain_codex_runtime(true));
     assert!(should_drain_codex_runtime(false));
+}
+
+#[test]
+fn completed_pre_active_reconcile_keeps_codex_events_gated_until_activation() {
+    assert!(startup_reconcile_required(true, false));
+    assert!(!startup_reconcile_required(true, true));
+    assert!(!should_process_codex_events(true));
 }
 
 #[tokio::test]

@@ -248,6 +248,7 @@ struct LifecycleUnquiesceContext<'a, 'event_log> {
     installation: &'a InstallationIdentity,
     lifecycle: &'a LifecycleControl,
     startup_reconcile_pending: &'a mut bool,
+    startup_reconcile_completed: &'a mut bool,
     startup_snapshot_persist_pending: &'a mut bool,
     response_expires_at: Instant,
 }
@@ -759,6 +760,7 @@ async fn run() -> Result<()> {
     let initial_lifecycle_phase = initial_lifecycle_phase(&config.bridge.cbth_plugin);
     let mut startup_reconcile_pending =
         initial_lifecycle_phase == LifecycleAdmissionPhase::Quiescing;
+    let mut startup_reconcile_completed = !startup_reconcile_pending;
     let mut startup_snapshot_persist_pending = false;
 
     let event_log = EventLog::new(&webex, &data_room.id);
@@ -998,6 +1000,7 @@ async fn run() -> Result<()> {
                                         installation: &installation,
                                         lifecycle: lifecycle.as_ref(),
                                         startup_reconcile_pending: &mut startup_reconcile_pending,
+                                        startup_reconcile_completed: &mut startup_reconcile_completed,
                                         startup_snapshot_persist_pending: &mut startup_snapshot_persist_pending,
                                         response_expires_at,
                                     },
@@ -3623,7 +3626,11 @@ async fn handle_lifecycle_unquiesce(
                 accepted: false,
             }));
         };
-        if Instant::now() >= ctx.response_expires_at {
+        if startup_reconcile_required(
+            *ctx.startup_reconcile_pending,
+            *ctx.startup_reconcile_completed,
+        ) && Instant::now() >= ctx.response_expires_at
+        {
             ctx.lifecycle.cancel_unquiesce_activation(activation_token);
             warn!(
                 "lifecycle unquiesce expired before startup reconcile: {}",
@@ -3633,18 +3640,24 @@ async fn handle_lifecycle_unquiesce(
                 accepted: false,
             }));
         }
-        if let Err(error) = reconcile_sessions(
-            ctx.config,
-            ctx.webex,
-            ctx.event_log,
-            ctx.state,
-            ctx.codex,
-            ctx.installation,
-        )
-        .await
-        {
-            ctx.lifecycle.cancel_unquiesce_activation(activation_token);
-            return Err(error);
+        if startup_reconcile_required(
+            *ctx.startup_reconcile_pending,
+            *ctx.startup_reconcile_completed,
+        ) {
+            if let Err(error) = reconcile_sessions(
+                ctx.config,
+                ctx.webex,
+                ctx.event_log,
+                ctx.state,
+                ctx.codex,
+                ctx.installation,
+            )
+            .await
+            {
+                ctx.lifecycle.cancel_unquiesce_activation(activation_token);
+                return Err(error);
+            }
+            *ctx.startup_reconcile_completed = true;
         }
         if *ctx.startup_snapshot_persist_pending {
             if let Err(error) = persist_snapshot(ctx.event_log, ctx.state, ctx.config).await {
@@ -3752,6 +3765,13 @@ fn lifecycle_control_socket_path_from_env(
 
 fn should_process_codex_events(startup_reconcile_pending: bool) -> bool {
     !startup_reconcile_pending
+}
+
+fn startup_reconcile_required(
+    startup_reconcile_pending: bool,
+    startup_reconcile_completed: bool,
+) -> bool {
+    startup_reconcile_pending && !startup_reconcile_completed
 }
 
 fn default_lifecycle_control_socket_path(config: &CbthPluginConfig) -> PathBuf {
