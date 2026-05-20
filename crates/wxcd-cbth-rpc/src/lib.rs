@@ -608,6 +608,32 @@ impl PluginRpcClient {
         .context("cbth delivery.enqueue failed")
     }
 
+    pub async fn plugin_handoff_export(
+        &mut self,
+        request: PluginHandoffExportRequest,
+    ) -> Result<PluginHandoffExportResponse> {
+        self.request(
+            PLUGIN_RPC_PLUGIN_HANDOFF_EXPORT_METHOD,
+            request,
+            "failed to decode plugin.handoff_export response",
+        )
+        .await
+        .context("cbth plugin.handoff_export failed")
+    }
+
+    pub async fn plugin_handoff_import(
+        &mut self,
+        request: PluginHandoffImportRequest,
+    ) -> Result<PluginLifecycleAckResponse> {
+        self.request(
+            PLUGIN_RPC_PLUGIN_HANDOFF_IMPORT_METHOD,
+            request,
+            "failed to decode plugin.handoff_import response",
+        )
+        .await
+        .context("cbth plugin.handoff_import failed")
+    }
+
     async fn request<T, U>(
         &mut self,
         method: &str,
@@ -1199,6 +1225,51 @@ mod tests {
             json!({
                 "drained": false,
                 "in_flight_count": 2,
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_handoff_requests_serialize_optional_c7_contract() {
+        let snapshot = PluginHandoffSnapshot {
+            schema_version: 1,
+            payload: json!({
+                "plugin_name": "webex-connector",
+                "recent_webex_event_ids": ["event-1"],
+            }),
+        };
+        let export = PluginRpcRequestFrame::new(
+            "handoff-export-1",
+            PLUGIN_RPC_PLUGIN_HANDOFF_EXPORT_METHOD,
+            serde_json::to_value(PluginHandoffExportRequest {
+                reason: "upgrade".to_string(),
+            })
+            .unwrap(),
+        );
+        let import = PluginRpcRequestFrame::new(
+            "handoff-import-1",
+            PLUGIN_RPC_PLUGIN_HANDOFF_IMPORT_METHOD,
+            serde_json::to_value(PluginHandoffImportRequest {
+                reason: "upgrade".to_string(),
+                snapshot: snapshot.clone(),
+            })
+            .unwrap(),
+        );
+
+        assert_eq!(export.method, PLUGIN_RPC_PLUGIN_HANDOFF_EXPORT_METHOD);
+        assert_eq!(export.params, json!({"reason": "upgrade"}));
+        assert_eq!(import.method, PLUGIN_RPC_PLUGIN_HANDOFF_IMPORT_METHOD);
+        assert_eq!(
+            import.params,
+            json!({
+                "reason": "upgrade",
+                "snapshot": {
+                    "schema_version": 1,
+                    "payload": {
+                        "plugin_name": "webex-connector",
+                        "recent_webex_event_ids": ["event-1"],
+                    },
+                },
             })
         );
     }

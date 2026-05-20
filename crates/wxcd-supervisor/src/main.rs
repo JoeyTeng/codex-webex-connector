@@ -15,11 +15,11 @@ use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use wxcd_cbth_rpc::{
-    PLUGIN_RPC_PLUGIN_LIFECYCLE_CAPABILITY, PLUGIN_RPC_PROTOCOL_VERSION_V1,
-    PluginAppServerEnsureRequest, PluginAppServerRefreshRequest, PluginAppServerStopRequest,
-    PluginCapability, PluginDeliveryEnqueueRequest, PluginDeliveryTarget, PluginHelloRequest,
-    PluginHelloResponse, PluginRpcClient, PluginRpcError, PluginRpcErrorKind,
-    PluginRpcRequestFrame, PluginRpcResponseFrame,
+    PLUGIN_RPC_PLUGIN_HANDOFF_CAPABILITY, PLUGIN_RPC_PLUGIN_LIFECYCLE_CAPABILITY,
+    PLUGIN_RPC_PROTOCOL_VERSION_V1, PluginAppServerEnsureRequest, PluginAppServerRefreshRequest,
+    PluginAppServerStopRequest, PluginCapability, PluginDeliveryEnqueueRequest,
+    PluginDeliveryTarget, PluginHelloRequest, PluginHelloResponse, PluginRpcClient, PluginRpcError,
+    PluginRpcErrorKind, PluginRpcRequestFrame, PluginRpcResponseFrame,
     SERVICE_CAPABILITY_DELIVERY_OWNED_CODEX_APP_SERVER_TARGET_V1, read_plugin_rpc_frame,
     write_plugin_rpc_frame,
 };
@@ -1079,6 +1079,7 @@ fn plugin_hello_request(config: &CbthPluginConfig) -> PluginHelloRequest {
             PluginCapability::new("diagnostics"),
             PluginCapability::new("standalone-compatible"),
             PluginCapability::new(PLUGIN_RPC_PLUGIN_LIFECYCLE_CAPABILITY),
+            PluginCapability::new(PLUGIN_RPC_PLUGIN_HANDOFF_CAPABILITY),
         ],
         plugin_home: config.plugin_home.display().to_string(),
         pid: std::process::id(),
@@ -1275,6 +1276,33 @@ mod tests {
         assert_eq!(
             request.lease_ttl_seconds,
             Some(PLUGIN_APP_SERVER_LEASE_TTL_SECONDS)
+        );
+    }
+
+    #[test]
+    fn plugin_hello_advertises_lifecycle_handoff_capability() {
+        let config = CbthPluginConfig {
+            enabled: true,
+            socket_path: Some("/tmp/cbth.sock".into()),
+            plugin_home: "/tmp/plugin".into(),
+            plugin_instance_id: "instance-1".to_string(),
+            plugin_release_id: "release-1".to_string(),
+            manifest_path: "/tmp/plugin/manifest.json".into(),
+        };
+
+        let request = plugin_hello_request(&config);
+
+        assert!(
+            request
+                .capabilities
+                .iter()
+                .any(|capability| { capability.name == PLUGIN_RPC_PLUGIN_LIFECYCLE_CAPABILITY })
+        );
+        assert!(
+            request
+                .capabilities
+                .iter()
+                .any(|capability| { capability.name == PLUGIN_RPC_PLUGIN_HANDOFF_CAPABILITY })
         );
     }
 

@@ -19,6 +19,9 @@
     },
     {
       "name": "plugin-lifecycle-v1"
+    },
+    {
+      "name": "plugin-handoff-v1"
     }
   ],
   "config_schema": {
