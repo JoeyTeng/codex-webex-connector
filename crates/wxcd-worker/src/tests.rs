@@ -11,13 +11,13 @@ use super::{
     ingress_requires_processing_ack, ingress_uses_delivery_enqueue,
     initial_lifecycle_phase_from_env, is_control_list_session, is_default_list_session,
     is_failed_session_room_command, lifecycle_control_socket_path_from_env,
-    load_durable_local_snapshot_with_metadata, load_local_snapshot_with_metadata,
-    load_or_create_installation_identity, normalize_control_command_text,
-    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
-    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
-    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
-    resolve_codex_connection, resolve_delivery_broker_connection, session_belongs_to_installation,
-    session_requires_codex_archive, sessions_for_diagnostics,
+    lifecycle_runtime_in_flight_total, load_durable_local_snapshot_with_metadata,
+    load_local_snapshot_with_metadata, load_or_create_installation_identity,
+    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
+    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
+    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
+    repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
+    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
     should_process_async_notification_event, slice_thread_history_page,
     validate_purge_archived_session, webex_delivery_idempotency_key, worker_active_check_ack,
     write_supervisor_shutdown_marker_at,
@@ -1689,6 +1689,12 @@ fn lifecycle_accepts_drainable_sidecar_work_while_quiescing() {
 
     let shutting_down = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::ShuttingDown));
     assert!(shutting_down.try_begin_drainable_external_work().is_err());
+    assert_eq!(shutting_down.in_flight_count(), 0);
+}
+
+#[test]
+fn lifecycle_runtime_count_includes_drainable_ingress() {
+    assert_eq!(lifecycle_runtime_in_flight_total(2, 3, 5), 10);
 }
 
 #[tokio::test]

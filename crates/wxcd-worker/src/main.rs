@@ -203,6 +203,7 @@ struct LifecycleCommandContext<'a, 'event_log> {
     event_log: &'a EventLog<'event_log>,
     state: &'a mut WorkerState,
     codex: &'a mut CodexClient,
+    lifecycle: &'a LifecycleControl,
 }
 
 struct LifecycleUnquiesceContext<'a, 'event_log> {
@@ -319,15 +320,16 @@ impl LifecycleControl {
     fn try_begin_drainable_external_work(
         self: &Arc<Self>,
     ) -> std::result::Result<LifecycleWorkPermit, String> {
-        let phase = self.phase();
-        if phase == LifecycleAdmissionPhase::ShuttingDown {
-            return Err("plugin is shutting down and is not accepting new Webex work".to_string());
+        let phase = self.phase.lock().expect("lifecycle phase poisoned");
+        if *phase == LifecycleAdmissionPhase::ShuttingDown {
+            Err("plugin is shutting down and is not accepting new Webex work".to_string())
+        } else {
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
+            Ok(LifecycleWorkPermit {
+                lifecycle: Arc::clone(self),
+                finished: false,
+            })
         }
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        Ok(LifecycleWorkPermit {
-            lifecycle: Arc::clone(self),
-            finished: false,
-        })
     }
 
     fn in_flight_count(&self) -> u64 {
@@ -753,6 +755,7 @@ async fn run() -> Result<()> {
                                         event_log: &event_log,
                                         state: &mut state,
                                         codex: &mut codex,
+                                        lifecycle: lifecycle.as_ref(),
                                     },
                                     command,
                                 )
@@ -2813,11 +2816,24 @@ async fn handle_lifecycle_command_with_runtime_drain(
     let mut ctx = ctx;
     match command {
         LifecycleCommand::Drain(request) => {
-            let in_flight_count = drain_codex_runtime(&mut ctx).await?;
+            let ingress_in_flight_count = ctx.lifecycle.in_flight_count();
+            if ingress_in_flight_count > 0 {
+                persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx);
+                warn!(
+                    "lifecycle drain incomplete: {in_flight_count} Webex ingress, Codex events, or sessions remain in flight"
+                );
+                return Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                    drained: false,
+                    in_flight_count: Some(in_flight_count),
+                }));
+            }
+            let _ = drain_codex_runtime(&mut ctx).await?;
+            let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx);
             persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
             if in_flight_count > 0 {
                 warn!(
-                    "lifecycle drain incomplete: {in_flight_count} Codex events or sessions remain in flight"
+                    "lifecycle drain incomplete: {in_flight_count} Webex ingress, Codex events, or sessions remain in flight"
                 );
                 return Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
                     drained: false,
@@ -2831,11 +2847,23 @@ async fn handle_lifecycle_command_with_runtime_drain(
             }))
         }
         LifecycleCommand::Shutdown(request) => {
-            let in_flight_count = drain_codex_runtime(&mut ctx).await?;
+            let ingress_in_flight_count = ctx.lifecycle.in_flight_count();
+            if ingress_in_flight_count > 0 {
+                persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx);
+                warn!(
+                    "lifecycle shutdown rejected: {in_flight_count} Webex ingress, Codex events, or sessions remain in flight"
+                );
+                return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                    accepted: false,
+                }));
+            }
+            let _ = drain_codex_runtime(&mut ctx).await?;
+            let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx);
             persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
             if in_flight_count > 0 {
                 warn!(
-                    "lifecycle shutdown rejected: {in_flight_count} Codex events or sessions remain in flight"
+                    "lifecycle shutdown rejected: {in_flight_count} Webex ingress, Codex events, or sessions remain in flight"
                 );
                 return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
                     accepted: false,
@@ -2855,7 +2883,7 @@ async fn drain_codex_runtime(ctx: &mut LifecycleCommandContext<'_, '_>) -> Resul
     let deadline = Instant::now() + PLUGIN_LIFECYCLE_DRAIN_TIMEOUT;
     loop {
         process_pending_codex_events(ctx).await?;
-        let in_flight_count = lifecycle_runtime_in_flight_count(ctx);
+        let in_flight_count = lifecycle_codex_runtime_in_flight_count(ctx);
         if in_flight_count == 0 {
             return Ok(0);
         }
@@ -2877,7 +2905,7 @@ async fn drain_codex_runtime(ctx: &mut LifecycleCommandContext<'_, '_>) -> Resul
                 )
                 .await?;
             }
-            Ok(None) => return Ok(lifecycle_runtime_in_flight_count(ctx)),
+            Ok(None) => return Ok(lifecycle_codex_runtime_in_flight_count(ctx)),
             Err(_) => {}
         }
     }
@@ -2903,7 +2931,27 @@ async fn process_pending_codex_events(ctx: &mut LifecycleCommandContext<'_, '_>)
 }
 
 fn lifecycle_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_, '_>) -> u64 {
-    ctx.state.lifecycle_codex_in_flight_count() + ctx.codex.events().len() as u64
+    lifecycle_runtime_in_flight_total(
+        ctx.lifecycle.in_flight_count(),
+        ctx.state.lifecycle_codex_in_flight_count(),
+        ctx.codex.events().len(),
+    )
+}
+
+fn lifecycle_codex_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_, '_>) -> u64 {
+    lifecycle_runtime_in_flight_total(
+        0,
+        ctx.state.lifecycle_codex_in_flight_count(),
+        ctx.codex.events().len(),
+    )
+}
+
+fn lifecycle_runtime_in_flight_total(
+    ingress_in_flight_count: u64,
+    codex_in_flight_count: u64,
+    queued_codex_event_count: usize,
+) -> u64 {
+    ingress_in_flight_count + codex_in_flight_count + queued_codex_event_count as u64
 }
 
 fn lifecycle_runtime_wait_interval(remaining: Duration) -> Duration {
