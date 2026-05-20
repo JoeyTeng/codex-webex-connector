@@ -221,16 +221,10 @@ enum LifecycleCommand {
 enum LifecycleCommandResponse {
     Drain(PluginDrainResponse),
     Ack(PluginLifecycleAckResponse),
-    AckWithUnquiesceRollback {
+    AckWithUnquiesceCommit {
         response: PluginLifecycleAckResponse,
-        rollback: Option<LifecycleUnquiesceRollback>,
+        activation: Option<LifecycleTransitionToken>,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LifecycleUnquiesceRollback {
-    active_generation: u64,
-    restore_phase_started_at: Option<DateTime<Utc>>,
 }
 
 struct LifecycleCommandContext<'a, 'event_log> {
@@ -384,29 +378,17 @@ impl LifecycleControl {
         ))
     }
 
-    #[cfg(test)]
     fn complete_unquiesce_activation(&self, token: LifecycleTransitionToken) -> bool {
-        self.complete_unquiesce_activation_with_rollback(token)
-            .is_some()
-    }
-
-    fn complete_unquiesce_activation_with_rollback(
-        &self,
-        token: LifecycleTransitionToken,
-    ) -> Option<LifecycleUnquiesceRollback> {
         let mut state = self.phase.lock().expect("lifecycle phase poisoned");
         if state.phase != LifecycleAdmissionPhase::Activating
             || state.generation != token.generation
         {
-            return None;
+            return false;
         }
         state.phase = LifecycleAdmissionPhase::Active;
         state.generation = state.generation.wrapping_add(1);
         state.phase_started_at = Utc::now();
-        Some(LifecycleUnquiesceRollback {
-            active_generation: state.generation,
-            restore_phase_started_at: token.restore_phase_started_at,
-        })
+        true
     }
 
     fn cancel_unquiesce_activation(&self, token: LifecycleTransitionToken) {
@@ -438,13 +420,17 @@ impl LifecycleControl {
 
     #[cfg(test)]
     fn unquiesce_if_current(&self, token: LifecycleTransitionToken) -> bool {
-        self.unquiesce_if_current_with_rollback(token).0
+        let (accepted, activation) = self.begin_unquiesce_if_current(token);
+        if let Some(activation) = activation {
+            return self.complete_unquiesce_activation(activation);
+        }
+        accepted
     }
 
-    fn unquiesce_if_current_with_rollback(
+    fn begin_unquiesce_if_current(
         &self,
         token: LifecycleTransitionToken,
-    ) -> (bool, Option<LifecycleUnquiesceRollback>) {
+    ) -> (bool, Option<LifecycleTransitionToken>) {
         let mut state = self.phase.lock().expect("lifecycle phase poisoned");
         if matches!(
             state.phase,
@@ -453,30 +439,23 @@ impl LifecycleControl {
         {
             return (false, None);
         }
-        let rollback_phase_started_at =
-            (state.phase == LifecycleAdmissionPhase::Quiescing).then_some(state.phase_started_at);
-        state.phase = LifecycleAdmissionPhase::Active;
-        state.generation = state.generation.wrapping_add(1);
-        state.phase_started_at = Utc::now();
-        let rollback =
-            rollback_phase_started_at.map(|phase_started_at| LifecycleUnquiesceRollback {
-                active_generation: state.generation,
-                restore_phase_started_at: Some(phase_started_at),
-            });
-        (true, rollback)
-    }
-
-    fn rollback_unquiesce_response_failure(&self, rollback: LifecycleUnquiesceRollback) {
-        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
-        if state.phase != LifecycleAdmissionPhase::Active
-            || state.generation != rollback.active_generation
-        {
-            return;
-        }
-        state.phase = LifecycleAdmissionPhase::Quiescing;
-        state.generation = state.generation.wrapping_add(1);
-        if let Some(phase_started_at) = rollback.restore_phase_started_at {
-            state.phase_started_at = phase_started_at;
+        match state.phase {
+            LifecycleAdmissionPhase::Active => (true, None),
+            LifecycleAdmissionPhase::Quiescing => {
+                let quiesce_started_at = state.phase_started_at;
+                state.phase = LifecycleAdmissionPhase::Activating;
+                state.generation = state.generation.wrapping_add(1);
+                (
+                    true,
+                    Some(LifecycleTransitionToken::for_activation(
+                        state.generation,
+                        quiesce_started_at,
+                    )),
+                )
+            }
+            LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown => {
+                unreachable!("activating and shutdown phases returned before match")
+            }
         }
     }
 
@@ -1043,11 +1022,11 @@ async fn run() -> Result<()> {
                                 result.as_ref(),
                                 Ok(LifecycleCommandResponse::Ack(response)) if response.accepted
                             );
-                        let unquiesce_rollback = match result.as_ref() {
-                            Ok(LifecycleCommandResponse::AckWithUnquiesceRollback {
+                        let unquiesce_activation = match result.as_ref() {
+                            Ok(LifecycleCommandResponse::AckWithUnquiesceCommit {
                                 response,
-                                rollback,
-                            }) if response.accepted => *rollback,
+                                activation,
+                            }) if response.accepted => *activation,
                             _ => None,
                         };
                         if shutdown_accepted {
@@ -1065,14 +1044,20 @@ async fn run() -> Result<()> {
                             warn!(
                                 "lifecycle shutdown accepted locally but response was not delivered; continuing worker"
                             );
-                        } else if let Some(rollback) = unquiesce_rollback {
+                        } else if let Some(activation) = unquiesce_activation {
                             let completion_delivered = completion.send(result).is_ok();
-                            if !completion_delivered
-                                || !wait_for_lifecycle_response_flush(response_flushed).await
+                            if completion_delivered
+                                && wait_for_lifecycle_response_flush(response_flushed).await
                             {
-                                lifecycle.rollback_unquiesce_response_failure(rollback);
+                                if !lifecycle.complete_unquiesce_activation(activation) {
+                                    warn!(
+                                        "lifecycle unquiesce response flushed but activation was no longer current"
+                                    );
+                                }
+                            } else {
+                                lifecycle.cancel_unquiesce_activation(activation);
                                 warn!(
-                                    "lifecycle unquiesce accepted locally but response was not delivered; returning to quiesced admission"
+                                    "lifecycle unquiesce accepted locally but response was not delivered; staying in quiesced admission"
                                 );
                             }
                         } else {
@@ -3726,14 +3711,12 @@ async fn handle_lifecycle_unquiesce(
             }));
         }
         *ctx.startup_reconcile_pending = false;
-        let rollback = ctx
-            .lifecycle
-            .complete_unquiesce_activation_with_rollback(activation_token);
-        let accepted = rollback.is_some();
+        let activation = Some(activation_token);
+        let accepted = true;
         info!("lifecycle unquiesce completed: {}", request.reason);
-        return Ok(LifecycleCommandResponse::AckWithUnquiesceRollback {
+        return Ok(LifecycleCommandResponse::AckWithUnquiesceCommit {
             response: PluginLifecycleAckResponse { accepted },
-            rollback,
+            activation,
         });
     }
     if Instant::now() >= ctx.response_expires_at {
@@ -3745,11 +3728,11 @@ async fn handle_lifecycle_unquiesce(
             accepted: false,
         }));
     }
-    let (accepted, rollback) = ctx.lifecycle.unquiesce_if_current_with_rollback(token);
+    let (accepted, activation) = ctx.lifecycle.begin_unquiesce_if_current(token);
     info!("lifecycle unquiesce completed: {}", request.reason);
-    Ok(LifecycleCommandResponse::AckWithUnquiesceRollback {
+    Ok(LifecycleCommandResponse::AckWithUnquiesceCommit {
         response: PluginLifecycleAckResponse { accepted },
-        rollback,
+        activation,
     })
 }
 
@@ -4082,7 +4065,7 @@ async fn handle_lifecycle_rpc_frame(
                                 PluginRpcErrorKind::Internal,
                                 "drain command returned ack response",
                             )),
-                            LifecycleCommandResponse::AckWithUnquiesceRollback { .. } => {
+                            LifecycleCommandResponse::AckWithUnquiesceCommit { .. } => {
                                 Err(PluginRpcError::new(
                                     PluginRpcErrorKind::Internal,
                                     "drain command returned unquiesce response",
@@ -4153,7 +4136,7 @@ async fn handle_lifecycle_rpc_frame(
                                         "shutdown command returned drain response",
                                     ))
                                 }
-                                LifecycleCommandResponse::AckWithUnquiesceRollback { .. } => {
+                                LifecycleCommandResponse::AckWithUnquiesceCommit { .. } => {
                                     lifecycle.restore_shutdown_phase(previous_phase);
                                     Err(PluginRpcError::new(
                                         PluginRpcErrorKind::Internal,
@@ -4199,7 +4182,7 @@ async fn handle_lifecycle_rpc_frame(
                             .map_err(|error| {
                                 PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
                             }),
-                        LifecycleCommandResponse::AckWithUnquiesceRollback { response, .. } => {
+                        LifecycleCommandResponse::AckWithUnquiesceCommit { response, .. } => {
                             serde_json::to_value(response).map_err(|error| {
                                 PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
                             })

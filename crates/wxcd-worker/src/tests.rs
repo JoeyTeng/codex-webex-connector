@@ -2478,11 +2478,16 @@ fn lifecycle_unquiesce_response_failure_restores_quiesce_cutoff() {
     let token = lifecycle
         .prepare_unquiesce()
         .expect("quiesced lifecycle prepares unquiesce");
-    let (accepted, rollback) = lifecycle.unquiesce_if_current_with_rollback(token);
+    let (accepted, activation) = lifecycle.begin_unquiesce_if_current(token);
     assert!(accepted);
-    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Active);
-    lifecycle.rollback_unquiesce_response_failure(
-        rollback.expect("quiesced unquiesce provides rollback state"),
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Activating);
+    assert!(
+        lifecycle
+            .try_begin_drainable_external_work(Some(received_after_quiesce))
+            .is_err()
+    );
+    lifecycle.cancel_unquiesce_activation(
+        activation.expect("quiesced unquiesce provides pending activation"),
     );
 
     assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Quiescing);
@@ -2502,14 +2507,9 @@ fn lifecycle_unquiesce_response_failure_restores_quiesce_cutoff() {
 }
 
 #[test]
-fn lifecycle_activation_response_failure_restores_quiesce_cutoff() {
+fn lifecycle_activation_waits_for_response_flush_before_accepting_work() {
     let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
-    let received_before_quiesce = Utc::now();
-    std::thread::sleep(std::time::Duration::from_millis(2));
     assert!(lifecycle.quiesce());
-    let original_cutoff = lifecycle
-        .sidecar_drain_barrier_started_at()
-        .expect("quiesce records a sidecar drain barrier");
     let received_after_quiesce = Utc::now() + Duration::seconds(1);
 
     let token = lifecycle
@@ -2518,26 +2518,20 @@ fn lifecycle_activation_response_failure_restores_quiesce_cutoff() {
     let activation = lifecycle
         .begin_unquiesce_activation(token)
         .expect("current unquiesce token is claimed");
-    let rollback = lifecycle
-        .complete_unquiesce_activation_with_rollback(activation)
-        .expect("activation completes with rollback state");
-    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Active);
-    lifecycle.rollback_unquiesce_response_failure(rollback);
-
-    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Quiescing);
-    assert_eq!(
-        lifecycle.sidecar_drain_barrier_started_at(),
-        Some(original_cutoff)
-    );
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Activating);
+    assert!(lifecycle.try_begin_external_work().is_err());
     assert!(
         lifecycle
             .try_begin_drainable_external_work(Some(received_after_quiesce))
             .is_err()
     );
-    let work_permit = lifecycle
-        .try_begin_drainable_external_work(Some(received_before_quiesce))
-        .expect("work received before the original quiesce remains drainable");
-    drop(work_permit);
+
+    assert!(lifecycle.complete_unquiesce_activation(activation));
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Active);
+    let active_work = lifecycle
+        .try_begin_external_work()
+        .expect("committed activation accepts new work");
+    drop(active_work);
 }
 
 #[test]
