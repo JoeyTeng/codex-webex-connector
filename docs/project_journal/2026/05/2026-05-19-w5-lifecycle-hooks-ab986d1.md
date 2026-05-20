@@ -24,7 +24,7 @@ superseded_by:
 - `WXCD_CBTH_PRE_ACTIVE=1` 会让 worker 以 quiesced admission 启动，便于 pre-active health checks 验证外部 Webex work 已被 fence。
 - Plugin-mode durable mirror snapshot 位于 `CBTH_PLUGIN_HOME/bridge-state.json`；如果 plugin-home mirror 还不存在，启动时会 fallback 到 legacy `state_dir/bridge-state.json`。
 - `plugin.shutdown` 成功时会写入 supervisor shutdown marker；supervisor 会先校验 marker instance/release，匹配时正常退出而不是重启旧 worker，避免 upgrade shutdown 被 supervisor 误判为可恢复 worker crash。
-- Sidecar 现在解析 worker ingress ACK；quiesce/shutdown 等 retryable negative ACK 会被重试，不再把 worker 拒收当作投递成功。正在执行或重试的 Webex callback 会写入 `CBTH_PLUGIN_HOME/webex-sidecar-drain-state.json`，worker drain/shutdown 会把该 backlog 计入 in-flight。
+- Sidecar 现在解析 worker ingress ACK，不再把 worker 拒收当作投递成功。Webex callback 入口会记录 `sidecar_received_at` 并写入 `CBTH_PLUGIN_HOME/webex-sidecar-drain-state.json`；worker drain/shutdown 会把该 backlog 计入 in-flight，只放行首次 quiesce/shutdown cutoff 前已进入 sidecar 的 callback，cutoff 后的新 Webex work 会被拒绝且不会在 sidecar 内无限 retry。
 
 ## Remaining Dependencies
 - W6 仍负责 optional production handoff export/import，包括 Webex cursor、in-flight handler state 和 sidecar restart metadata。
