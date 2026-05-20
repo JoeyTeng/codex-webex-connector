@@ -189,6 +189,10 @@ async function withSidecarDrainTracking(callback) {
   } catch (error) {
     sidecarInFlightCount = Math.max(0, sidecarInFlightCount - 1);
     console.error("failed to persist sidecar drain state before processing ingress", error);
+    exitForSupervisorRestart("sidecar_drain_state_before_ingress_failed", {
+      message: error?.message || String(error),
+      code: error?.code,
+    });
     throw error;
   }
   try {
@@ -199,6 +203,10 @@ async function withSidecarDrainTracking(callback) {
       await queueSidecarDrainStateWrite();
     } catch (error) {
       console.error("failed to persist sidecar drain state after processing ingress", error);
+      exitForSupervisorRestart("sidecar_drain_state_after_ingress_failed", {
+        message: error?.message || String(error),
+        code: error?.code,
+      });
       throw error;
     }
   }
