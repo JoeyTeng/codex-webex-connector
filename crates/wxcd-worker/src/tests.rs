@@ -21,12 +21,14 @@ use super::{
     repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
     session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
     should_process_async_notification_event, sidecar_drain_in_flight_count,
-    slice_thread_history_page, validate_purge_archived_session, wait_for_lifecycle_response_flush,
-    webex_delivery_idempotency_key, worker_active_check_ack, write_supervisor_shutdown_marker_at,
+    slice_thread_history_page, stable_fnv1a_hex, validate_purge_archived_session,
+    wait_for_lifecycle_response_flush, webex_delivery_idempotency_key, worker_active_check_ack,
+    worker_ingress_socket_path_for, worker_ingress_socket_path_from_env,
+    write_supervisor_shutdown_marker_at,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wxcd_cbth_rpc::{
     PluginDrainRequest, PluginHealthCheckRequest, PluginRpcError, PluginRpcErrorKind,
@@ -102,6 +104,50 @@ fn app_config_with_state_dir(state_dir: &Path, plugin_enabled: bool) -> AppConfi
         config.bridge.cbth_plugin.plugin_home = state_dir.join("plugin-home");
     }
     config
+}
+
+#[test]
+fn worker_ingress_socket_env_override_wins() {
+    let config = app_config_with_plugin(true);
+
+    assert_eq!(
+        worker_ingress_socket_path_from_env(
+            &config,
+            Some(std::ffi::OsStr::new("/tmp/custom-wxcd.sock")),
+        ),
+        PathBuf::from("/tmp/custom-wxcd.sock")
+    );
+}
+
+#[test]
+fn plugin_worker_ingress_socket_is_release_scoped() {
+    let mut config = app_config_with_plugin(true);
+    config.bridge.state_dir = "/tmp/wxcd-state".into();
+
+    let socket_path = worker_ingress_socket_path_from_env(&config, Some(std::ffi::OsStr::new("")));
+
+    assert_eq!(
+        socket_path,
+        PathBuf::from("/tmp").join(format!(
+            "wxcd-ingress-{}.sock",
+            stable_fnv1a_hex("instance-1\n0.1.0\n/tmp/wxcd-state")
+        ))
+    );
+    assert_ne!(socket_path, config.bridge.socket_path);
+}
+
+#[test]
+fn standalone_worker_ingress_socket_uses_bridge_socket_path() {
+    let config = app_config_with_plugin(false);
+
+    assert_eq!(
+        worker_ingress_socket_path_for(
+            &config.bridge.socket_path,
+            &config.bridge.state_dir,
+            &config.bridge.cbth_plugin,
+        ),
+        config.bridge.socket_path
+    );
 }
 
 #[test]

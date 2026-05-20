@@ -69,6 +69,8 @@ const PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(
 const PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_millis(75);
 const PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PLUGIN_LIFECYCLE_CODEX_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PLUGIN_WORKER_INGRESS_SOCKET_DIR: &str = "/tmp";
+const WXCD_SOCKET_PATH_ENV: &str = "WXCD_SOCKET_PATH";
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
 const WXCD_CBTH_LIFECYCLE_SOCKET_ENV: &str = "WXCD_CBTH_LIFECYCLE_SOCKET";
@@ -827,6 +829,7 @@ async fn run() -> Result<()> {
         .await?;
     }
     let (work_tx, mut work_rx) = mpsc::channel(256);
+    let ingress_socket_path = worker_ingress_socket_path(&config);
     if let Some(socket_path) = lifecycle_control_socket_path(&config) {
         start_lifecycle_control_server(
             &socket_path,
@@ -836,11 +839,11 @@ async fn run() -> Result<()> {
         )
         .await?;
     }
-    remove_stale_socket(&config.bridge.socket_path).await?;
-    let listener = UnixListener::bind(&config.bridge.socket_path).with_context(|| {
+    remove_stale_socket(&ingress_socket_path).await?;
+    let listener = UnixListener::bind(&ingress_socket_path).with_context(|| {
         format!(
             "failed to bind unix socket {}",
-            config.bridge.socket_path.display()
+            ingress_socket_path.display()
         )
     })?;
     tokio::spawn(run_ingress_server(
@@ -990,7 +993,7 @@ async fn run() -> Result<()> {
 
     healthy.store(false, Ordering::Relaxed);
     codex.shutdown().await?;
-    remove_stale_socket(&config.bridge.socket_path).await?;
+    remove_stale_socket(&ingress_socket_path).await?;
     if let Some(socket_path) = lifecycle_control_socket_path(&config) {
         remove_stale_socket(&socket_path).await.ok();
     }
@@ -1377,6 +1380,43 @@ fn ensure_async_delivery_session_is_executable(
 
 fn webex_delivery_idempotency_key(event_id: &str) -> String {
     format!("webex-delivery-{}", stable_fnv1a_hex(event_id))
+}
+
+fn worker_ingress_socket_path(config: &AppConfig) -> PathBuf {
+    let socket_env = std::env::var_os(WXCD_SOCKET_PATH_ENV);
+    worker_ingress_socket_path_from_env(config, socket_env.as_deref())
+}
+
+fn worker_ingress_socket_path_from_env(config: &AppConfig, socket_env: Option<&OsStr>) -> PathBuf {
+    if let Some(value) = socket_env
+        && !value.is_empty()
+    {
+        return PathBuf::from(value);
+    }
+    worker_ingress_socket_path_for(
+        &config.bridge.socket_path,
+        &config.bridge.state_dir,
+        &config.bridge.cbth_plugin,
+    )
+}
+
+fn worker_ingress_socket_path_for(
+    bridge_socket_path: &Path,
+    state_dir: &Path,
+    config: &CbthPluginConfig,
+) -> PathBuf {
+    if !config.enabled {
+        return bridge_socket_path.to_path_buf();
+    }
+    Path::new(PLUGIN_WORKER_INGRESS_SOCKET_DIR).join(format!(
+        "wxcd-ingress-{}.sock",
+        stable_fnv1a_hex(&format!(
+            "{}\n{}\n{}",
+            config.plugin_instance_id,
+            config.plugin_release_id,
+            state_dir.display()
+        ))
+    ))
 }
 
 fn stable_fnv1a_hex(value: &str) -> String {

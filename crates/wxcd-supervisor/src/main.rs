@@ -39,6 +39,8 @@ const PLUGIN_DELIVERY_BROKER_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 const PLUGIN_DELIVERY_BROKER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(6);
 const PLUGIN_DELIVERY_BROKER_SOCKET_DIR: &str = "/tmp";
 const PLUGIN_DELIVERY_BROKER_SOCKET_MODE: u32 = 0o600;
+const PLUGIN_WORKER_INGRESS_SOCKET_DIR: &str = "/tmp";
+const WXCD_SOCKET_PATH_ENV: &str = "WXCD_SOCKET_PATH";
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
 const WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV: &str = "WXCD_SUPERVISOR_SHUTDOWN_MARKER";
@@ -109,6 +111,7 @@ async fn run_supervisor() -> Result<()> {
                     return Err(error);
                 }
             };
+        let worker_socket_path = worker_ingress_socket_path(&config);
 
         info!("starting worker from {}", worker_path.display());
         let mut worker_command = Command::new(&worker_path);
@@ -122,6 +125,7 @@ async fn run_supervisor() -> Result<()> {
                 .as_ref()
                 .map(|broker| broker.socket_path.as_path()),
             Some(&shutdown_marker_path),
+            Some(&worker_socket_path),
         );
         let mut worker = match worker_command
             .stdout(Stdio::inherit())
@@ -144,7 +148,7 @@ async fn run_supervisor() -> Result<()> {
         let node_path = std::env::var("WXCD_NODE_PATH").unwrap_or_else(|_| "node".to_string());
         let mut sidecar = match Command::new(&node_path)
             .arg(&sidecar_path)
-            .env("WXCD_SOCKET_PATH", &config.bridge.socket_path)
+            .env(WXCD_SOCKET_PATH_ENV, &worker_socket_path)
             .env("WXCD_PLUGIN_HOME", &config.bridge.cbth_plugin.plugin_home)
             .env(
                 "WXCD_PLUGIN_INSTANCE_ID",
@@ -172,7 +176,7 @@ async fn run_supervisor() -> Result<()> {
             }
         };
 
-        if let Err(error) = wait_for_worker_health(&config.bridge.socket_path).await {
+        if let Err(error) = wait_for_worker_health(&worker_socket_path).await {
             worker.kill().await.ok();
             sidecar.kill().await.ok();
             if let Some(app_server) = managed_app_server {
@@ -550,7 +554,9 @@ fn configure_worker_environment(
     app_server_url: Option<&str>,
     delivery_broker_socket_path: Option<&Path>,
     shutdown_marker_path: Option<&Path>,
+    worker_ingress_socket_path: Option<&Path>,
 ) {
+    command.env_remove(WXCD_SOCKET_PATH_ENV);
     command.env_remove(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV);
     command.env_remove(WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV);
     if let Some(config_path) = config_path {
@@ -564,6 +570,9 @@ fn configure_worker_environment(
     }
     if let Some(marker_path) = shutdown_marker_path {
         command.env(WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV, marker_path);
+    }
+    if let Some(socket_path) = worker_ingress_socket_path {
+        command.env(WXCD_SOCKET_PATH_ENV, socket_path);
     }
 }
 
@@ -721,6 +730,33 @@ fn supervisor_codex_binary() -> String {
 fn delivery_broker_socket_path(config: &CbthPluginConfig, state_dir: &Path) -> PathBuf {
     Path::new(PLUGIN_DELIVERY_BROKER_SOCKET_DIR).join(format!(
         "wxcd-delivery-{}.sock",
+        stable_fnv1a_hex(&format!(
+            "{}\n{}\n{}",
+            config.plugin_instance_id,
+            config.plugin_release_id,
+            state_dir.display()
+        ))
+    ))
+}
+
+fn worker_ingress_socket_path(config: &AppConfig) -> PathBuf {
+    worker_ingress_socket_path_for(
+        &config.bridge.socket_path,
+        &config.bridge.state_dir,
+        &config.bridge.cbth_plugin,
+    )
+}
+
+fn worker_ingress_socket_path_for(
+    bridge_socket_path: &Path,
+    state_dir: &Path,
+    config: &CbthPluginConfig,
+) -> PathBuf {
+    if !config.enabled {
+        return bridge_socket_path.to_path_buf();
+    }
+    Path::new(PLUGIN_WORKER_INGRESS_SOCKET_DIR).join(format!(
+        "wxcd-ingress-{}.sock",
         stable_fnv1a_hex(&format!(
             "{}\n{}\n{}",
             config.plugin_instance_id,
@@ -1382,14 +1418,20 @@ mod tests {
     fn worker_command_env_removes_inherited_delivery_broker_socket_when_absent() {
         let mut command = Command::new("worker");
         command.env(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV, "/tmp/stale.sock");
+        command.env(WXCD_SOCKET_PATH_ENV, "/tmp/stale-worker.sock");
 
-        configure_worker_environment(&mut command, None, None, None, None);
+        configure_worker_environment(&mut command, None, None, None, None, None);
 
         let broker_env = command
             .as_std()
             .get_envs()
             .find(|(key, _)| *key == WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV);
         assert!(matches!(broker_env, Some((_, None))));
+        let worker_env = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == WXCD_SOCKET_PATH_ENV);
+        assert!(matches!(worker_env, Some((_, None))));
     }
 
     #[test]
@@ -1397,7 +1439,7 @@ mod tests {
         let mut command = Command::new("worker");
         let socket_path = Path::new("/tmp/current.sock");
 
-        configure_worker_environment(&mut command, None, None, Some(socket_path), None);
+        configure_worker_environment(&mut command, None, None, Some(socket_path), None, None);
 
         let broker_env = command
             .as_std()
@@ -1414,7 +1456,7 @@ mod tests {
         let mut command = Command::new("worker");
         let marker_path = Path::new("/tmp/wxcd-supervisor-shutdown.json");
 
-        configure_worker_environment(&mut command, None, None, None, Some(marker_path));
+        configure_worker_environment(&mut command, None, None, None, Some(marker_path), None);
 
         let marker_env = command
             .as_std()
@@ -1424,6 +1466,70 @@ mod tests {
             marker_env,
             Some((_, Some(value))) if value == marker_path.as_os_str()
         ));
+    }
+
+    #[test]
+    fn worker_command_env_sets_current_ingress_socket() {
+        let mut command = Command::new("worker");
+        let socket_path = Path::new("/tmp/wxcd-ingress-current.sock");
+
+        configure_worker_environment(&mut command, None, None, None, None, Some(socket_path));
+
+        let socket_env = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == WXCD_SOCKET_PATH_ENV);
+        assert!(matches!(
+            socket_env,
+            Some((_, Some(value))) if value == socket_path.as_os_str()
+        ));
+    }
+
+    #[test]
+    fn plugin_worker_ingress_socket_is_release_scoped() {
+        let config = CbthPluginConfig {
+            enabled: true,
+            socket_path: Some("/tmp/cbth.sock".into()),
+            plugin_home: "/tmp/plugin-home".into(),
+            plugin_instance_id: "instance-1".to_string(),
+            plugin_release_id: "release-1".to_string(),
+            manifest_path: "/tmp/plugin/manifest.json".into(),
+        };
+        let socket_path = worker_ingress_socket_path_for(
+            Path::new("/tmp/wxcd.sock"),
+            Path::new("/tmp/state"),
+            &config,
+        );
+
+        assert_eq!(
+            socket_path,
+            PathBuf::from("/tmp").join(format!(
+                "wxcd-ingress-{}.sock",
+                stable_fnv1a_hex("instance-1\nrelease-1\n/tmp/state")
+            ))
+        );
+        assert_ne!(socket_path, PathBuf::from("/tmp/wxcd.sock"));
+    }
+
+    #[test]
+    fn standalone_worker_ingress_socket_uses_bridge_socket_path() {
+        let config = CbthPluginConfig {
+            enabled: false,
+            socket_path: None,
+            plugin_home: "/tmp/plugin-home".into(),
+            plugin_instance_id: "standalone".to_string(),
+            plugin_release_id: "release-1".to_string(),
+            manifest_path: "/tmp/plugin/manifest.json".into(),
+        };
+
+        assert_eq!(
+            worker_ingress_socket_path_for(
+                Path::new("/tmp/wxcd.sock"),
+                Path::new("/tmp/state"),
+                &config
+            ),
+            PathBuf::from("/tmp/wxcd.sock")
+        );
     }
 
     #[test]
