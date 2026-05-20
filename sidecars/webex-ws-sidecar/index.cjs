@@ -332,16 +332,21 @@ async function persistDeferredIngressUntilStored(envelope, error) {
   throw lastPersistError;
 }
 
-function refreshReplayEnvelope(envelope) {
-  if (
+function replayEnvelopeNeedsProcessingAck(envelope) {
+  return (
     envelope?.kind === "message_created" ||
     envelope?.kind === "attachment_action_created"
-  ) {
-    return {
+  );
+}
+
+function refreshReplayEnvelope(envelope) {
+  if (replayEnvelopeNeedsProcessingAck(envelope)) {
+    const refreshed = {
       ...envelope,
       sidecar_received_at: new Date().toISOString(),
-      processing_ack: true,
     };
+    refreshed.processing_ack = true;
+    return refreshed;
   }
   return envelope;
 }
@@ -427,6 +432,24 @@ async function quarantineMalformedDeferredIngressRecord(recordPath, error) {
   });
 }
 
+async function readDeferredIngressRecordForReplay(recordPath) {
+  try {
+    return JSON.parse(await fs.readFile(recordPath, "utf8"));
+  } catch (error) {
+    await quarantineMalformedDeferredIngressRecord(recordPath, error);
+    return null;
+  }
+}
+
+function deferredIngressReplayCandidate(entry, record, recordPath) {
+  return {
+    entry,
+    record,
+    recordPath,
+    sortTime: replayRecordSortTime(record),
+  };
+}
+
 async function replayDeferredIngress() {
   if (!deferredIngressDir) {
     return;
@@ -448,11 +471,8 @@ async function replayDeferredIngress() {
     const records = [];
     for (const entry of entries.filter((name) => name.endsWith(".json")).sort()) {
       const recordPath = path.join(deferredIngressDir, entry);
-      let record;
-      try {
-        record = JSON.parse(await fs.readFile(recordPath, "utf8"));
-      } catch (error) {
-        await quarantineMalformedDeferredIngressRecord(recordPath, error);
+      const record = await readDeferredIngressRecordForReplay(recordPath);
+      if (!record) {
         continue;
       }
       const eligibility = deferredIngressReplayEligibility(record);
@@ -474,12 +494,7 @@ async function replayDeferredIngress() {
         });
         continue;
       }
-      records.push({
-        entry,
-        record,
-        recordPath,
-        sortTime: replayRecordSortTime(record),
-      });
+      records.push(deferredIngressReplayCandidate(entry, record, recordPath));
     }
     records.sort((left, right) => {
       const timeOrder = left.sortTime - right.sortTime;

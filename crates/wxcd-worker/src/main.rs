@@ -897,7 +897,8 @@ async fn run() -> Result<()> {
         info!(
             "pre-active lifecycle mode enabled, deferring startup reconcile and Codex event processing until unquiesce"
         );
-    } else {
+    }
+    if !startup_reconcile_pending {
         reconcile_sessions(
             &config,
             &webex,
