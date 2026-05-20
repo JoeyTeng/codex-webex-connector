@@ -21,7 +21,7 @@ use super::{
     parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
     remove_stale_lifecycle_socket, repo_name_for_cwd, resolve_codex_connection,
     resolve_delivery_broker_connection, session_belongs_to_installation,
-    session_requires_codex_archive, sessions_for_diagnostics,
+    session_requires_codex_archive, sessions_for_diagnostics, should_drain_codex_runtime,
     should_process_async_notification_event, should_process_codex_events,
     sidecar_drain_in_flight_count, sidecar_drain_in_flight_count_after,
     sidecar_drain_state_file_prefix, sidecar_drain_state_liveness, sidecar_received_before_cutoff,
@@ -1640,6 +1640,12 @@ fn pre_active_startup_defers_snapshot_persistence() {
 fn pre_active_startup_gates_codex_event_processing() {
     assert!(!should_process_codex_events(true));
     assert!(should_process_codex_events(false));
+}
+
+#[test]
+fn pre_active_lifecycle_does_not_drain_codex_runtime() {
+    assert!(!should_drain_codex_runtime(true));
+    assert!(should_drain_codex_runtime(false));
 }
 
 #[tokio::test]

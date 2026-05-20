@@ -236,6 +236,7 @@ struct LifecycleCommandContext<'a, 'event_log> {
     state: &'a mut WorkerState,
     codex: &'a mut CodexClient,
     lifecycle: &'a LifecycleControl,
+    startup_reconcile_pending: bool,
 }
 
 struct LifecycleUnquiesceContext<'a, 'event_log> {
@@ -1014,6 +1015,7 @@ async fn run() -> Result<()> {
                                         state: &mut state,
                                         codex: &mut codex,
                                         lifecycle: lifecycle.as_ref(),
+                                        startup_reconcile_pending,
                                     },
                                     command,
                                 )
@@ -3286,6 +3288,9 @@ async fn handle_lifecycle_command_with_runtime_drain(
 }
 
 async fn drain_codex_runtime(ctx: &mut LifecycleCommandContext<'_, '_>) -> Result<u64> {
+    if !should_drain_codex_runtime(ctx.startup_reconcile_pending) {
+        return Ok(lifecycle_codex_runtime_in_flight_count(ctx));
+    }
     let deadline = Instant::now() + PLUGIN_LIFECYCLE_DRAIN_TIMEOUT;
     loop {
         process_pending_codex_events(ctx).await?;
@@ -3315,6 +3320,10 @@ async fn drain_codex_runtime(ctx: &mut LifecycleCommandContext<'_, '_>) -> Resul
             Err(_) => {}
         }
     }
+}
+
+fn should_drain_codex_runtime(startup_reconcile_pending: bool) -> bool {
+    !startup_reconcile_pending
 }
 
 async fn process_pending_codex_events(ctx: &mut LifecycleCommandContext<'_, '_>) -> Result<()> {
