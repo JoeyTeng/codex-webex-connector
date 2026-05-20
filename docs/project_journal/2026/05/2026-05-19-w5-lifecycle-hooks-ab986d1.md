@@ -5,7 +5,7 @@ status: completed
 created: 2026-05-19
 updated: 2026-05-20
 branch: codex/w5-lifecycle-hooks
-pr:
+pr: https://github.com/JoeyTeng/codex-webex-connector/pull/14
 supersedes: []
 superseded_by:
 ---
