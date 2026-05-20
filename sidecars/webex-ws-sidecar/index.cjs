@@ -20,6 +20,7 @@ const socketPath = process.env.WXCD_SOCKET_PATH || "/tmp/wxcd.sock";
 const botEmail = (process.env.WEBEX_BOT_EMAIL || "").toLowerCase();
 const ingressRetryDelayMs = Number.parseInt(process.env.WXCD_INGRESS_RETRY_DELAY_MS || "1000", 10);
 const sidecarDrainStateHeartbeatMs = 30000;
+const deferredIngressCrossReleaseReplayWindowMs = 60 * 60 * 1000;
 const pluginHome = process.env.WXCD_PLUGIN_HOME || process.env.CBTH_PLUGIN_HOME || "";
 const pluginInstanceId = process.env.WXCD_PLUGIN_INSTANCE_ID || "standalone";
 const pluginReleaseId = process.env.WXCD_PLUGIN_RELEASE_ID || process.env.CBTH_PLUGIN_RELEASE_ID || "unknown";
@@ -261,10 +262,21 @@ function replayRecordSortTime(record) {
 }
 
 function deferredIngressRecordMatchesCurrentScope(record) {
-  return (
-    record?.plugin_instance_id === pluginInstanceId &&
-    record?.plugin_release_id === pluginReleaseId
-  );
+  if (record?.plugin_instance_id !== pluginInstanceId) {
+    return false;
+  }
+  if (record?.plugin_release_id === pluginReleaseId) {
+    return true;
+  }
+  if (typeof record?.plugin_release_id !== "string" || record.plugin_release_id.length === 0) {
+    return false;
+  }
+  const deferredAt = Date.parse(record?.deferred_at);
+  if (!Number.isFinite(deferredAt)) {
+    return false;
+  }
+  const ageMs = Date.now() - deferredAt;
+  return ageMs >= 0 && ageMs <= deferredIngressCrossReleaseReplayWindowMs;
 }
 
 async function replayDeferredIngress() {
@@ -307,6 +319,14 @@ async function replayDeferredIngress() {
           current_plugin_release_id: pluginReleaseId,
         });
         continue;
+      }
+      if (record?.plugin_release_id !== pluginReleaseId) {
+        console.error("replaying deferred Webex ingress from previous plugin release", {
+          path: recordPath,
+          plugin_instance_id: record?.plugin_instance_id,
+          plugin_release_id: record?.plugin_release_id,
+          current_plugin_release_id: pluginReleaseId,
+        });
       }
       records.push({
         entry,
