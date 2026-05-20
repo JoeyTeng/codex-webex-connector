@@ -404,6 +404,7 @@ async function waitForActiveWorker() {
         });
         nextLogAt = now + 10000;
       }
+      await recordWorkerInactiveObservation();
       await sleep(Number.isFinite(ingressRetryDelayMs) ? ingressRetryDelayMs : 1000);
     }
   }
