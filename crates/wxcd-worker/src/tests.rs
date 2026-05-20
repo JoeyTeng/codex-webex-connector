@@ -3,15 +3,15 @@ use super::{
     CleanupFailedCommand, CodexConnectionConfig, DiagnoseCommand, LifecycleAdmissionPhase,
     LifecycleCommand, LifecycleCommandResponse, LifecycleControl, LifecycleTransitionToken,
     ListCommand, ListMode, LocalMirrorClaimScope, PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT,
-    PurgeArchivedCommand, QueuedLifecycleCommand, RECENT_EVENT_ID_LIMIT, SIDECAR_DRAIN_STATE_DIR,
-    ThreadProbe, ThreadProbeKind, WorkerQueueItem, WorkerState, abbreviate, apply_thread_probe,
-    attached_session_for_thread, build_async_notification_delivery_request,
-    durable_local_snapshot_path, ensure_approval_belongs_to_installation,
-    ensure_failed_cleanup_target, ensure_session_id_belongs_to_installation,
-    extract_thread_history_turns, generate_installation_id, handle_lifecycle_command,
-    ingress_requires_processing_ack, ingress_uses_delivery_enqueue,
-    initial_lifecycle_phase_from_env, is_control_list_session, is_default_list_session,
-    is_failed_session_room_command, lifecycle_command_response,
+    PurgeArchivedCommand, QueuedLifecycleCommand, RECENT_EVENT_ID_LIMIT,
+    SIDECAR_DEFERRED_INGRESS_DIR, SIDECAR_DRAIN_STATE_DIR, ThreadProbe, ThreadProbeKind,
+    WorkerQueueItem, WorkerState, abbreviate, apply_thread_probe, attached_session_for_thread,
+    build_async_notification_delivery_request, durable_local_snapshot_path,
+    ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
+    ensure_session_id_belongs_to_installation, extract_thread_history_turns,
+    generate_installation_id, handle_lifecycle_command, ingress_requires_processing_ack,
+    ingress_uses_delivery_enqueue, initial_lifecycle_phase_from_env, is_control_list_session,
+    is_default_list_session, is_failed_session_room_command, lifecycle_command_response,
     lifecycle_control_socket_path_from_env, lifecycle_runtime_in_flight_total,
     load_durable_local_snapshot_with_metadata, load_local_snapshot_with_metadata,
     load_or_create_installation_identity, normalize_control_command_text,
@@ -20,9 +20,10 @@ use super::{
     parse_resume_local_thread_id, parse_session_history_page, remove_stale_lifecycle_socket,
     repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
     session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
-    should_process_async_notification_event, sidecar_drain_in_flight_count,
-    sidecar_drain_in_flight_count_after, sidecar_received_before_cutoff, slice_thread_history_page,
-    stable_fnv1a_hex, startup_snapshot_persist_now, validate_purge_archived_session,
+    should_process_async_notification_event, sidecar_deferred_ingress_count,
+    sidecar_drain_in_flight_count, sidecar_drain_in_flight_count_after,
+    sidecar_received_before_cutoff, slice_thread_history_page, stable_fnv1a_hex,
+    startup_snapshot_persist_now, validate_purge_archived_session,
     wait_for_lifecycle_response_flush, webex_delivery_idempotency_key, worker_active_check_ack,
     worker_ingress_socket_path_for, worker_ingress_socket_path_from_env,
     write_supervisor_shutdown_marker_at,
@@ -1954,7 +1955,6 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
             "plugin_release_id": "0.1.0",
             "pid": std::process::id(),
             "in_flight_count": 2,
-            "deferred_ingress_count": 3,
             "updated_at": Utc::now().to_rfc3339()
         }))
         .unwrap(),
@@ -2008,7 +2008,7 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
     .await
     .unwrap();
 
-    assert_eq!(sidecar_drain_in_flight_count(&config).await, 5);
+    assert_eq!(sidecar_drain_in_flight_count(&config).await, 2);
     assert!(
         !tokio::fs::try_exists(&stale_current_pid_path)
             .await
@@ -2017,6 +2017,51 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
 
     config.bridge.cbth_plugin.enabled = false;
     assert_eq!(sidecar_drain_in_flight_count(&config).await, 0);
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_runtime_count_includes_deferred_ingress_records() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-sidecar-deferred-ingress-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let mut config = app_config_with_state_dir(&state_dir, true);
+    let plugin_home = config.bridge.cbth_plugin.plugin_home.clone();
+    let deferred_ingress_dir = plugin_home.join(SIDECAR_DEFERRED_INGRESS_DIR);
+    tokio::fs::create_dir_all(&deferred_ingress_dir)
+        .await
+        .unwrap();
+    tokio::fs::write(
+        deferred_ingress_dir.join("current.json"),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "event_id": "event-current"
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        deferred_ingress_dir.join("old-release.json"),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "old-release",
+            "event_id": "event-old"
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(deferred_ingress_dir.join("malformed.json"), b"not-json")
+        .await
+        .unwrap();
+
+    assert_eq!(sidecar_deferred_ingress_count(&config).await, 2);
+
+    config.bridge.cbth_plugin.enabled = false;
+    assert_eq!(sidecar_deferred_ingress_count(&config).await, 0);
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 
@@ -2078,27 +2123,6 @@ async fn sidecar_drain_requires_post_cutoff_inactive_observation() {
             "pid": std::process::id(),
             "in_flight_count": 0,
             "worker_inactive_observed_at": Utc.timestamp_millis_opt(1_700_000_000_124).unwrap().to_rfc3339(),
-            "deferred_ingress_count": 4,
-            "updated_at": Utc::now().to_rfc3339()
-        }))
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        sidecar_drain_in_flight_count_after(&config, Some(cutoff)).await,
-        4
-    );
-
-    tokio::fs::write(
-        &state_path,
-        serde_json::to_vec(&json!({
-            "plugin_instance_id": "instance-1",
-            "plugin_release_id": "0.1.0",
-            "pid": std::process::id(),
-            "in_flight_count": 0,
-            "worker_inactive_observed_at": Utc.timestamp_millis_opt(1_700_000_000_124).unwrap().to_rfc3339(),
-            "deferred_ingress_count": 0,
             "updated_at": Utc::now().to_rfc3339()
         }))
         .unwrap(),
@@ -2422,6 +2446,82 @@ fn lifecycle_cancelled_activation_preserves_quiesce_cutoff() {
     std::thread::sleep(std::time::Duration::from_millis(2));
     lifecycle.cancel_unquiesce_activation(activation);
 
+    assert_eq!(
+        lifecycle.sidecar_drain_barrier_started_at(),
+        Some(original_cutoff)
+    );
+    assert!(
+        lifecycle
+            .try_begin_drainable_external_work(Some(received_after_quiesce))
+            .is_err()
+    );
+    let work_permit = lifecycle
+        .try_begin_drainable_external_work(Some(received_before_quiesce))
+        .expect("work received before the original quiesce remains drainable");
+    drop(work_permit);
+}
+
+#[test]
+fn lifecycle_unquiesce_response_failure_restores_quiesce_cutoff() {
+    let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
+    let received_before_quiesce = Utc::now();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert!(lifecycle.quiesce());
+    let original_cutoff = lifecycle
+        .sidecar_drain_barrier_started_at()
+        .expect("quiesce records a sidecar drain barrier");
+    let received_after_quiesce = Utc::now() + Duration::seconds(1);
+
+    let token = lifecycle
+        .prepare_unquiesce()
+        .expect("quiesced lifecycle prepares unquiesce");
+    let (accepted, rollback) = lifecycle.unquiesce_if_current_with_rollback(token);
+    assert!(accepted);
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Active);
+    lifecycle.rollback_unquiesce_response_failure(
+        rollback.expect("quiesced unquiesce provides rollback state"),
+    );
+
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Quiescing);
+    assert_eq!(
+        lifecycle.sidecar_drain_barrier_started_at(),
+        Some(original_cutoff)
+    );
+    assert!(
+        lifecycle
+            .try_begin_drainable_external_work(Some(received_after_quiesce))
+            .is_err()
+    );
+    let work_permit = lifecycle
+        .try_begin_drainable_external_work(Some(received_before_quiesce))
+        .expect("work received before the original quiesce remains drainable");
+    drop(work_permit);
+}
+
+#[test]
+fn lifecycle_activation_response_failure_restores_quiesce_cutoff() {
+    let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
+    let received_before_quiesce = Utc::now();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert!(lifecycle.quiesce());
+    let original_cutoff = lifecycle
+        .sidecar_drain_barrier_started_at()
+        .expect("quiesce records a sidecar drain barrier");
+    let received_after_quiesce = Utc::now() + Duration::seconds(1);
+
+    let token = lifecycle
+        .prepare_unquiesce()
+        .expect("quiesced lifecycle prepares unquiesce");
+    let activation = lifecycle
+        .begin_unquiesce_activation(token)
+        .expect("current unquiesce token is claimed");
+    let rollback = lifecycle
+        .complete_unquiesce_activation_with_rollback(activation)
+        .expect("activation completes with rollback state");
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Active);
+    lifecycle.rollback_unquiesce_response_failure(rollback);
+
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Quiescing);
     assert_eq!(
         lifecycle.sidecar_drain_barrier_started_at(),
         Some(original_cutoff)

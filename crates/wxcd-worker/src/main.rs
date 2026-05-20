@@ -77,6 +77,7 @@ const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SO
 const WXCD_CBTH_LIFECYCLE_SOCKET_ENV: &str = "WXCD_CBTH_LIFECYCLE_SOCKET";
 const WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV: &str = "WXCD_SUPERVISOR_SHUTDOWN_MARKER";
 const SIDECAR_DRAIN_STATE_DIR: &str = "webex-sidecar-drain-state";
+const SIDECAR_DEFERRED_INGRESS_DIR: &str = "webex-sidecar-deferred-ingress";
 const SIDECAR_DRAIN_STATE_STALE_AFTER: Duration = Duration::from_secs(120);
 const WEBEX_DELIVERY_MAX_ATTEMPTS: i64 = 3;
 const WEBEX_DELIVERY_REDELIVERY_WINDOW_SECONDS: i64 = 3600;
@@ -220,6 +221,16 @@ enum LifecycleCommand {
 enum LifecycleCommandResponse {
     Drain(PluginDrainResponse),
     Ack(PluginLifecycleAckResponse),
+    AckWithUnquiesceRollback {
+        response: PluginLifecycleAckResponse,
+        rollback: Option<LifecycleUnquiesceRollback>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LifecycleUnquiesceRollback {
+    active_generation: u64,
+    restore_phase_started_at: Option<DateTime<Utc>>,
 }
 
 struct LifecycleCommandContext<'a, 'event_log> {
@@ -373,17 +384,29 @@ impl LifecycleControl {
         ))
     }
 
+    #[cfg(test)]
     fn complete_unquiesce_activation(&self, token: LifecycleTransitionToken) -> bool {
+        self.complete_unquiesce_activation_with_rollback(token)
+            .is_some()
+    }
+
+    fn complete_unquiesce_activation_with_rollback(
+        &self,
+        token: LifecycleTransitionToken,
+    ) -> Option<LifecycleUnquiesceRollback> {
         let mut state = self.phase.lock().expect("lifecycle phase poisoned");
         if state.phase != LifecycleAdmissionPhase::Activating
             || state.generation != token.generation
         {
-            return false;
+            return None;
         }
         state.phase = LifecycleAdmissionPhase::Active;
         state.generation = state.generation.wrapping_add(1);
         state.phase_started_at = Utc::now();
-        true
+        Some(LifecycleUnquiesceRollback {
+            active_generation: state.generation,
+            restore_phase_started_at: token.restore_phase_started_at,
+        })
     }
 
     fn cancel_unquiesce_activation(&self, token: LifecycleTransitionToken) {
@@ -402,26 +425,59 @@ impl LifecycleControl {
     fn prepare_unquiesce(&self) -> Option<LifecycleTransitionToken> {
         let state = self.phase.lock().expect("lifecycle phase poisoned");
         match state.phase {
-            LifecycleAdmissionPhase::Active | LifecycleAdmissionPhase::Quiescing => {
+            LifecycleAdmissionPhase::Active => {
                 Some(LifecycleTransitionToken::for_generation(state.generation))
             }
+            LifecycleAdmissionPhase::Quiescing => Some(LifecycleTransitionToken::for_activation(
+                state.generation,
+                state.phase_started_at,
+            )),
             LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown => None,
         }
     }
 
+    #[cfg(test)]
     fn unquiesce_if_current(&self, token: LifecycleTransitionToken) -> bool {
+        self.unquiesce_if_current_with_rollback(token).0
+    }
+
+    fn unquiesce_if_current_with_rollback(
+        &self,
+        token: LifecycleTransitionToken,
+    ) -> (bool, Option<LifecycleUnquiesceRollback>) {
         let mut state = self.phase.lock().expect("lifecycle phase poisoned");
         if matches!(
             state.phase,
             LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown
         ) || state.generation != token.generation
         {
-            return false;
+            return (false, None);
         }
+        let rollback_phase_started_at =
+            (state.phase == LifecycleAdmissionPhase::Quiescing).then_some(state.phase_started_at);
         state.phase = LifecycleAdmissionPhase::Active;
         state.generation = state.generation.wrapping_add(1);
         state.phase_started_at = Utc::now();
-        true
+        let rollback =
+            rollback_phase_started_at.map(|phase_started_at| LifecycleUnquiesceRollback {
+                active_generation: state.generation,
+                restore_phase_started_at: Some(phase_started_at),
+            });
+        (true, rollback)
+    }
+
+    fn rollback_unquiesce_response_failure(&self, rollback: LifecycleUnquiesceRollback) {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        if state.phase != LifecycleAdmissionPhase::Active
+            || state.generation != rollback.active_generation
+        {
+            return;
+        }
+        state.phase = LifecycleAdmissionPhase::Quiescing;
+        state.generation = state.generation.wrapping_add(1);
+        if let Some(phase_started_at) = rollback.restore_phase_started_at {
+            state.phase_started_at = phase_started_at;
+        }
     }
 
     fn begin_shutdown(&self) -> Option<LifecyclePhaseState> {
@@ -942,9 +998,7 @@ async fn run() -> Result<()> {
                             continue;
                         }
                         let shutdown_previous_phase = match &command {
-                            LifecycleCommand::Shutdown { previous_phase, .. } => {
-                                Some(*previous_phase)
-                            }
+                            LifecycleCommand::Shutdown { previous_phase, .. } => Some(*previous_phase),
                             _ => None,
                         };
                         let result = match command {
@@ -989,6 +1043,13 @@ async fn run() -> Result<()> {
                                 result.as_ref(),
                                 Ok(LifecycleCommandResponse::Ack(response)) if response.accepted
                             );
+                        let unquiesce_rollback = match result.as_ref() {
+                            Ok(LifecycleCommandResponse::AckWithUnquiesceRollback {
+                                response,
+                                rollback,
+                            }) if response.accepted => *rollback,
+                            _ => None,
+                        };
                         if shutdown_accepted {
                             let completion_delivered = completion.send(result).is_ok();
                             if completion_delivered
@@ -1004,6 +1065,16 @@ async fn run() -> Result<()> {
                             warn!(
                                 "lifecycle shutdown accepted locally but response was not delivered; continuing worker"
                             );
+                        } else if let Some(rollback) = unquiesce_rollback {
+                            let completion_delivered = completion.send(result).is_ok();
+                            if !completion_delivered
+                                || !wait_for_lifecycle_response_flush(response_flushed).await
+                            {
+                                lifecycle.rollback_unquiesce_response_failure(rollback);
+                                warn!(
+                                    "lifecycle unquiesce accepted locally but response was not delivered; returning to quiesced admission"
+                                );
+                            }
                         } else {
                             let _ = completion.send(result);
                         }
@@ -3252,15 +3323,17 @@ async fn process_pending_codex_events(ctx: &mut LifecycleCommandContext<'_, '_>)
 }
 
 async fn lifecycle_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_, '_>) -> u64 {
+    let sidecar_drain_count = sidecar_drain_in_flight_count_after(
+        ctx.config,
+        ctx.lifecycle.sidecar_drain_barrier_started_at(),
+    )
+    .await;
+    let sidecar_deferred_count = sidecar_deferred_ingress_count(ctx.config).await;
     lifecycle_runtime_in_flight_total(
         ctx.lifecycle.in_flight_count(),
         ctx.state.lifecycle_codex_in_flight_count(),
         ctx.codex.events().len(),
-        sidecar_drain_in_flight_count_after(
-            ctx.config,
-            ctx.lifecycle.sidecar_drain_barrier_started_at(),
-        )
-        .await,
+        sidecar_drain_count.saturating_add(sidecar_deferred_count),
     )
 }
 
@@ -3374,7 +3447,6 @@ async fn sidecar_drain_in_flight_count_after(
                 remove_sidecar_drain_state_file(&path).await;
                 continue;
             }
-            let state_in_flight_count = state.lifecycle_in_flight_count();
             if let Some(cutoff) = inactive_observed_after
                 && !state.sidecar_observed_inactive_after(cutoff)
             {
@@ -3382,10 +3454,81 @@ async fn sidecar_drain_in_flight_count_after(
                     "sidecar drain state {} has not observed the lifecycle admission fence; treating sidecar as in flight",
                     path.display()
                 );
-                count += state_in_flight_count.max(1);
+                count += state.in_flight_count.max(1);
                 continue;
             }
-            count += state_in_flight_count;
+            count += state.in_flight_count;
+        }
+    }
+}
+
+async fn sidecar_deferred_ingress_count(config: &AppConfig) -> u64 {
+    if !config.bridge.cbth_plugin.enabled {
+        return 0;
+    }
+    let dir = config
+        .bridge
+        .cbth_plugin
+        .plugin_home
+        .join(SIDECAR_DEFERRED_INGRESS_DIR);
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => {
+            warn!(
+                "failed to read sidecar deferred ingress dir {}; treating deferred ingress as in flight: {error:#}",
+                dir.display()
+            );
+            return 1;
+        }
+    };
+    let mut count = 0;
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return count,
+            Err(error) => {
+                warn!(
+                    "failed to iterate sidecar deferred ingress dir {}; treating deferred ingress as in flight: {error:#}",
+                    dir.display()
+                );
+                return count + 1;
+            }
+        };
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.ends_with(".json"))
+        {
+            continue;
+        }
+        let contents = match tokio::fs::read(&path).await {
+            Ok(contents) => contents,
+            Err(error) => {
+                warn!(
+                    "failed to read sidecar deferred ingress {}; treating deferred ingress as in flight: {error:#}",
+                    path.display()
+                );
+                count += 1;
+                continue;
+            }
+        };
+        let record: SidecarDeferredIngressRecord = match serde_json::from_slice(&contents) {
+            Ok(record) => record,
+            Err(error) => {
+                warn!(
+                    "failed to parse sidecar deferred ingress {}; treating deferred ingress as in flight: {error:#}",
+                    path.display()
+                );
+                count += 1;
+                continue;
+            }
+        };
+        if record.plugin_instance_id == config.bridge.cbth_plugin.plugin_instance_id
+            && record.plugin_release_id == config.bridge.cbth_plugin.plugin_release_id
+        {
+            count += 1;
         }
     }
 }
@@ -3432,22 +3575,21 @@ struct SidecarDrainState {
     #[serde(default)]
     in_flight_count: u64,
     #[serde(default)]
-    deferred_ingress_count: u64,
-    #[serde(default)]
     worker_inactive_observed_at: Option<DateTime<Utc>>,
     updated_at: DateTime<Utc>,
 }
 
 impl SidecarDrainState {
-    fn lifecycle_in_flight_count(&self) -> u64 {
-        self.in_flight_count
-            .saturating_add(self.deferred_ingress_count)
-    }
-
     fn sidecar_observed_inactive_after(&self, cutoff: DateTime<Utc>) -> bool {
         self.worker_inactive_observed_at
             .is_some_and(|observed_at| observed_at.timestamp_millis() > cutoff.timestamp_millis())
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct SidecarDeferredIngressRecord {
+    plugin_instance_id: String,
+    plugin_release_id: String,
 }
 
 fn sidecar_drain_state_is_fresh(state: &SidecarDrainState, now: DateTime<Utc>) -> bool {
@@ -3562,13 +3704,15 @@ async fn handle_lifecycle_unquiesce(
             }));
         }
         *ctx.startup_reconcile_pending = false;
-        let accepted = ctx
+        let rollback = ctx
             .lifecycle
-            .complete_unquiesce_activation(activation_token);
+            .complete_unquiesce_activation_with_rollback(activation_token);
+        let accepted = rollback.is_some();
         info!("lifecycle unquiesce completed: {}", request.reason);
-        return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
-            accepted,
-        }));
+        return Ok(LifecycleCommandResponse::AckWithUnquiesceRollback {
+            response: PluginLifecycleAckResponse { accepted },
+            rollback,
+        });
     }
     if Instant::now() >= ctx.response_expires_at {
         warn!(
@@ -3579,11 +3723,12 @@ async fn handle_lifecycle_unquiesce(
             accepted: false,
         }));
     }
-    let accepted = ctx.lifecycle.unquiesce_if_current(token);
+    let (accepted, rollback) = ctx.lifecycle.unquiesce_if_current_with_rollback(token);
     info!("lifecycle unquiesce completed: {}", request.reason);
-    Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
-        accepted,
-    }))
+    Ok(LifecycleCommandResponse::AckWithUnquiesceRollback {
+        response: PluginLifecycleAckResponse { accepted },
+        rollback,
+    })
 }
 
 async fn wait_for_lifecycle_response_flush(
@@ -3915,6 +4060,12 @@ async fn handle_lifecycle_rpc_frame(
                                 PluginRpcErrorKind::Internal,
                                 "drain command returned ack response",
                             )),
+                            LifecycleCommandResponse::AckWithUnquiesceRollback { .. } => {
+                                Err(PluginRpcError::new(
+                                    PluginRpcErrorKind::Internal,
+                                    "drain command returned unquiesce response",
+                                ))
+                            }
                         })
                     }
                 }
@@ -3980,6 +4131,13 @@ async fn handle_lifecycle_rpc_frame(
                                         "shutdown command returned drain response",
                                     ))
                                 }
+                                LifecycleCommandResponse::AckWithUnquiesceRollback { .. } => {
+                                    lifecycle.restore_shutdown_phase(previous_phase);
+                                    Err(PluginRpcError::new(
+                                        PluginRpcErrorKind::Internal,
+                                        "shutdown command returned unquiesce response",
+                                    ))
+                                }
                             },
                             Err(error) => {
                                 lifecycle.restore_shutdown_phase(previous_phase);
@@ -4006,10 +4164,12 @@ async fn handle_lifecycle_rpc_frame(
                             response_flushed: None,
                         };
                     };
+                    let (flushed_tx, flushed_rx) = oneshot::channel();
+                    response_flushed = Some(flushed_tx);
                     lifecycle_command_response(
                         events_tx,
                         LifecycleCommand::Unquiesce { request, token },
-                        None,
+                        Some(flushed_rx),
                     )
                     .await
                     .and_then(|response| match response {
@@ -4017,6 +4177,11 @@ async fn handle_lifecycle_rpc_frame(
                             .map_err(|error| {
                                 PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
                             }),
+                        LifecycleCommandResponse::AckWithUnquiesceRollback { response, .. } => {
+                            serde_json::to_value(response).map_err(|error| {
+                                PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
+                            })
+                        }
                         LifecycleCommandResponse::Drain(_) => Err(PluginRpcError::new(
                             PluginRpcErrorKind::Internal,
                             "unquiesce command returned drain response",
