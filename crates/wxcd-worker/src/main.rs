@@ -202,7 +202,7 @@ enum LifecycleCommand {
     Drain(PluginDrainRequest),
     Shutdown {
         request: PluginShutdownRequest,
-        previous_phase: LifecycleAdmissionPhase,
+        previous_phase: LifecyclePhaseState,
     },
     Unquiesce {
         request: PluginUnquiesceRequest,
@@ -292,10 +292,14 @@ impl LifecycleControl {
     fn quiesce(&self) -> bool {
         let mut state = self.phase.lock().expect("lifecycle phase poisoned");
         match state.phase {
-            LifecycleAdmissionPhase::Active | LifecycleAdmissionPhase::Quiescing => {
+            LifecycleAdmissionPhase::Active => {
                 state.phase = LifecycleAdmissionPhase::Quiescing;
                 state.generation = state.generation.wrapping_add(1);
                 state.phase_started_at = Utc::now();
+                true
+            }
+            LifecycleAdmissionPhase::Quiescing => {
+                state.generation = state.generation.wrapping_add(1);
                 true
             }
             LifecycleAdmissionPhase::ShuttingDown => false,
@@ -327,26 +331,28 @@ impl LifecycleControl {
         true
     }
 
-    fn begin_shutdown(&self) -> Option<LifecycleAdmissionPhase> {
+    fn begin_shutdown(&self) -> Option<LifecyclePhaseState> {
         let mut state = self.phase.lock().expect("lifecycle phase poisoned");
         match state.phase {
             LifecycleAdmissionPhase::ShuttingDown => None,
             LifecycleAdmissionPhase::Active | LifecycleAdmissionPhase::Quiescing => {
-                let previous = state.phase;
+                let previous = *state;
                 state.phase = LifecycleAdmissionPhase::ShuttingDown;
                 state.generation = state.generation.wrapping_add(1);
-                state.phase_started_at = Utc::now();
+                if previous.phase == LifecycleAdmissionPhase::Active {
+                    state.phase_started_at = Utc::now();
+                }
                 Some(previous)
             }
         }
     }
 
-    fn restore_shutdown_phase(&self, previous: LifecycleAdmissionPhase) {
+    fn restore_shutdown_phase(&self, previous: LifecyclePhaseState) {
         let mut state = self.phase.lock().expect("lifecycle phase poisoned");
         if state.phase == LifecycleAdmissionPhase::ShuttingDown {
-            state.phase = previous;
+            state.phase = previous.phase;
             state.generation = state.generation.wrapping_add(1);
-            state.phase_started_at = Utc::now();
+            state.phase_started_at = previous.phase_started_at;
         }
     }
 

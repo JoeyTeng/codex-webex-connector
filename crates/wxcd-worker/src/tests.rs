@@ -1747,6 +1747,39 @@ fn lifecycle_accepts_already_received_sidecar_work_while_quiescing() {
 }
 
 #[test]
+fn lifecycle_preserves_first_quiesce_cutoff_through_drain_and_shutdown() {
+    let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
+    let received_before_quiesce = Utc::now();
+    assert!(lifecycle.quiesce());
+    let received_after_quiesce = Utc::now() + Duration::seconds(1);
+
+    assert!(lifecycle.quiesce());
+    assert!(
+        lifecycle
+            .try_begin_drainable_external_work(Some(received_after_quiesce))
+            .is_err()
+    );
+
+    let previous_phase = lifecycle.begin_shutdown().expect("shutdown begins");
+    assert!(
+        lifecycle
+            .try_begin_drainable_external_work(Some(received_after_quiesce))
+            .is_err()
+    );
+    lifecycle.restore_shutdown_phase(previous_phase);
+    assert!(
+        lifecycle
+            .try_begin_drainable_external_work(Some(received_after_quiesce))
+            .is_err()
+    );
+
+    let work_permit = lifecycle
+        .try_begin_drainable_external_work(Some(received_before_quiesce))
+        .expect("work received before the first quiesce remains drainable");
+    drop(work_permit);
+}
+
+#[test]
 fn lifecycle_runtime_count_includes_drainable_ingress() {
     assert_eq!(lifecycle_runtime_in_flight_total(2, 3, 5, 7), 17);
 }
