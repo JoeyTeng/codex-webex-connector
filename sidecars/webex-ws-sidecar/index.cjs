@@ -141,11 +141,9 @@ function queueSidecarDrainStateWrite() {
         updated_at: new Date().toISOString(),
       };
       await fs.mkdir(path.dirname(sidecarDrainStatePath), { recursive: true });
-      await fs.writeFile(
-        sidecarDrainStatePath,
-        `${JSON.stringify(snapshot, null, 2)}\n`,
-        "utf8"
-      );
+      const tmpPath = `${sidecarDrainStatePath}.${process.pid}.${Date.now()}.tmp`;
+      await fs.writeFile(tmpPath, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+      await fs.rename(tmpPath, sidecarDrainStatePath);
     });
   return sidecarDrainStateWrite;
 }
