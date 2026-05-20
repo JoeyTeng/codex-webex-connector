@@ -203,6 +203,7 @@ struct LifecycleCommandContext<'a, 'event_log> {
     event_log: &'a EventLog<'event_log>,
     state: &'a mut WorkerState,
     codex: &'a mut CodexClient,
+    lifecycle: &'a LifecycleControl,
 }
 
 struct LifecycleUnquiesceContext<'a, 'event_log> {
@@ -231,6 +232,7 @@ enum LifecycleAdmissionPhase {
 #[derive(Debug)]
 struct LifecycleControl {
     phase: Mutex<LifecycleAdmissionPhase>,
+    blocked_external_events: Mutex<HashSet<String>>,
     in_flight: AtomicU64,
     drained: Notify,
 }
@@ -244,6 +246,7 @@ impl LifecycleControl {
     fn new(initial_phase: LifecycleAdmissionPhase) -> Self {
         Self {
             phase: Mutex::new(initial_phase),
+            blocked_external_events: Mutex::new(HashSet::new()),
             in_flight: AtomicU64::new(0),
             drained: Notify::new(),
         }
@@ -317,6 +320,27 @@ impl LifecycleControl {
 
     fn in_flight_count(&self) -> u64 {
         self.in_flight.load(Ordering::SeqCst)
+    }
+
+    fn track_blocked_external_event(&self, event_id: String) {
+        self.blocked_external_events
+            .lock()
+            .expect("lifecycle blocked event set poisoned")
+            .insert(event_id);
+    }
+
+    fn clear_blocked_external_event(&self, event_id: &str) {
+        self.blocked_external_events
+            .lock()
+            .expect("lifecycle blocked event set poisoned")
+            .remove(event_id);
+    }
+
+    fn blocked_external_event_count(&self) -> u64 {
+        self.blocked_external_events
+            .lock()
+            .expect("lifecycle blocked event set poisoned")
+            .len() as u64
     }
 
     async fn wait_until_drained(&self, timeout_after: Duration) -> bool {
@@ -738,6 +762,7 @@ async fn run() -> Result<()> {
                                         event_log: &event_log,
                                         state: &mut state,
                                         codex: &mut codex,
+                                        lifecycle: lifecycle.as_ref(),
                                     },
                                     command,
                                 )
@@ -1192,6 +1217,15 @@ fn ingress_requires_processing_ack(event: &WebexIngressEnvelope) -> bool {
 #[cfg(test)]
 fn ingress_uses_delivery_enqueue(event: &WebexIngressEnvelope) -> bool {
     matches!(event, WebexIngressEnvelope::AsyncNotification(_))
+}
+
+fn ingress_lifecycle_event_id(event: &WebexIngressEnvelope) -> Option<&str> {
+    match event {
+        WebexIngressEnvelope::MessageCreated(message) => Some(&message.event_id),
+        WebexIngressEnvelope::AttachmentActionCreated(action) => Some(&action.event_id),
+        WebexIngressEnvelope::AsyncNotification(notification) => Some(&notification.event_id),
+        WebexIngressEnvelope::HealthCheck | WebexIngressEnvelope::ActiveCheck => None,
+    }
 }
 
 async fn handle_control_message(
@@ -2844,6 +2878,9 @@ async fn drain_codex_runtime(ctx: &mut LifecycleCommandContext<'_, '_>) -> Resul
         if in_flight_count == 0 {
             return Ok(0);
         }
+        if ctx.lifecycle.blocked_external_event_count() > 0 {
+            return Ok(in_flight_count);
+        }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -2888,7 +2925,9 @@ async fn process_pending_codex_events(ctx: &mut LifecycleCommandContext<'_, '_>)
 }
 
 fn lifecycle_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_, '_>) -> u64 {
-    ctx.state.lifecycle_codex_in_flight_count() + ctx.codex.events().len() as u64
+    ctx.lifecycle.blocked_external_event_count()
+        + ctx.state.lifecycle_codex_in_flight_count()
+        + ctx.codex.events().len() as u64
 }
 
 fn lifecycle_runtime_wait_interval(remaining: Duration) -> Duration {
@@ -3422,9 +3461,18 @@ async fn handle_ingress_connection(
             worker_active_check_ack(healthy.load(Ordering::Relaxed), lifecycle.phase())
         }
         event if ingress_requires_processing_ack(&event) => {
+            let blocked_event_id = ingress_lifecycle_event_id(&event).map(ToOwned::to_owned);
             let work_permit = match lifecycle.try_begin_external_work() {
-                Ok(work_permit) => work_permit,
+                Ok(work_permit) => {
+                    if let Some(event_id) = blocked_event_id.as_deref() {
+                        lifecycle.clear_blocked_external_event(event_id);
+                    }
+                    work_permit
+                }
                 Err(detail) => {
+                    if let Some(event_id) = blocked_event_id {
+                        lifecycle.track_blocked_external_event(event_id);
+                    }
                     return write_ingress_ack(
                         &mut writer,
                         WebexIngressAck {
@@ -3478,9 +3526,18 @@ async fn handle_ingress_connection(
             }
         }
         event => {
+            let blocked_event_id = ingress_lifecycle_event_id(&event).map(ToOwned::to_owned);
             let work_permit = match lifecycle.try_begin_external_work() {
-                Ok(work_permit) => work_permit,
+                Ok(work_permit) => {
+                    if let Some(event_id) = blocked_event_id.as_deref() {
+                        lifecycle.clear_blocked_external_event(event_id);
+                    }
+                    work_permit
+                }
                 Err(detail) => {
+                    if let Some(event_id) = blocked_event_id {
+                        lifecycle.track_blocked_external_event(event_id);
+                    }
                     return write_ingress_ack(
                         &mut writer,
                         WebexIngressAck {
