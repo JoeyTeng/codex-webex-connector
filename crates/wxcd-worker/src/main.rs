@@ -238,6 +238,7 @@ struct LifecycleUnquiesceContext<'a, 'event_log> {
     installation: &'a InstallationIdentity,
     lifecycle: &'a LifecycleControl,
     startup_reconcile_pending: &'a mut bool,
+    startup_snapshot_persist_pending: &'a mut bool,
     response_expires_at: Instant,
 }
 
@@ -700,6 +701,10 @@ async fn run() -> Result<()> {
         &config,
         std::env::var(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV).ok(),
     )?;
+    let initial_lifecycle_phase = initial_lifecycle_phase(&config.bridge.cbth_plugin);
+    let mut startup_reconcile_pending =
+        initial_lifecycle_phase == LifecycleAdmissionPhase::Quiescing;
+    let mut startup_snapshot_persist_pending = false;
 
     let event_log = EventLog::new(&webex, &data_room.id);
     let local_snapshot_path = durable_local_snapshot_path(&config);
@@ -790,7 +795,11 @@ async fn run() -> Result<()> {
                         }
                     },
                 };
-                if changed {
+                if startup_snapshot_persist_now(
+                    changed,
+                    startup_reconcile_pending,
+                    &mut startup_snapshot_persist_pending,
+                ) {
                     persist_snapshot(&event_log, &mut state, &config).await?;
                 }
             }
@@ -811,7 +820,11 @@ async fn run() -> Result<()> {
                         Utc::now(),
                         &local_thread_ids,
                     );
-                    if changed {
+                    if startup_snapshot_persist_now(
+                        changed,
+                        startup_reconcile_pending,
+                        &mut startup_snapshot_persist_pending,
+                    ) {
                         persist_local_snapshot(&local_snapshot_path, &state.to_snapshot()).await?;
                     }
                 }
@@ -825,10 +838,7 @@ async fn run() -> Result<()> {
         state.rebuild_session_indexes();
     }
     let healthy = Arc::new(AtomicBool::new(false));
-    let lifecycle = Arc::new(LifecycleControl::new(initial_lifecycle_phase(
-        &config.bridge.cbth_plugin,
-    )));
-    let mut startup_reconcile_pending = lifecycle.phase() == LifecycleAdmissionPhase::Quiescing;
+    let lifecycle = Arc::new(LifecycleControl::new(initial_lifecycle_phase));
     if startup_reconcile_pending {
         info!("pre-active lifecycle mode enabled, deferring startup reconcile until unquiesce");
     } else {
@@ -932,6 +942,7 @@ async fn run() -> Result<()> {
                                         installation: &installation,
                                         lifecycle: lifecycle.as_ref(),
                                         startup_reconcile_pending: &mut startup_reconcile_pending,
+                                        startup_snapshot_persist_pending: &mut startup_snapshot_persist_pending,
                                         response_expires_at,
                                     },
                                     request,
@@ -3479,6 +3490,13 @@ async fn handle_lifecycle_unquiesce(
             ctx.lifecycle.cancel_unquiesce_activation(activation_token);
             return Err(error);
         }
+        if *ctx.startup_snapshot_persist_pending {
+            if let Err(error) = persist_snapshot(ctx.event_log, ctx.state, ctx.config).await {
+                ctx.lifecycle.cancel_unquiesce_activation(activation_token);
+                return Err(error);
+            }
+            *ctx.startup_snapshot_persist_pending = false;
+        }
         *ctx.startup_reconcile_pending = false;
         if Instant::now() >= ctx.response_expires_at {
             ctx.lifecycle.cancel_unquiesce_activation(activation_token);
@@ -3570,8 +3588,33 @@ fn lifecycle_control_socket_path_from_env(
         socket_env
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| config.bridge.cbth_plugin.plugin_home.join("lifecycle.sock")),
+            .unwrap_or_else(|| default_lifecycle_control_socket_path(&config.bridge.cbth_plugin)),
     )
+}
+
+fn default_lifecycle_control_socket_path(config: &CbthPluginConfig) -> PathBuf {
+    config.plugin_home.join("lifecycle").join(format!(
+        "wxcd-lifecycle-{}.sock",
+        stable_fnv1a_hex(&format!(
+            "{}\n{}",
+            config.plugin_instance_id, config.plugin_release_id
+        ))
+    ))
+}
+
+fn startup_snapshot_persist_now(
+    changed: bool,
+    startup_reconcile_pending: bool,
+    startup_snapshot_persist_pending: &mut bool,
+) -> bool {
+    if !changed {
+        return false;
+    }
+    if startup_reconcile_pending {
+        *startup_snapshot_persist_pending = true;
+        return false;
+    }
+    true
 }
 
 async fn write_supervisor_shutdown_marker(

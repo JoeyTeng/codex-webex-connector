@@ -268,13 +268,14 @@ async function replayDeferredIngress() {
           deferOnLifecycleRejection: true,
         })
       );
-      if (replayResult !== SEND_DEFERRED) {
-        await fs.rm(recordPath, { force: true });
+      if (replayResult === SEND_DEFERRED) {
+        return SEND_DEFERRED;
       }
+      await fs.rm(recordPath, { force: true });
     }
   })();
   try {
-    await replayDeferredIngressTask;
+    return await replayDeferredIngressTask;
   } finally {
     replayDeferredIngressTask = null;
   }
@@ -455,7 +456,12 @@ async function monitorWorkerActive() {
         { retryLifecycleRejection: true }
       );
       await clearWorkerInactiveObservation();
-      await replayDeferredIngress();
+      if ((await replayDeferredIngress()) === SEND_DEFERRED) {
+        await recordWorkerInactiveObservation();
+        await stopWebexListeners();
+        await sleep(Number.isFinite(ingressRetryDelayMs) ? ingressRetryDelayMs : 1000);
+        continue;
+      }
       await startWebexListeners();
     } catch (error) {
       if (!error?.retryable) {
@@ -582,8 +588,12 @@ async function forwardAttachmentAction(payload) {
 
 async function main() {
   await queueSidecarDrainStateWrite();
-  await waitForActiveWorker();
-  await replayDeferredIngress();
+  for (;;) {
+    await waitForActiveWorker();
+    if ((await replayDeferredIngress()) !== SEND_DEFERRED) {
+      break;
+    }
+  }
   await webex.people.get("me");
   installMercuryWatchdog();
 

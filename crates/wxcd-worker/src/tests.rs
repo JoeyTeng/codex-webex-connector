@@ -22,9 +22,10 @@ use super::{
     session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
     should_process_async_notification_event, sidecar_drain_in_flight_count,
     sidecar_drain_in_flight_count_after, sidecar_received_before_cutoff, slice_thread_history_page,
-    stable_fnv1a_hex, validate_purge_archived_session, wait_for_lifecycle_response_flush,
-    webex_delivery_idempotency_key, worker_active_check_ack, worker_ingress_socket_path_for,
-    worker_ingress_socket_path_from_env, write_supervisor_shutdown_marker_at,
+    stable_fnv1a_hex, startup_snapshot_persist_now, validate_purge_archived_session,
+    wait_for_lifecycle_response_flush, webex_delivery_idempotency_key, worker_active_check_ack,
+    worker_ingress_socket_path_for, worker_ingress_socket_path_from_env,
+    write_supervisor_shutdown_marker_at,
 };
 use chrono::{Duration, TimeZone, Utc};
 use serde_json::json;
@@ -1578,16 +1579,41 @@ fn durable_snapshot_uses_plugin_home_in_cbth_plugin_mode() {
 }
 
 #[test]
-fn lifecycle_socket_empty_env_falls_back_to_plugin_home() {
+fn lifecycle_socket_empty_env_falls_back_to_release_scoped_path() {
     let mut config = app_config_with_plugin(true);
     config.bridge.cbth_plugin.plugin_home = "/tmp/wxcd-plugin-home".into();
+    let mut next_release = config.clone();
+    next_release.bridge.cbth_plugin.plugin_release_id = "0.2.0".to_string();
+
+    let socket_path =
+        lifecycle_control_socket_path_from_env(&config, Some(std::ffi::OsStr::new("")))
+            .expect("lifecycle socket path");
+    let next_socket_path =
+        lifecycle_control_socket_path_from_env(&next_release, Some(std::ffi::OsStr::new("")))
+            .expect("next lifecycle socket path");
 
     assert_eq!(
-        lifecycle_control_socket_path_from_env(&config, Some(std::ffi::OsStr::new(""))),
-        Some(std::path::PathBuf::from(
-            "/tmp/wxcd-plugin-home/lifecycle.sock"
+        socket_path,
+        std::path::PathBuf::from("/tmp/wxcd-plugin-home/lifecycle").join(format!(
+            "wxcd-lifecycle-{}.sock",
+            stable_fnv1a_hex("instance-1\n0.1.0")
         ))
     );
+    assert_ne!(socket_path, next_socket_path);
+}
+
+#[test]
+fn pre_active_startup_defers_snapshot_persistence() {
+    let mut pending = false;
+
+    assert!(!startup_snapshot_persist_now(false, true, &mut pending));
+    assert!(!pending);
+
+    assert!(startup_snapshot_persist_now(true, false, &mut pending));
+    assert!(!pending);
+
+    assert!(!startup_snapshot_persist_now(true, true, &mut pending));
+    assert!(pending);
 }
 
 #[tokio::test]
