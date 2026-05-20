@@ -29,6 +29,7 @@ const webex = new WebexCore({
 
 let exitingForRestart = false;
 let shuttingDown = false;
+let listenersActive = false;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -174,6 +175,65 @@ async function waitForActiveWorker() {
   }
 }
 
+async function startWebexListeners() {
+  if (listenersActive) {
+    return;
+  }
+  try {
+    await webex.messages.listen();
+    await webex.attachmentActions.listen();
+    listenersActive = true;
+    console.log("webex-ws-sidecar is listening for Webex events");
+  } catch (error) {
+    await stopWebexListeners();
+    throw error;
+  }
+}
+
+async function stopWebexListeners() {
+  try {
+    if (typeof webex.messages.stopListening === "function") {
+      await webex.messages.stopListening();
+    }
+  } catch (error) {
+    console.error("failed to stop messages listener", error);
+  }
+
+  try {
+    if (typeof webex.attachmentActions.stopListening === "function") {
+      await webex.attachmentActions.stopListening();
+    }
+  } catch (error) {
+    console.error("failed to stop attachment actions listener", error);
+  }
+  listenersActive = false;
+}
+
+async function monitorWorkerActive() {
+  for (;;) {
+    if (shuttingDown) {
+      return;
+    }
+    try {
+      await sendEnvelopeOnce({ kind: "active_check" });
+      await startWebexListeners();
+    } catch (error) {
+      if (!error?.retryable) {
+        throw error;
+      }
+      if (listenersActive) {
+        console.error("worker is no longer active; stopping Webex listeners", {
+          message: error.message,
+          code: error.code,
+          ack: error.ack,
+        });
+        await stopWebexListeners();
+      }
+    }
+    await sleep(Number.isFinite(ingressRetryDelayMs) ? ingressRetryDelayMs : 1000);
+  }
+}
+
 function ingressEventId(payload) {
   return (
     payload?.id ||
@@ -261,8 +321,6 @@ async function main() {
   await waitForActiveWorker();
   await webex.people.get("me");
   installMercuryWatchdog();
-  await webex.messages.listen();
-  await webex.attachmentActions.listen();
 
   webex.messages.on("created", async (payload) => {
     try {
@@ -280,26 +338,18 @@ async function main() {
     }
   });
 
-  console.log("webex-ws-sidecar is listening for Webex events");
+  await startWebexListeners();
+  monitorWorkerActive().catch((error) => {
+    exitForSupervisorRestart("active_check_failed", {
+      message: error?.message || String(error),
+      code: error?.code,
+    });
+  });
 }
 
 async function shutdown() {
   shuttingDown = true;
-  try {
-    if (typeof webex.messages.stopListening === "function") {
-      await webex.messages.stopListening();
-    }
-  } catch (error) {
-    console.error("failed to stop messages listener", error);
-  }
-
-  try {
-    if (typeof webex.attachmentActions.stopListening === "function") {
-      await webex.attachmentActions.stopListening();
-    }
-  } catch (error) {
-    console.error("failed to stop attachment actions listener", error);
-  }
+  await stopWebexListeners();
 
   try {
     if (webex.internal?.mercury?.connected) {

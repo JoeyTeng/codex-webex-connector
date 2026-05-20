@@ -1650,22 +1650,6 @@ fn lifecycle_codex_in_flight_count_tracks_current_executable_work() {
     assert_eq!(state.lifecycle_codex_in_flight_count(), 3);
 }
 
-#[test]
-fn lifecycle_tracks_blocked_external_event_retries_once() {
-    let lifecycle = LifecycleControl::new(LifecycleAdmissionPhase::Quiescing);
-
-    lifecycle.track_blocked_external_event("event-1".to_string());
-    lifecycle.track_blocked_external_event("event-1".to_string());
-    lifecycle.track_blocked_external_event("event-2".to_string());
-    assert_eq!(lifecycle.blocked_external_event_count(), 2);
-
-    lifecycle.clear_blocked_external_event("event-1");
-    assert_eq!(lifecycle.blocked_external_event_count(), 1);
-
-    lifecycle.clear_blocked_external_event("event-2");
-    assert_eq!(lifecycle.blocked_external_event_count(), 0);
-}
-
 #[tokio::test]
 async fn lifecycle_quiesce_blocks_new_external_work_until_unquiesce() {
     let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
@@ -1689,6 +1673,22 @@ async fn lifecycle_quiesce_blocks_new_external_work_until_unquiesce() {
     );
     assert!(lifecycle.unquiesce());
     assert!(lifecycle.try_begin_external_work().is_ok());
+}
+
+#[test]
+fn lifecycle_accepts_drainable_sidecar_work_while_quiescing() {
+    let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Quiescing));
+    let work_permit = lifecycle
+        .try_begin_drainable_external_work()
+        .expect("quiesced lifecycle accepts sidecar-owned drainable work");
+
+    assert_eq!(lifecycle.in_flight_count(), 1);
+    assert!(lifecycle.try_begin_external_work().is_err());
+    drop(work_permit);
+    assert_eq!(lifecycle.in_flight_count(), 0);
+
+    let shutting_down = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::ShuttingDown));
+    assert!(shutting_down.try_begin_drainable_external_work().is_err());
 }
 
 #[tokio::test]
