@@ -47,6 +47,7 @@ let listenersActive = false;
 let sidecarInFlightCount = 0;
 let sidecarDrainStateWrite = Promise.resolve();
 let replayDeferredIngressTask = null;
+let workerInactiveObservedAt = null;
 const SEND_DEFERRED = "deferred";
 
 function sleep(ms) {
@@ -67,6 +68,7 @@ function queueSidecarDrainStateWrite() {
     plugin_release_id: pluginReleaseId,
     pid: process.pid,
     in_flight_count: sidecarInFlightCount,
+    worker_inactive_observed_at: workerInactiveObservedAt,
     updated_at: new Date().toISOString(),
   };
   sidecarDrainStateWrite = sidecarDrainStateWrite
@@ -87,6 +89,7 @@ async function clearSidecarDrainState() {
     return;
   }
   sidecarInFlightCount = 0;
+  workerInactiveObservedAt = null;
   try {
     await queueSidecarDrainStateWrite();
   } catch (error) {
@@ -97,6 +100,19 @@ async function clearSidecarDrainState() {
   } catch (error) {
     console.error("failed to remove sidecar drain state", error);
   }
+}
+
+async function clearWorkerInactiveObservation() {
+  if (workerInactiveObservedAt === null) {
+    return;
+  }
+  workerInactiveObservedAt = null;
+  await queueSidecarDrainStateWrite();
+}
+
+async function recordWorkerInactiveObservation() {
+  workerInactiveObservedAt = new Date().toISOString();
+  await queueSidecarDrainStateWrite();
 }
 
 async function withSidecarDrainTracking(callback) {
@@ -373,6 +389,7 @@ async function waitForActiveWorker() {
         { kind: "active_check" },
         { retryLifecycleRejection: true }
       );
+      await clearWorkerInactiveObservation();
       return;
     } catch (error) {
       if (!error?.retryable || shuttingDown) {
@@ -436,6 +453,7 @@ async function monitorWorkerActive() {
         { kind: "active_check" },
         { retryLifecycleRejection: true }
       );
+      await clearWorkerInactiveObservation();
       await replayDeferredIngress();
       await startWebexListeners();
     } catch (error) {
@@ -450,6 +468,7 @@ async function monitorWorkerActive() {
         });
         await stopWebexListeners();
       }
+      await recordWorkerInactiveObservation();
     }
     await sleep(Number.isFinite(ingressRetryDelayMs) ? ingressRetryDelayMs : 1000);
   }

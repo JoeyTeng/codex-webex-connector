@@ -295,6 +295,16 @@ impl LifecycleControl {
         self.phase.lock().expect("lifecycle phase poisoned").phase
     }
 
+    fn sidecar_drain_barrier_started_at(&self) -> Option<DateTime<Utc>> {
+        let state = self.phase.lock().expect("lifecycle phase poisoned");
+        match state.phase {
+            LifecycleAdmissionPhase::Quiescing | LifecycleAdmissionPhase::ShuttingDown => {
+                Some(state.phase_started_at)
+            }
+            LifecycleAdmissionPhase::Active | LifecycleAdmissionPhase::Activating => None,
+        }
+    }
+
     fn begin_quiesce(&self) -> Option<LifecycleTransitionToken> {
         let mut state = self.phase.lock().expect("lifecycle phase poisoned");
         match state.phase {
@@ -460,9 +470,9 @@ impl LifecycleControl {
                 })
             }
             LifecycleAdmissionPhase::Quiescing => {
-                if sidecar_received_at
-                    .is_some_and(|received_at| received_at <= state.phase_started_at)
-                {
+                if sidecar_received_at.is_some_and(|received_at| {
+                    sidecar_received_before_cutoff(received_at, state.phase_started_at)
+                }) {
                     self.in_flight.fetch_add(1, Ordering::SeqCst);
                     Ok(LifecycleWorkPermit {
                         lifecycle: Arc::clone(self),
@@ -476,9 +486,9 @@ impl LifecycleControl {
                 Err("plugin is activating and is not accepting new Webex work".to_string())
             }
             LifecycleAdmissionPhase::ShuttingDown => {
-                if sidecar_received_at
-                    .is_some_and(|received_at| received_at <= state.phase_started_at)
-                {
+                if sidecar_received_at.is_some_and(|received_at| {
+                    sidecar_received_before_cutoff(received_at, state.phase_started_at)
+                }) {
                     self.in_flight.fetch_add(1, Ordering::SeqCst);
                     Ok(LifecycleWorkPermit {
                         lifecycle: Arc::clone(self),
@@ -570,6 +580,10 @@ impl LifecycleControl {
             message: None,
         }
     }
+}
+
+fn sidecar_received_before_cutoff(received_at: DateTime<Utc>, cutoff: DateTime<Utc>) -> bool {
+    received_at.timestamp_millis() < cutoff.timestamp_millis()
 }
 
 impl LifecycleWorkPermit {
@@ -3203,7 +3217,11 @@ async fn lifecycle_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_,
         ctx.lifecycle.in_flight_count(),
         ctx.state.lifecycle_codex_in_flight_count(),
         ctx.codex.events().len(),
-        sidecar_drain_in_flight_count(ctx.config).await,
+        sidecar_drain_in_flight_count_after(
+            ctx.config,
+            ctx.lifecycle.sidecar_drain_barrier_started_at(),
+        )
+        .await,
     )
 }
 
@@ -3228,7 +3246,15 @@ fn lifecycle_runtime_in_flight_total(
         + sidecar_in_flight_count
 }
 
+#[cfg(test)]
 async fn sidecar_drain_in_flight_count(config: &AppConfig) -> u64 {
+    sidecar_drain_in_flight_count_after(config, None).await
+}
+
+async fn sidecar_drain_in_flight_count_after(
+    config: &AppConfig,
+    inactive_observed_after: Option<DateTime<Utc>>,
+) -> u64 {
     if !config.bridge.cbth_plugin.enabled {
         return 0;
     }
@@ -3299,6 +3325,16 @@ async fn sidecar_drain_in_flight_count(config: &AppConfig) -> u64 {
                 remove_sidecar_drain_state_file(&path).await;
                 continue;
             }
+            if let Some(cutoff) = inactive_observed_after
+                && !state.sidecar_observed_inactive_after(cutoff)
+            {
+                warn!(
+                    "sidecar drain state {} has not observed the lifecycle admission fence; treating sidecar as in flight",
+                    path.display()
+                );
+                count += state.in_flight_count.max(1);
+                continue;
+            }
             count += state.in_flight_count;
         }
     }
@@ -3345,6 +3381,15 @@ struct SidecarDrainState {
     pid: Option<u32>,
     #[serde(default)]
     in_flight_count: u64,
+    #[serde(default)]
+    worker_inactive_observed_at: Option<DateTime<Utc>>,
+}
+
+impl SidecarDrainState {
+    fn sidecar_observed_inactive_after(&self, cutoff: DateTime<Utc>) -> bool {
+        self.worker_inactive_observed_at
+            .is_some_and(|observed_at| observed_at.timestamp_millis() > cutoff.timestamp_millis())
+    }
 }
 
 unsafe extern "C" {

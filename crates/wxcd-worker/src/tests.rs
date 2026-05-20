@@ -21,12 +21,12 @@ use super::{
     repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
     session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
     should_process_async_notification_event, sidecar_drain_in_flight_count,
-    slice_thread_history_page, stable_fnv1a_hex, validate_purge_archived_session,
-    wait_for_lifecycle_response_flush, webex_delivery_idempotency_key, worker_active_check_ack,
-    worker_ingress_socket_path_for, worker_ingress_socket_path_from_env,
-    write_supervisor_shutdown_marker_at,
+    sidecar_drain_in_flight_count_after, sidecar_received_before_cutoff, slice_thread_history_page,
+    stable_fnv1a_hex, validate_purge_archived_session, wait_for_lifecycle_response_flush,
+    webex_delivery_idempotency_key, worker_active_check_ack, worker_ingress_socket_path_for,
+    worker_ingress_socket_path_from_env, write_supervisor_shutdown_marker_at,
 };
-use chrono::{Duration, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1812,6 +1812,7 @@ fn lifecycle_rejects_drainable_sidecar_work_while_quiescing() {
 fn lifecycle_accepts_already_received_sidecar_work_while_quiescing() {
     let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
     let received_before_quiesce = Utc::now();
+    std::thread::sleep(std::time::Duration::from_millis(2));
     assert!(lifecycle.quiesce());
 
     let work_permit = lifecycle
@@ -1829,9 +1830,38 @@ fn lifecycle_accepts_already_received_sidecar_work_while_quiescing() {
 }
 
 #[test]
+fn lifecycle_rejects_same_millisecond_sidecar_work_after_cutoff() {
+    let cutoff = Utc.timestamp_millis_opt(1_700_000_000_123).unwrap() + Duration::microseconds(750);
+    let previous_millisecond = Utc.timestamp_millis_opt(1_700_000_000_122).unwrap();
+    let same_millisecond = Utc.timestamp_millis_opt(1_700_000_000_123).unwrap();
+
+    assert!(sidecar_received_before_cutoff(previous_millisecond, cutoff));
+    assert!(!sidecar_received_before_cutoff(same_millisecond, cutoff));
+
+    let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
+    {
+        let mut state = lifecycle.phase.lock().expect("lifecycle phase poisoned");
+        state.phase = LifecycleAdmissionPhase::Quiescing;
+        state.phase_started_at = cutoff;
+    }
+
+    assert!(
+        lifecycle
+            .try_begin_drainable_external_work(Some(same_millisecond))
+            .is_err()
+    );
+    assert!(
+        lifecycle
+            .try_begin_drainable_external_work(Some(previous_millisecond))
+            .is_ok()
+    );
+}
+
+#[test]
 fn lifecycle_preserves_first_quiesce_cutoff_through_drain_and_shutdown() {
     let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
     let received_before_quiesce = Utc::now();
+    std::thread::sleep(std::time::Duration::from_millis(2));
     assert!(lifecycle.quiesce());
     let received_after_quiesce = Utc::now() + Duration::seconds(1);
 
@@ -1927,6 +1957,78 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
 
     config.bridge.cbth_plugin.enabled = false;
     assert_eq!(sidecar_drain_in_flight_count(&config).await, 0);
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn sidecar_drain_requires_post_cutoff_inactive_observation() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-sidecar-drain-barrier-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let config = app_config_with_state_dir(&state_dir, true);
+    let plugin_home = config.bridge.cbth_plugin.plugin_home.clone();
+    let drain_state_dir = plugin_home.join(SIDECAR_DRAIN_STATE_DIR);
+    tokio::fs::create_dir_all(&drain_state_dir).await.unwrap();
+    let cutoff = Utc.timestamp_millis_opt(1_700_000_000_123).unwrap() + Duration::microseconds(750);
+    let state_path = drain_state_dir.join("instance-1--0.1.0--current.json");
+
+    tokio::fs::write(
+        &state_path,
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "pid": std::process::id(),
+            "in_flight_count": 0,
+            "updated_at": Utc::now().to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sidecar_drain_in_flight_count_after(&config, Some(cutoff)).await,
+        1
+    );
+
+    tokio::fs::write(
+        &state_path,
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "pid": std::process::id(),
+            "in_flight_count": 0,
+            "worker_inactive_observed_at": Utc.timestamp_millis_opt(1_700_000_000_123).unwrap().to_rfc3339(),
+            "updated_at": Utc::now().to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sidecar_drain_in_flight_count_after(&config, Some(cutoff)).await,
+        1
+    );
+
+    tokio::fs::write(
+        &state_path,
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "pid": std::process::id(),
+            "in_flight_count": 0,
+            "worker_inactive_observed_at": Utc.timestamp_millis_opt(1_700_000_000_124).unwrap().to_rfc3339(),
+            "updated_at": Utc::now().to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sidecar_drain_in_flight_count_after(&config, Some(cutoff)).await,
+        0
+    );
+
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 
