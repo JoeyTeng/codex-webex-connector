@@ -47,6 +47,7 @@ let listenersActive = false;
 let sidecarInFlightCount = 0;
 let sidecarDrainStateWrite = Promise.resolve();
 let replayDeferredIngressTask = null;
+const SEND_DEFERRED = "deferred";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -156,6 +157,19 @@ async function persistDeferredIngress(envelope, error) {
   await fs.rename(tmpPath, targetPath);
 }
 
+function refreshReplayEnvelope(envelope) {
+  if (
+    envelope?.kind === "message_created" ||
+    envelope?.kind === "attachment_action_created"
+  ) {
+    return {
+      ...envelope,
+      sidecar_received_at: new Date().toISOString(),
+    };
+  }
+  return envelope;
+}
+
 async function replayDeferredIngress() {
   if (!deferredIngressDir) {
     return;
@@ -186,11 +200,17 @@ async function replayDeferredIngress() {
         });
         continue;
       }
-      await sendEnvelope(record.envelope, {
-        retryUnavailable: true,
-        retryLifecycleRejection: true,
-      });
-      await fs.rm(recordPath, { force: true });
+      const replayEnvelope = refreshReplayEnvelope(record.envelope);
+      const replayResult = await withSidecarDrainTracking(() =>
+        sendEnvelope(replayEnvelope, {
+          retryUnavailable: true,
+          retryLifecycleRejection: true,
+          deferOnLifecycleRejection: true,
+        })
+      );
+      if (replayResult !== SEND_DEFERRED) {
+        await fs.rm(recordPath, { force: true });
+      }
     }
   })();
   try {
@@ -281,7 +301,7 @@ async function sendEnvelope(envelope, options = {}) {
       if (options.deferOnLifecycleRejection === true && error?.lifecycleRejected) {
         await persistDeferredIngress(envelope, error);
         await stopWebexListeners();
-        return;
+        return SEND_DEFERRED;
       }
       if (options.retryUnavailable !== true || !error?.retryable || shuttingDown) {
         throw error;
