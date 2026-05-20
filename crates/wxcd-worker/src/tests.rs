@@ -1915,9 +1915,17 @@ fn lifecycle_preserves_first_quiesce_cutoff_through_drain_and_shutdown() {
     let received_before_quiesce = Utc::now();
     std::thread::sleep(std::time::Duration::from_millis(2));
     assert!(lifecycle.quiesce());
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let received_between_quiesces = Utc::now();
+    std::thread::sleep(std::time::Duration::from_millis(2));
     let received_after_quiesce = Utc::now() + Duration::seconds(1);
 
     assert!(lifecycle.quiesce());
+    assert!(
+        lifecycle
+            .try_begin_drainable_external_work(Some(received_between_quiesces))
+            .is_err()
+    );
     assert!(
         lifecycle
             .try_begin_drainable_external_work(Some(received_after_quiesce))
