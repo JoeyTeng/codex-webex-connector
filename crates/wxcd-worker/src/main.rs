@@ -83,6 +83,7 @@ const SIDECAR_DRAIN_STATE_DIR: &str = "webex-sidecar-drain-state";
 const SIDECAR_DEFERRED_INGRESS_DIR: &str = "webex-sidecar-deferred-ingress";
 const WEBEX_HANDOFF_STATE_FILE: &str = "webex-handoff-state.json";
 const WEBEX_HANDOFF_SCHEMA_VERSION: u32 = 1;
+const WEBEX_HANDOFF_RPC_FRAME_RESERVE_BYTES: usize = 16 * 1024;
 const SIDECAR_DRAIN_STATE_STALE_AFTER: Duration = Duration::from_secs(120);
 const WEBEX_DELIVERY_MAX_ATTEMPTS: i64 = 3;
 const WEBEX_DELIVERY_REDELIVERY_WINDOW_SECONDS: i64 = 3600;
@@ -308,6 +309,11 @@ struct WebexHandoffSidecarRestartState {
 struct WebexHandoffSidecarFileRecord {
     file_name: String,
     record: Value,
+}
+
+struct StagedHandoffImport {
+    response: PluginLifecycleAckResponse,
+    state: WorkerState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1040,6 +1046,53 @@ async fn run() -> Result<()> {
                             LifecycleCommand::Shutdown { previous_phase, .. } => Some(*previous_phase),
                             _ => None,
                         };
+                        if let LifecycleCommand::HandoffImport { request } = command {
+                            let result = if lifecycle_accepts_handoff_import(
+                                startup_reconcile_pending,
+                                lifecycle.phase(),
+                            ) {
+                                stage_handoff_import_snapshot(
+                                    &config,
+                                    &state,
+                                    request.snapshot,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    PluginRpcError::new(
+                                        PluginRpcErrorKind::Internal,
+                                        format!("{error:#}"),
+                                    )
+                                })
+                            } else {
+                                Err(PluginRpcError::new(
+                                    PluginRpcErrorKind::Internal,
+                                    "lifecycle handoff import requires pre-active quiesced Webex work admission",
+                                ))
+                            };
+                            match result {
+                                Ok(staged) => {
+                                    let completion_delivered = completion
+                                        .send(Ok(LifecycleCommandResponse::HandoffImport(
+                                            staged.response.clone(),
+                                        )))
+                                        .is_ok();
+                                    if completion_delivered
+                                        && wait_for_lifecycle_response_flush(response_flushed).await
+                                    {
+                                        state = staged.state;
+                                        info!("lifecycle handoff import accepted: {}", request.reason);
+                                    } else {
+                                        warn!(
+                                            "lifecycle handoff import staged locally but response was not delivered; keeping pre-import worker state"
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = completion.send(Err(error));
+                                }
+                            }
+                            continue;
+                        }
                         let result = match command {
                             LifecycleCommand::Unquiesce { request, token } => {
                                 handle_lifecycle_unquiesce(
@@ -3404,13 +3457,15 @@ async fn export_handoff_snapshot(
         in_flight: build_handoff_in_flight_state(state),
         sidecar: collect_sidecar_handoff_state(config).await?,
     };
-    persist_webex_handoff_state(config, &payload).await?;
-    Ok(PluginHandoffExportResponse {
+    let response = PluginHandoffExportResponse {
         snapshot: PluginHandoffSnapshot {
             schema_version: WEBEX_HANDOFF_SCHEMA_VERSION,
-            payload: serde_json::to_value(payload)?,
+            payload: serde_json::to_value(&payload)?,
         },
-    })
+    };
+    ensure_handoff_export_response_fits_rpc_frame(&response)?;
+    persist_webex_handoff_state(config, &payload).await?;
+    Ok(response)
 }
 
 async fn import_handoff_snapshot(
@@ -3418,6 +3473,16 @@ async fn import_handoff_snapshot(
     state: &mut WorkerState,
     snapshot: PluginHandoffSnapshot,
 ) -> Result<PluginLifecycleAckResponse> {
+    let staged = stage_handoff_import_snapshot(config, state, snapshot).await?;
+    *state = staged.state;
+    Ok(staged.response)
+}
+
+async fn stage_handoff_import_snapshot(
+    config: &AppConfig,
+    state: &WorkerState,
+    snapshot: PluginHandoffSnapshot,
+) -> Result<StagedHandoffImport> {
     if !config.bridge.cbth_plugin.enabled {
         bail!("plugin handoff import requires cbth plugin mode");
     }
@@ -3432,12 +3497,17 @@ async fn import_handoff_snapshot(
             .plugin_home
             .join(SIDECAR_DEFERRED_INGRESS_DIR),
         &payload.sidecar.deferred_ingress_records,
+        &config.bridge.cbth_plugin.plugin_instance_id,
     )
     .await?;
+    materialize_handoff_sidecar_drain_state_records(config, &payload.sidecar.drain_state_records)
+        .await?;
     persist_webex_handoff_state(config, &payload).await?;
     persist_durable_lifecycle_mirror(config, &imported_state).await?;
-    *state = imported_state;
-    Ok(PluginLifecycleAckResponse { accepted: true })
+    Ok(StagedHandoffImport {
+        response: PluginLifecycleAckResponse { accepted: true },
+        state: imported_state,
+    })
 }
 
 fn decode_webex_handoff_payload(snapshot: PluginHandoffSnapshot) -> Result<WebexHandoffPayload> {
@@ -3507,6 +3577,7 @@ fn apply_webex_handoff_payload(
         .collect::<HashSet<_>>();
     let mirrored_at = Utc::now();
     let mut changed = false;
+    let mut authoritative_session_ids = HashSet::new();
     for mut local_session in sessions.into_values() {
         if !local_session_has_current_installation_evidence(&local_session, &installation_id) {
             continue;
@@ -3529,6 +3600,7 @@ fn apply_webex_handoff_payload(
         } else if state.local_session_is_stale_against_remote(&local_session) {
             continue;
         }
+        authoritative_session_ids.insert(local_session.session_id.clone());
         if local_session.authority.is_none() {
             local_session.authority = Some(SessionAuthority {
                 installation_id: installation_id.clone(),
@@ -3560,6 +3632,13 @@ fn apply_webex_handoff_payload(
             }
             changed = true;
         }
+    }
+    if state.reconcile_handoff_pending_approvals(
+        &authoritative_session_ids,
+        &pending_approvals,
+        &installation_id,
+    ) {
+        changed = true;
     }
     if state.merge_local_pending_approvals(pending_approvals, &installation_id) {
         changed = true;
@@ -3614,6 +3693,23 @@ fn build_handoff_in_flight_state(state: &WorkerState) -> WebexHandoffInFlightSta
         sessions,
         pending_approval_count: state.pending_approvals.len(),
     }
+}
+
+fn ensure_handoff_export_response_fits_rpc_frame(
+    response: &PluginHandoffExportResponse,
+) -> Result<()> {
+    let safe_payload_budget = PLUGIN_RPC_MAX_FRAME_BYTES
+        .checked_sub(WEBEX_HANDOFF_RPC_FRAME_RESERVE_BYTES)
+        .ok_or_else(|| anyhow!("plugin RPC frame budget is smaller than handoff reserve"))?;
+    let response_bytes = serde_json::to_vec(response)
+        .context("failed to encode Webex handoff export response for size check")?
+        .len();
+    if response_bytes > safe_payload_budget {
+        bail!(
+            "Webex handoff snapshot is {response_bytes} bytes, exceeds safe plugin RPC payload budget {safe_payload_budget} bytes"
+        );
+    }
+    Ok(())
 }
 
 async fn collect_sidecar_handoff_state(
@@ -3704,6 +3800,7 @@ where
 async fn materialize_handoff_deferred_ingress_records(
     dir: &Path,
     records: &[WebexHandoffSidecarFileRecord],
+    plugin_instance_id: &str,
 ) -> Result<usize> {
     if records.is_empty() {
         return Ok(0);
@@ -3711,9 +3808,13 @@ async fn materialize_handoff_deferred_ingress_records(
     tokio::fs::create_dir_all(dir)
         .await
         .with_context(|| format!("failed to create deferred ingress dir {}", dir.display()))?;
-    let mut existing_event_ids = collect_deferred_ingress_event_ids(dir).await?;
+    let mut existing_event_ids =
+        collect_deferred_ingress_event_ids(dir, plugin_instance_id).await?;
     let mut imported = 0;
     for (index, record) in records.iter().enumerate() {
+        if json_pointer_string(&record.record, "/plugin_instance_id") != Some(plugin_instance_id) {
+            continue;
+        }
         let event_id = json_pointer_string(&record.record, "/event_id")
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -3738,7 +3839,52 @@ async fn materialize_handoff_deferred_ingress_records(
     Ok(imported)
 }
 
-async fn collect_deferred_ingress_event_ids(dir: &Path) -> Result<HashSet<String>> {
+async fn materialize_handoff_sidecar_drain_state_records(
+    config: &AppConfig,
+    records: &[WebexHandoffSidecarFileRecord],
+) -> Result<usize> {
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let dir = config
+        .bridge
+        .cbth_plugin
+        .plugin_home
+        .join(SIDECAR_DRAIN_STATE_DIR);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("failed to create sidecar drain state dir {}", dir.display()))?;
+    let mut imported = 0;
+    for (index, record) in records.iter().enumerate() {
+        if json_pointer_string(&record.record, "/plugin_instance_id")
+            != Some(config.bridge.cbth_plugin.plugin_instance_id.as_str())
+        {
+            continue;
+        }
+        let mut drain_record = record.record.clone();
+        if let Some(object) = drain_record.as_object_mut() {
+            object.insert(
+                "plugin_instance_id".to_string(),
+                Value::String(config.bridge.cbth_plugin.plugin_instance_id.clone()),
+            );
+            object.insert(
+                "plugin_release_id".to_string(),
+                Value::String(config.bridge.cbth_plugin.plugin_release_id.clone()),
+            );
+        } else {
+            continue;
+        }
+        let file_name = sidecar_drain_state_handoff_file_name(config, record, index);
+        write_json_pretty_atomic(&dir.join(file_name), &drain_record).await?;
+        imported += 1;
+    }
+    Ok(imported)
+}
+
+async fn collect_deferred_ingress_event_ids(
+    dir: &Path,
+    plugin_instance_id: &str,
+) -> Result<HashSet<String>> {
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
@@ -3784,6 +3930,9 @@ async fn collect_deferred_ingress_event_ids(dir: &Path) -> Result<HashSet<String
                 continue;
             }
         };
+        if json_pointer_string(&record, "/plugin_instance_id") != Some(plugin_instance_id) {
+            continue;
+        }
         if let Some(event_id) = json_pointer_string(&record, "/event_id")
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -3792,6 +3941,19 @@ async fn collect_deferred_ingress_event_ids(dir: &Path) -> Result<HashSet<String
         }
     }
     Ok(event_ids)
+}
+
+fn sidecar_drain_state_handoff_file_name(
+    config: &AppConfig,
+    record: &WebexHandoffSidecarFileRecord,
+    index: usize,
+) -> String {
+    format!(
+        "{}handoff-{}--{}.json",
+        sidecar_drain_state_file_prefix(config),
+        index,
+        handoff_file_component(&record.file_name)
+    )
 }
 
 fn deferred_ingress_handoff_file_name(
@@ -4835,37 +4997,41 @@ async fn handle_lifecycle_rpc_frame(
         }
         PLUGIN_RPC_PLUGIN_HANDOFF_IMPORT_METHOD => {
             match decode_lifecycle_params::<PluginHandoffImportRequest>(&frame) {
-                Ok(request) => lifecycle_command_response(
-                    events_tx,
-                    LifecycleCommand::HandoffImport { request },
-                    None,
-                )
-                .await
-                .and_then(|response| match response {
-                    LifecycleCommandResponse::HandoffImport(response) => {
-                        serde_json::to_value(response).map_err(|error| {
-                            PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
-                        })
-                    }
-                    LifecycleCommandResponse::Drain(_) => Err(PluginRpcError::new(
-                        PluginRpcErrorKind::Internal,
-                        "handoff import command returned drain response",
-                    )),
-                    LifecycleCommandResponse::Ack(_) => Err(PluginRpcError::new(
-                        PluginRpcErrorKind::Internal,
-                        "handoff import command returned ack response",
-                    )),
-                    LifecycleCommandResponse::HandoffExport(_) => Err(PluginRpcError::new(
-                        PluginRpcErrorKind::Internal,
-                        "handoff import command returned export response",
-                    )),
-                    LifecycleCommandResponse::AckWithUnquiesceCommit { .. } => {
-                        Err(PluginRpcError::new(
+                Ok(request) => {
+                    let (flushed_tx, flushed_rx) = oneshot::channel();
+                    response_flushed = Some(flushed_tx);
+                    lifecycle_handoff_import_command_response(
+                        events_tx,
+                        LifecycleCommand::HandoffImport { request },
+                        Some(flushed_rx),
+                    )
+                    .await
+                    .and_then(|response| match response {
+                        LifecycleCommandResponse::HandoffImport(response) => {
+                            serde_json::to_value(response).map_err(|error| {
+                                PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
+                            })
+                        }
+                        LifecycleCommandResponse::Drain(_) => Err(PluginRpcError::new(
                             PluginRpcErrorKind::Internal,
-                            "handoff import command returned unquiesce response",
-                        ))
-                    }
-                }),
+                            "handoff import command returned drain response",
+                        )),
+                        LifecycleCommandResponse::Ack(_) => Err(PluginRpcError::new(
+                            PluginRpcErrorKind::Internal,
+                            "handoff import command returned ack response",
+                        )),
+                        LifecycleCommandResponse::HandoffExport(_) => Err(PluginRpcError::new(
+                            PluginRpcErrorKind::Internal,
+                            "handoff import command returned export response",
+                        )),
+                        LifecycleCommandResponse::AckWithUnquiesceCommit { .. } => {
+                            Err(PluginRpcError::new(
+                                PluginRpcErrorKind::Internal,
+                                "handoff import command returned unquiesce response",
+                            ))
+                        }
+                    })
+                }
                 Err(error) => Err(error),
             }
         }
@@ -4892,10 +5058,34 @@ async fn lifecycle_command_response(
     command: LifecycleCommand,
     response_flushed: Option<oneshot::Receiver<()>>,
 ) -> std::result::Result<LifecycleCommandResponse, PluginRpcError> {
+    lifecycle_command_response_with_timeout(
+        events_tx,
+        command,
+        response_flushed,
+        Some(PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT),
+    )
+    .await
+}
+
+async fn lifecycle_handoff_import_command_response(
+    events_tx: &mpsc::Sender<WorkerQueueItem>,
+    command: LifecycleCommand,
+    response_flushed: Option<oneshot::Receiver<()>>,
+) -> std::result::Result<LifecycleCommandResponse, PluginRpcError> {
+    lifecycle_command_response_with_timeout(events_tx, command, response_flushed, None).await
+}
+
+async fn lifecycle_command_response_with_timeout(
+    events_tx: &mpsc::Sender<WorkerQueueItem>,
+    command: LifecycleCommand,
+    response_flushed: Option<oneshot::Receiver<()>>,
+    response_timeout_after: Option<Duration>,
+) -> std::result::Result<LifecycleCommandResponse, PluginRpcError> {
     let (completion, response) = oneshot::channel();
     let requested_at = Instant::now();
     let expires_at = requested_at + PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT;
-    let response_expires_at = requested_at + PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT;
+    let response_expires_at =
+        requested_at + response_timeout_after.unwrap_or_else(|| Duration::from_secs(24 * 60 * 60));
     timeout_at(
         expires_at,
         events_tx.send(WorkerQueueItem::Lifecycle(QueuedLifecycleCommand {
@@ -4922,23 +5112,26 @@ async fn lifecycle_command_response(
             "worker lifecycle command queue is closed",
         )
     })?;
-    timeout_at(response_expires_at, response)
-        .await
-        .map_err(|_| {
-            PluginRpcError::new(
-                PluginRpcErrorKind::TransientDaemonUnavailable,
-                format!(
-                    "timed out after {}s waiting for worker lifecycle command response",
-                    PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT.as_secs()
-                ),
-            )
-        })?
-        .map_err(|_| {
-            PluginRpcError::new(
-                PluginRpcErrorKind::TransientDaemonUnavailable,
-                "worker stopped before completing lifecycle command",
-            )
-        })?
+    let response = match response_timeout_after {
+        Some(timeout_after) => timeout_at(response_expires_at, response)
+            .await
+            .map_err(|_| {
+                PluginRpcError::new(
+                    PluginRpcErrorKind::TransientDaemonUnavailable,
+                    format!(
+                        "timed out after {}s waiting for worker lifecycle command response",
+                        timeout_after.as_secs()
+                    ),
+                )
+            })?,
+        None => response.await,
+    };
+    response.map_err(|_| {
+        PluginRpcError::new(
+            PluginRpcErrorKind::TransientDaemonUnavailable,
+            "worker stopped before completing lifecycle command",
+        )
+    })?
 }
 
 fn decode_lifecycle_params<T>(
@@ -6115,16 +6308,7 @@ impl WorkerState {
     ) -> bool {
         let mut changed = false;
         for approval in pending_approvals.into_values() {
-            if self.local_approval_is_stale_against_remote(&approval) {
-                continue;
-            }
-            let Some(session) = self.sessions.get(&approval.session_id) else {
-                continue;
-            };
-            if !session_belongs_to_installation(session, installation_id) {
-                continue;
-            }
-            if approval.thread_id != session.thread_id {
+            if !self.local_pending_approval_is_claimable(&approval, installation_id) {
                 continue;
             }
             match self.pending_approvals.get(&approval.approval_id) {
@@ -6137,6 +6321,52 @@ impl WorkerState {
             }
         }
         changed
+    }
+
+    fn reconcile_handoff_pending_approvals(
+        &mut self,
+        authoritative_session_ids: &HashSet<String>,
+        pending_approvals: &HashMap<String, PendingApproval>,
+        installation_id: &str,
+    ) -> bool {
+        if authoritative_session_ids.is_empty() {
+            return false;
+        }
+        let authoritative_session_ids = authoritative_session_ids
+            .iter()
+            .filter(|session_id| {
+                self.sessions.get(*session_id).is_some_and(|session| {
+                    session_belongs_to_installation(session, installation_id)
+                })
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
+        let handoff_approval_ids = pending_approvals
+            .values()
+            .filter(|approval| self.local_pending_approval_is_claimable(approval, installation_id))
+            .map(|approval| approval.approval_id.clone())
+            .collect::<HashSet<_>>();
+        let before = self.pending_approvals.len();
+        self.pending_approvals.retain(|approval_id, approval| {
+            handoff_approval_ids.contains(approval_id)
+                || !authoritative_session_ids.contains(&approval.session_id)
+        });
+        self.pending_approvals.len() != before
+    }
+
+    fn local_pending_approval_is_claimable(
+        &self,
+        approval: &PendingApproval,
+        installation_id: &str,
+    ) -> bool {
+        if self.local_approval_is_stale_against_remote(approval) {
+            return false;
+        }
+        let Some(session) = self.sessions.get(&approval.session_id) else {
+            return false;
+        };
+        session_belongs_to_installation(session, installation_id)
+            && approval.thread_id == session.thread_id
     }
 
     fn local_session_is_stale_against_remote(&self, session: &SessionRecord) -> bool {

@@ -9,12 +9,13 @@ use super::{
     abbreviate, apply_thread_probe, attached_session_for_thread,
     build_async_notification_delivery_request, durable_local_snapshot_path,
     ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
-    ensure_session_id_belongs_to_installation, export_handoff_snapshot,
-    extract_thread_history_turns, generate_installation_id, handle_lifecycle_command,
-    import_handoff_snapshot, ingress_requires_processing_ack, ingress_uses_delivery_enqueue,
-    initial_lifecycle_phase_from_env, is_control_list_session, is_default_list_session,
-    is_failed_session_room_command, lifecycle_accepts_handoff_import, lifecycle_command_response,
-    lifecycle_control_socket_path_from_env, lifecycle_runtime_in_flight_total,
+    ensure_handoff_export_response_fits_rpc_frame, ensure_session_id_belongs_to_installation,
+    export_handoff_snapshot, extract_thread_history_turns, generate_installation_id,
+    handle_lifecycle_command, import_handoff_snapshot, ingress_requires_processing_ack,
+    ingress_uses_delivery_enqueue, initial_lifecycle_phase_from_env, is_control_list_session,
+    is_default_list_session, is_failed_session_room_command, lifecycle_accepts_handoff_import,
+    lifecycle_command_response, lifecycle_control_socket_path_from_env,
+    lifecycle_handoff_import_command_response, lifecycle_runtime_in_flight_total,
     lifecycle_sidecar_in_flight_count, load_durable_local_snapshot_with_metadata,
     load_local_snapshot_with_metadata, load_or_create_installation_identity,
     normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
@@ -37,8 +38,9 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wxcd_cbth_rpc::{
-    PluginDrainRequest, PluginHandoffSnapshot, PluginHealthCheckRequest, PluginRpcError,
-    PluginRpcErrorKind, PluginShutdownRequest,
+    PLUGIN_RPC_MAX_FRAME_BYTES, PluginDrainRequest, PluginHandoffExportResponse,
+    PluginHandoffImportRequest, PluginHandoffSnapshot, PluginHealthCheckRequest,
+    PluginLifecycleAckResponse, PluginRpcError, PluginRpcErrorKind, PluginShutdownRequest,
 };
 use wxcd_proto::{
     AppConfig, BridgeConfig, BridgeSnapshot, CbthPluginConfig, DiagnosticsConfig,
@@ -57,6 +59,18 @@ fn lifecycle_drain_command(reason: &str) -> LifecycleCommand {
             reason: reason.to_string(),
         },
         token: LifecycleTransitionToken::for_generation(0),
+    }
+}
+
+fn lifecycle_handoff_import_command(reason: &str) -> LifecycleCommand {
+    LifecycleCommand::HandoffImport {
+        request: PluginHandoffImportRequest {
+            reason: reason.to_string(),
+            snapshot: PluginHandoffSnapshot {
+                schema_version: 1,
+                payload: json!({}),
+            },
+        },
     }
 }
 
@@ -1835,6 +1849,25 @@ async fn handoff_export_includes_cursor_in_flight_and_sidecar_restart_state() {
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 
+#[test]
+fn handoff_export_rejects_payload_over_rpc_frame_budget() {
+    let response = PluginHandoffExportResponse {
+        snapshot: PluginHandoffSnapshot {
+            schema_version: 1,
+            payload: json!({
+                "blob": "x".repeat(PLUGIN_RPC_MAX_FRAME_BYTES),
+            }),
+        },
+    };
+
+    let error = ensure_handoff_export_response_fits_rpc_frame(&response).unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("exceeds safe plugin RPC payload budget"),
+        "{error:#}"
+    );
+}
+
 #[tokio::test]
 async fn handoff_import_applies_snapshot_cursor_and_deferred_ingress_without_external_io() {
     let source_dir = std::env::temp_dir().join(format!(
@@ -1853,7 +1886,15 @@ async fn handoff_import_applies_snapshot_cursor_and_deferred_ingress_without_ext
         .cbth_plugin
         .plugin_home
         .join(SIDECAR_DEFERRED_INGRESS_DIR);
+    let source_drain_state_dir = source_config
+        .bridge
+        .cbth_plugin
+        .plugin_home
+        .join(SIDECAR_DRAIN_STATE_DIR);
     tokio::fs::create_dir_all(&deferred_ingress_dir)
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(&source_drain_state_dir)
         .await
         .unwrap();
     tokio::fs::write(
@@ -1866,6 +1907,22 @@ async fn handoff_import_applies_snapshot_cursor_and_deferred_ingress_without_ext
                 "kind": "message_created",
                 "event_id": "event-import"
             }
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        source_drain_state_dir.join(format!(
+            "{}handoff-source.json",
+            sidecar_drain_state_file_prefix(&source_config)
+        )),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "pid": std::process::id(),
+            "in_flight_count": 2,
+            "updated_at": Utc::now().to_rfc3339()
         }))
         .unwrap(),
     )
@@ -1897,6 +1954,25 @@ async fn handoff_import_applies_snapshot_cursor_and_deferred_ingress_without_ext
         false,
         "ins_current",
     ));
+    let target_deferred_dir = target_config
+        .bridge
+        .cbth_plugin
+        .plugin_home
+        .join(SIDECAR_DEFERRED_INGRESS_DIR);
+    tokio::fs::create_dir_all(&target_deferred_dir)
+        .await
+        .unwrap();
+    tokio::fs::write(
+        target_deferred_dir.join("foreign-same-event.json"),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-other",
+            "plugin_release_id": "0.2.0",
+            "event_id": "event-import"
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
 
     let ack = import_handoff_snapshot(&target_config, &mut target_state, snapshot)
         .await
@@ -1909,13 +1985,29 @@ async fn handoff_import_applies_snapshot_cursor_and_deferred_ingress_without_ext
     assert_eq!(imported.active_turn_buffer, "partial output");
     assert!(target_state.recent_event_ids.contains("event-import"));
     assert!(target_state.pending_approvals.contains_key("apr_running"));
-    let target_deferred_dir = target_config
-        .bridge
-        .cbth_plugin
-        .plugin_home
-        .join(SIDECAR_DEFERRED_INGRESS_DIR);
     let mut deferred_entries = tokio::fs::read_dir(&target_deferred_dir).await.unwrap();
-    assert!(deferred_entries.next_entry().await.unwrap().is_some());
+    let mut current_instance_event_records = 0;
+    let mut foreign_instance_event_records = 0;
+    while let Some(entry) = deferred_entries.next_entry().await.unwrap() {
+        let record: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(entry.path()).await.unwrap()).unwrap();
+        if record.get("event_id").and_then(serde_json::Value::as_str) == Some("event-import") {
+            match record
+                .get("plugin_instance_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("instance-1") => current_instance_event_records += 1,
+                Some("instance-other") => foreign_instance_event_records += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(current_instance_event_records, 1);
+    assert_eq!(foreign_instance_event_records, 1);
+    assert_eq!(
+        lifecycle_sidecar_in_flight_count(&target_config, None).await,
+        2
+    );
     assert!(
         tokio::fs::try_exists(
             target_config
@@ -1927,6 +2019,56 @@ async fn handoff_import_applies_snapshot_cursor_and_deferred_ingress_without_ext
         .await
         .unwrap()
     );
+
+    tokio::fs::remove_dir_all(&source_dir).await.unwrap();
+    tokio::fs::remove_dir_all(&target_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn handoff_import_removes_target_approvals_absent_from_snapshot() {
+    let source_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-import-approval-source-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let target_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-import-approval-target-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let source_config = app_config_with_state_dir(&source_dir, true);
+    let target_config = app_config_with_state_dir(&target_dir, true);
+
+    let mut source_state = WorkerState::default();
+    source_state.set_executable_installation("ins_current");
+    source_state.upsert_session(managed_session_record(
+        "ses_approval",
+        SessionState::Idle,
+        false,
+        "ins_current",
+    ));
+    let snapshot = export_handoff_snapshot(&source_config, &source_state)
+        .await
+        .unwrap()
+        .snapshot;
+
+    let mut target_state = WorkerState::default();
+    target_state.set_executable_installation("ins_current");
+    target_state.upsert_session(managed_session_record(
+        "ses_approval",
+        SessionState::WaitingApproval,
+        false,
+        "ins_current",
+    ));
+    target_state.pending_approvals.insert(
+        "apr_stale".to_string(),
+        pending_approval("apr_stale", "ses_approval"),
+    );
+
+    let ack = import_handoff_snapshot(&target_config, &mut target_state, snapshot)
+        .await
+        .unwrap();
+
+    assert!(ack.accepted);
+    assert!(!target_state.pending_approvals.contains_key("apr_stale"));
 
     tokio::fs::remove_dir_all(&source_dir).await.unwrap();
     tokio::fs::remove_dir_all(&target_dir).await.unwrap();
@@ -2765,6 +2907,39 @@ async fn lifecycle_command_response_preserves_typed_worker_errors() {
 
     assert_eq!(error.kind, PluginRpcErrorKind::TransientDaemonUnavailable);
     assert!(error.retryable);
+}
+
+#[tokio::test]
+async fn lifecycle_handoff_import_response_waits_without_fixed_timeout() {
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(1);
+    let response_task = tokio::spawn(async move {
+        lifecycle_handoff_import_command_response(
+            &events_tx,
+            lifecycle_handoff_import_command("upgrade"),
+            None,
+        )
+        .await
+    });
+
+    let WorkerQueueItem::Lifecycle(command) =
+        events_rx.recv().await.expect("queued lifecycle command")
+    else {
+        panic!("expected lifecycle command");
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    command
+        .completion
+        .send(Ok(LifecycleCommandResponse::HandoffImport(
+            PluginLifecycleAckResponse { accepted: true },
+        )))
+        .ok();
+
+    let response = response_task.await.unwrap().unwrap();
+
+    assert!(matches!(
+        response,
+        LifecycleCommandResponse::HandoffImport(PluginLifecycleAckResponse { accepted: true })
+    ));
 }
 
 #[tokio::test]
