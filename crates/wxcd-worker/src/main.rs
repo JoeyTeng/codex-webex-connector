@@ -3542,29 +3542,13 @@ async fn sidecar_deferred_ingress_count(config: &AppConfig) -> u64 {
 
 fn sidecar_drain_state_file_prefix(config: &AppConfig) -> String {
     format!(
-        "{}--{}--",
-        sidecar_drain_state_component(&config.bridge.cbth_plugin.plugin_instance_id),
-        sidecar_drain_state_component(&config.bridge.cbth_plugin.plugin_release_id)
+        "scope-{}--",
+        stable_fnv1a_hex(&format!(
+            "{}\n{}",
+            config.bridge.cbth_plugin.plugin_instance_id,
+            config.bridge.cbth_plugin.plugin_release_id
+        ))
     )
-}
-
-fn sidecar_drain_state_component(value: &str) -> String {
-    let normalized: String = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(128)
-        .collect();
-    if normalized.is_empty() {
-        "unknown".to_string()
-    } else {
-        normalized
-    }
 }
 
 fn sidecar_drain_state_file_matches(path: &Path, matching_file_prefix: &str) -> bool {

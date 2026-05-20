@@ -22,8 +22,8 @@ use super::{
     session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
     should_process_async_notification_event, sidecar_deferred_ingress_count,
     sidecar_drain_in_flight_count, sidecar_drain_in_flight_count_after,
-    sidecar_received_before_cutoff, slice_thread_history_page, stable_fnv1a_hex,
-    startup_snapshot_persist_now, validate_purge_archived_session,
+    sidecar_drain_state_file_prefix, sidecar_received_before_cutoff, slice_thread_history_page,
+    stable_fnv1a_hex, startup_snapshot_persist_now, validate_purge_archived_session,
     wait_for_lifecycle_response_flush, webex_delivery_idempotency_key, worker_active_check_ack,
     worker_ingress_socket_path_for, worker_ingress_socket_path_from_env,
     write_supervisor_shutdown_marker_at,
@@ -1951,8 +1951,9 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
     tokio::fs::create_dir_all(&plugin_home).await.unwrap();
     let drain_state_dir = plugin_home.join(SIDECAR_DRAIN_STATE_DIR);
     tokio::fs::create_dir_all(&drain_state_dir).await.unwrap();
+    let matching_prefix = sidecar_drain_state_file_prefix(&config);
     tokio::fs::write(
-        drain_state_dir.join("instance-1--0.1.0--12345.json"),
+        drain_state_dir.join(format!("{matching_prefix}12345.json")),
         serde_json::to_vec(&json!({
             "plugin_instance_id": "instance-1",
             "plugin_release_id": "0.1.0",
@@ -1983,7 +1984,8 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
     )
     .await
     .unwrap();
-    let stale_current_pid_path = drain_state_dir.join("instance-1--0.1.0--stale-current-pid.json");
+    let stale_current_pid_path =
+        drain_state_dir.join(format!("{matching_prefix}stale-current-pid.json"));
     tokio::fs::write(
         &stale_current_pid_path,
         serde_json::to_vec(&json!({
@@ -1998,7 +2000,7 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
     .await
     .unwrap();
     tokio::fs::write(
-        drain_state_dir.join("instance-1--0.1.0--2147483647.json"),
+        drain_state_dir.join(format!("{matching_prefix}2147483647.json")),
         serde_json::to_vec(&json!({
             "plugin_instance_id": "instance-1",
             "plugin_release_id": "0.1.0",
@@ -2021,6 +2023,20 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
     config.bridge.cbth_plugin.enabled = false;
     assert_eq!(sidecar_drain_in_flight_count(&config).await, 0);
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[test]
+fn sidecar_drain_state_file_prefix_is_bounded() {
+    let state_dir = std::env::temp_dir().join("wxcd-worker-sidecar-drain-state-prefix-test");
+    let mut config = app_config_with_state_dir(&state_dir, true);
+    config.bridge.cbth_plugin.plugin_instance_id = "instance-".repeat(128);
+    config.bridge.cbth_plugin.plugin_release_id = "release-".repeat(128);
+
+    let prefix = sidecar_drain_state_file_prefix(&config);
+
+    assert!(prefix.starts_with("scope-"));
+    assert!(prefix.ends_with("--"));
+    assert!(prefix.len() < 64, "{prefix}");
 }
 
 #[tokio::test]
@@ -2104,7 +2120,10 @@ async fn sidecar_drain_requires_post_cutoff_inactive_observation() {
     let drain_state_dir = plugin_home.join(SIDECAR_DRAIN_STATE_DIR);
     tokio::fs::create_dir_all(&drain_state_dir).await.unwrap();
     let cutoff = Utc.timestamp_millis_opt(1_700_000_000_123).unwrap() + Duration::microseconds(750);
-    let state_path = drain_state_dir.join("instance-1--0.1.0--current.json");
+    let state_path = drain_state_dir.join(format!(
+        "{}current.json",
+        sidecar_drain_state_file_prefix(&config)
+    ));
 
     tokio::fs::write(
         &state_path,
