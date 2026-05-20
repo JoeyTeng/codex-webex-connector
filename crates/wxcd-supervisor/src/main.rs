@@ -83,11 +83,8 @@ async fn run_supervisor() -> Result<()> {
     loop {
         let release_dir = current_release_dir(&config)?;
         let shutdown_marker_path = supervisor_shutdown_marker_path(&config.bridge.cbth_plugin);
-        if consume_current_supervisor_shutdown_marker(
-            &config.bridge.cbth_plugin,
-            &shutdown_marker_path,
-        )
-        .await?
+        if supervisor_shutdown_was_requested(&config.bridge.cbth_plugin, &shutdown_marker_path)
+            .await?
         {
             info!("honoring existing worker-requested supervisor shutdown marker");
             return Ok(());
@@ -1116,6 +1113,9 @@ struct SupervisorShutdownMarker {
 }
 
 async fn supervisor_shutdown_was_requested(config: &CbthPluginConfig, path: &Path) -> Result<bool> {
+    if !config.enabled {
+        return Ok(false);
+    }
     consume_current_supervisor_shutdown_marker(config, path).await
 }
 
@@ -1739,6 +1739,44 @@ mod tests {
                 .unwrap()
         );
         assert!(!tokio::fs::try_exists(&marker_path).await.unwrap());
+        tokio::fs::remove_dir_all(&plugin_home).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervisor_ignores_shutdown_marker_when_plugin_mode_disabled() {
+        let plugin_home = std::env::temp_dir().join(format!(
+            "wxcd-supervisor-standalone-shutdown-marker-test-{}",
+            current_unix_nanos().unwrap()
+        ));
+        tokio::fs::create_dir_all(&plugin_home).await.unwrap();
+        let config = CbthPluginConfig {
+            enabled: false,
+            socket_path: None,
+            plugin_home: plugin_home.clone(),
+            plugin_instance_id: "instance-1".to_string(),
+            plugin_release_id: "release-1".to_string(),
+            manifest_path: "/tmp/plugin/manifest.json".into(),
+        };
+        let marker_path = supervisor_shutdown_marker_path(&config);
+        tokio::fs::write(
+            &marker_path,
+            serde_json::json!({
+                "plugin_instance_id": "instance-1",
+                "plugin_release_id": "release-1",
+                "reason": "upgrade",
+                "created_at": "2026-05-20T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !supervisor_shutdown_was_requested(&config, &marker_path)
+                .await
+                .unwrap()
+        );
+        assert!(tokio::fs::try_exists(&marker_path).await.unwrap());
         tokio::fs::remove_dir_all(&plugin_home).await.unwrap();
     }
 

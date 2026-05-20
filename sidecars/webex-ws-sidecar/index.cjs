@@ -19,6 +19,14 @@ const token = process.env.WEBEX_BOT_TOKEN;
 const socketPath = process.env.WXCD_SOCKET_PATH || "/tmp/wxcd.sock";
 const botEmail = (process.env.WEBEX_BOT_EMAIL || "").toLowerCase();
 const ingressRetryDelayMs = Number.parseInt(process.env.WXCD_INGRESS_RETRY_DELAY_MS || "1000", 10);
+const deferredIngressPersistTimeoutMs = Number.parseInt(
+  process.env.WXCD_DEFERRED_INGRESS_PERSIST_TIMEOUT_MS || "30000",
+  10
+);
+const deferredIngressReplayMaxAgeMs = Number.parseInt(
+  process.env.WXCD_DEFERRED_INGRESS_REPLAY_MAX_AGE_MS || "86400000",
+  10
+);
 const sidecarDrainStateHeartbeatMs = 30000;
 const pluginHome = process.env.WXCD_PLUGIN_HOME || process.env.CBTH_PLUGIN_HOME || "";
 const pluginInstanceId = process.env.WXCD_PLUGIN_INSTANCE_ID || "standalone";
@@ -61,6 +69,10 @@ function sleep(ms) {
 function drainStateComponent(value) {
   const normalized = String(value || "unknown").replace(/[^A-Za-z0-9_.-]/g, "_");
   return normalized.slice(0, 128) || "unknown";
+}
+
+function finitePositiveDurationMs(value, fallback) {
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 async function deferredIngressCountForDrainState() {
@@ -261,13 +273,30 @@ async function persistDeferredIngress(envelope, error) {
 }
 
 async function persistDeferredIngressUntilStored(envelope, error) {
+  const startedAt = Date.now();
+  const timeoutMs = finitePositiveDurationMs(deferredIngressPersistTimeoutMs, 30000);
+  const retryDelayMs = finitePositiveDurationMs(ingressRetryDelayMs, 1000);
   let nextLogAt = 0;
+  let attempts = 0;
   for (;;) {
     try {
       await persistDeferredIngress(envelope, error);
       return;
     } catch (persistError) {
+      attempts += 1;
       const now = Date.now();
+      const elapsedMs = now - startedAt;
+      if (elapsedMs >= timeoutMs) {
+        exitForSupervisorRestart("deferred_ingress_persist_failed", {
+          message: persistError?.message || String(persistError),
+          code: persistError?.code,
+          event_id: envelope?.event_id || null,
+          attempts,
+          elapsed_ms: elapsedMs,
+          timeout_ms: timeoutMs,
+        });
+        throw persistError;
+      }
       if (now >= nextLogAt) {
         console.error(
           "failed to persist deferred ingress; retrying before releasing sidecar drain",
@@ -275,7 +304,7 @@ async function persistDeferredIngressUntilStored(envelope, error) {
         );
         nextLogAt = now + 10000;
       }
-      await sleep(Number.isFinite(ingressRetryDelayMs) ? ingressRetryDelayMs : 1000);
+      await sleep(Math.min(retryDelayMs, timeoutMs - elapsedMs));
     }
   }
 }
@@ -310,10 +339,18 @@ function replayRecordSortTime(record) {
 }
 
 function deferredIngressRecordMatchesCurrentScope(record) {
-  return (
-    record?.plugin_instance_id === pluginInstanceId &&
-    record?.plugin_release_id === pluginReleaseId
-  );
+  if (record?.plugin_instance_id !== pluginInstanceId) {
+    return false;
+  }
+  if (record?.plugin_release_id === pluginReleaseId) {
+    return true;
+  }
+  const maxAgeMs = finitePositiveDurationMs(deferredIngressReplayMaxAgeMs, 86400000);
+  const timestamp = Date.parse(record?.deferred_at || record?.envelope?.created_at || record?.envelope?.created);
+  if (!Number.isFinite(timestamp)) {
+    return false;
+  }
+  return Date.now() - timestamp <= maxAgeMs;
 }
 
 async function replayDeferredIngress() {
@@ -348,7 +385,7 @@ async function replayDeferredIngress() {
         continue;
       }
       if (!deferredIngressRecordMatchesCurrentScope(record)) {
-        console.error("skipping deferred Webex ingress from a different plugin scope", {
+        console.error("skipping deferred Webex ingress from a different or stale plugin scope", {
           path: recordPath,
           plugin_instance_id: record?.plugin_instance_id,
           plugin_release_id: record?.plugin_release_id,

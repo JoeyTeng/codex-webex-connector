@@ -79,6 +79,7 @@ const WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV: &str = "WXCD_SUPERVISOR_SHUTDOWN_MARK
 const SIDECAR_DRAIN_STATE_DIR: &str = "webex-sidecar-drain-state";
 const SIDECAR_DEFERRED_INGRESS_DIR: &str = "webex-sidecar-deferred-ingress";
 const SIDECAR_DRAIN_STATE_STALE_AFTER: Duration = Duration::from_secs(120);
+const SIDECAR_DEFERRED_INGRESS_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const WEBEX_DELIVERY_MAX_ATTEMPTS: i64 = 3;
 const WEBEX_DELIVERY_REDELIVERY_WINDOW_SECONDS: i64 = 3600;
 
@@ -3490,6 +3491,7 @@ async fn sidecar_deferred_ingress_count(config: &AppConfig) -> u64 {
         }
     };
     let mut count = 0;
+    let now = Utc::now();
     loop {
         let entry = match entries.next_entry().await {
             Ok(Some(entry)) => entry,
@@ -3532,9 +3534,7 @@ async fn sidecar_deferred_ingress_count(config: &AppConfig) -> u64 {
                 continue;
             }
         };
-        if record.plugin_instance_id == config.bridge.cbth_plugin.plugin_instance_id
-            && record.plugin_release_id == config.bridge.cbth_plugin.plugin_release_id
-        {
+        if sidecar_deferred_ingress_record_matches_current_scope(&record, config, now) {
             count += 1;
         }
     }
@@ -3597,6 +3597,28 @@ impl SidecarDrainState {
 struct SidecarDeferredIngressRecord {
     plugin_instance_id: String,
     plugin_release_id: String,
+    #[serde(default)]
+    deferred_at: Option<DateTime<Utc>>,
+}
+
+fn sidecar_deferred_ingress_record_matches_current_scope(
+    record: &SidecarDeferredIngressRecord,
+    config: &AppConfig,
+    now: DateTime<Utc>,
+) -> bool {
+    if record.plugin_instance_id != config.bridge.cbth_plugin.plugin_instance_id {
+        return false;
+    }
+    if record.plugin_release_id == config.bridge.cbth_plugin.plugin_release_id {
+        return true;
+    }
+    let Some(deferred_at) = record.deferred_at else {
+        return false;
+    };
+    match now.signed_duration_since(deferred_at).to_std() {
+        Ok(age) => age <= SIDECAR_DEFERRED_INGRESS_STALE_AFTER,
+        Err(_) => true,
+    }
 }
 
 fn sidecar_drain_state_is_fresh(state: &SidecarDrainState, now: DateTime<Utc>) -> bool {

@@ -2051,7 +2051,32 @@ async fn lifecycle_runtime_count_includes_deferred_ingress_records() {
         serde_json::to_vec(&json!({
             "plugin_instance_id": "instance-1",
             "plugin_release_id": "old-release",
-            "event_id": "event-old"
+            "event_id": "event-old",
+            "deferred_at": Utc::now().to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        deferred_ingress_dir.join("stale-old-release.json"),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "old-release",
+            "event_id": "event-stale-old",
+            "deferred_at": (Utc::now() - Duration::days(2)).to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        deferred_ingress_dir.join("foreign-instance.json"),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-other",
+            "plugin_release_id": "0.1.0",
+            "event_id": "event-foreign",
+            "deferred_at": Utc::now().to_rfc3339()
         }))
         .unwrap(),
     )
@@ -2061,7 +2086,7 @@ async fn lifecycle_runtime_count_includes_deferred_ingress_records() {
         .await
         .unwrap();
 
-    assert_eq!(sidecar_deferred_ingress_count(&config).await, 2);
+    assert_eq!(sidecar_deferred_ingress_count(&config).await, 3);
 
     config.bridge.cbth_plugin.enabled = false;
     assert_eq!(sidecar_deferred_ingress_count(&config).await, 0);
