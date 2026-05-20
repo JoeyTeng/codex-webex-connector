@@ -2036,15 +2036,14 @@ async fn handoff_import_removes_target_approvals_absent_from_snapshot() {
     ));
     let source_config = app_config_with_state_dir(&source_dir, true);
     let target_config = app_config_with_state_dir(&target_dir, true);
+    let base_time = Utc::now();
 
     let mut source_state = WorkerState::default();
     source_state.set_executable_installation("ins_current");
-    source_state.upsert_session(managed_session_record(
-        "ses_approval",
-        SessionState::Idle,
-        false,
-        "ins_current",
-    ));
+    let mut source_session =
+        managed_session_record("ses_approval", SessionState::Idle, false, "ins_current");
+    source_session.updated_at = base_time + Duration::seconds(1);
+    source_state.upsert_session(source_session);
     let snapshot = export_handoff_snapshot(&source_config, &source_state)
         .await
         .unwrap()
@@ -2052,12 +2051,14 @@ async fn handoff_import_removes_target_approvals_absent_from_snapshot() {
 
     let mut target_state = WorkerState::default();
     target_state.set_executable_installation("ins_current");
-    target_state.upsert_session(managed_session_record(
+    let mut target_session = managed_session_record(
         "ses_approval",
         SessionState::WaitingApproval,
         false,
         "ins_current",
-    ));
+    );
+    target_session.updated_at = base_time;
+    target_state.upsert_session(target_session);
     target_state.pending_approvals.insert(
         "apr_stale".to_string(),
         pending_approval("apr_stale", "ses_approval"),
@@ -2069,6 +2070,66 @@ async fn handoff_import_removes_target_approvals_absent_from_snapshot() {
 
     assert!(ack.accepted);
     assert!(!target_state.pending_approvals.contains_key("apr_stale"));
+
+    tokio::fs::remove_dir_all(&source_dir).await.unwrap();
+    tokio::fs::remove_dir_all(&target_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn handoff_import_preserves_newer_target_approval_when_session_not_replaced() {
+    let source_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-import-newer-approval-source-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let target_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-import-newer-approval-target-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let source_config = app_config_with_state_dir(&source_dir, true);
+    let target_config = app_config_with_state_dir(&target_dir, true);
+    let base_time = Utc::now();
+
+    let mut source_state = WorkerState::default();
+    source_state.set_executable_installation("ins_current");
+    let mut source_session =
+        managed_session_record("ses_approval", SessionState::Idle, false, "ins_current");
+    source_session.updated_at = base_time;
+    source_state.upsert_session(source_session);
+    let snapshot = export_handoff_snapshot(&source_config, &source_state)
+        .await
+        .unwrap()
+        .snapshot;
+
+    let mut target_state = WorkerState::default();
+    target_state.set_executable_installation("ins_current");
+    let mut target_session = managed_session_record(
+        "ses_approval",
+        SessionState::WaitingApproval,
+        false,
+        "ins_current",
+    );
+    target_session.updated_at = base_time + Duration::seconds(1);
+    target_state.upsert_session(target_session);
+    let mut target_approval = pending_approval("apr_target_newer", "ses_approval");
+    target_approval.requested_at = base_time + Duration::seconds(1);
+    target_state
+        .pending_approvals
+        .insert("apr_target_newer".to_string(), target_approval);
+
+    let ack = import_handoff_snapshot(&target_config, &mut target_state, snapshot)
+        .await
+        .unwrap();
+
+    assert!(ack.accepted);
+    assert!(
+        target_state
+            .pending_approvals
+            .contains_key("apr_target_newer")
+    );
+    assert_eq!(
+        target_state.sessions.get("ses_approval").unwrap().state,
+        SessionState::WaitingApproval
+    );
 
     tokio::fs::remove_dir_all(&source_dir).await.unwrap();
     tokio::fs::remove_dir_all(&target_dir).await.unwrap();

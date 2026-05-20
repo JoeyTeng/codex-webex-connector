@@ -54,3 +54,5 @@ superseded_by:
   - `plugin.handoff_import` now removes target pending approvals for handoff-owned sessions when those approvals are absent from the authoritative source snapshot.
 - Online review-gate threads found and W6 fixed additional handoff hardening gaps:
   - `plugin.handoff_export` now rejects snapshots that would exceed the safe RPC frame budget, import waits without the generic fixed lifecycle response timeout, deferred-ingress dedupe is scoped to the current plugin instance, and sidecar drain-state records are materialized for the target release.
+- The follow-up frozen-diff pass found and W6 fixed two import consistency issues:
+  - Approval reconcile is authoritative only for source sessions actually adopted by import, and the import path keeps memory/durable state commit together instead of splitting it across response flush.

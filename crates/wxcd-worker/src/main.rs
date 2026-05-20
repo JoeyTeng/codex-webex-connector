@@ -311,11 +311,6 @@ struct WebexHandoffSidecarFileRecord {
     record: Value,
 }
 
-struct StagedHandoffImport {
-    response: PluginLifecycleAckResponse,
-    state: WorkerState,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleAdmissionPhase {
     Active,
@@ -1046,53 +1041,6 @@ async fn run() -> Result<()> {
                             LifecycleCommand::Shutdown { previous_phase, .. } => Some(*previous_phase),
                             _ => None,
                         };
-                        if let LifecycleCommand::HandoffImport { request } = command {
-                            let result = if lifecycle_accepts_handoff_import(
-                                startup_reconcile_pending,
-                                lifecycle.phase(),
-                            ) {
-                                stage_handoff_import_snapshot(
-                                    &config,
-                                    &state,
-                                    request.snapshot,
-                                )
-                                .await
-                                .map_err(|error| {
-                                    PluginRpcError::new(
-                                        PluginRpcErrorKind::Internal,
-                                        format!("{error:#}"),
-                                    )
-                                })
-                            } else {
-                                Err(PluginRpcError::new(
-                                    PluginRpcErrorKind::Internal,
-                                    "lifecycle handoff import requires pre-active quiesced Webex work admission",
-                                ))
-                            };
-                            match result {
-                                Ok(staged) => {
-                                    let completion_delivered = completion
-                                        .send(Ok(LifecycleCommandResponse::HandoffImport(
-                                            staged.response.clone(),
-                                        )))
-                                        .is_ok();
-                                    if completion_delivered
-                                        && wait_for_lifecycle_response_flush(response_flushed).await
-                                    {
-                                        state = staged.state;
-                                        info!("lifecycle handoff import accepted: {}", request.reason);
-                                    } else {
-                                        warn!(
-                                            "lifecycle handoff import staged locally but response was not delivered; keeping pre-import worker state"
-                                        );
-                                    }
-                                }
-                                Err(error) => {
-                                    let _ = completion.send(Err(error));
-                                }
-                            }
-                            continue;
-                        }
                         let result = match command {
                             LifecycleCommand::Unquiesce { request, token } => {
                                 handle_lifecycle_unquiesce(
@@ -3473,16 +3421,6 @@ async fn import_handoff_snapshot(
     state: &mut WorkerState,
     snapshot: PluginHandoffSnapshot,
 ) -> Result<PluginLifecycleAckResponse> {
-    let staged = stage_handoff_import_snapshot(config, state, snapshot).await?;
-    *state = staged.state;
-    Ok(staged.response)
-}
-
-async fn stage_handoff_import_snapshot(
-    config: &AppConfig,
-    state: &WorkerState,
-    snapshot: PluginHandoffSnapshot,
-) -> Result<StagedHandoffImport> {
     if !config.bridge.cbth_plugin.enabled {
         bail!("plugin handoff import requires cbth plugin mode");
     }
@@ -3504,10 +3442,8 @@ async fn stage_handoff_import_snapshot(
         .await?;
     persist_webex_handoff_state(config, &payload).await?;
     persist_durable_lifecycle_mirror(config, &imported_state).await?;
-    Ok(StagedHandoffImport {
-        response: PluginLifecycleAckResponse { accepted: true },
-        state: imported_state,
-    })
+    *state = imported_state;
+    Ok(PluginLifecycleAckResponse { accepted: true })
 }
 
 fn decode_webex_handoff_payload(snapshot: PluginHandoffSnapshot) -> Result<WebexHandoffPayload> {
@@ -3600,7 +3536,6 @@ fn apply_webex_handoff_payload(
         } else if state.local_session_is_stale_against_remote(&local_session) {
             continue;
         }
-        authoritative_session_ids.insert(local_session.session_id.clone());
         if local_session.authority.is_none() {
             local_session.authority = Some(SessionAuthority {
                 installation_id: installation_id.clone(),
@@ -3613,6 +3548,7 @@ fn apply_webex_handoff_payload(
             });
         }
         if replace_session {
+            authoritative_session_ids.insert(local_session.session_id.clone());
             state.upsert_session(local_session);
             changed = true;
             continue;
@@ -4997,41 +4933,37 @@ async fn handle_lifecycle_rpc_frame(
         }
         PLUGIN_RPC_PLUGIN_HANDOFF_IMPORT_METHOD => {
             match decode_lifecycle_params::<PluginHandoffImportRequest>(&frame) {
-                Ok(request) => {
-                    let (flushed_tx, flushed_rx) = oneshot::channel();
-                    response_flushed = Some(flushed_tx);
-                    lifecycle_handoff_import_command_response(
-                        events_tx,
-                        LifecycleCommand::HandoffImport { request },
-                        Some(flushed_rx),
-                    )
-                    .await
-                    .and_then(|response| match response {
-                        LifecycleCommandResponse::HandoffImport(response) => {
-                            serde_json::to_value(response).map_err(|error| {
-                                PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
-                            })
-                        }
-                        LifecycleCommandResponse::Drain(_) => Err(PluginRpcError::new(
+                Ok(request) => lifecycle_handoff_import_command_response(
+                    events_tx,
+                    LifecycleCommand::HandoffImport { request },
+                    None,
+                )
+                .await
+                .and_then(|response| match response {
+                    LifecycleCommandResponse::HandoffImport(response) => {
+                        serde_json::to_value(response).map_err(|error| {
+                            PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
+                        })
+                    }
+                    LifecycleCommandResponse::Drain(_) => Err(PluginRpcError::new(
+                        PluginRpcErrorKind::Internal,
+                        "handoff import command returned drain response",
+                    )),
+                    LifecycleCommandResponse::Ack(_) => Err(PluginRpcError::new(
+                        PluginRpcErrorKind::Internal,
+                        "handoff import command returned ack response",
+                    )),
+                    LifecycleCommandResponse::HandoffExport(_) => Err(PluginRpcError::new(
+                        PluginRpcErrorKind::Internal,
+                        "handoff import command returned export response",
+                    )),
+                    LifecycleCommandResponse::AckWithUnquiesceCommit { .. } => {
+                        Err(PluginRpcError::new(
                             PluginRpcErrorKind::Internal,
-                            "handoff import command returned drain response",
-                        )),
-                        LifecycleCommandResponse::Ack(_) => Err(PluginRpcError::new(
-                            PluginRpcErrorKind::Internal,
-                            "handoff import command returned ack response",
-                        )),
-                        LifecycleCommandResponse::HandoffExport(_) => Err(PluginRpcError::new(
-                            PluginRpcErrorKind::Internal,
-                            "handoff import command returned export response",
-                        )),
-                        LifecycleCommandResponse::AckWithUnquiesceCommit { .. } => {
-                            Err(PluginRpcError::new(
-                                PluginRpcErrorKind::Internal,
-                                "handoff import command returned unquiesce response",
-                            ))
-                        }
-                    })
-                }
+                            "handoff import command returned unquiesce response",
+                        ))
+                    }
+                }),
                 Err(error) => Err(error),
             }
         }
