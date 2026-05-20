@@ -187,6 +187,26 @@ async function persistDeferredIngress(envelope, error) {
   await fs.rename(tmpPath, targetPath);
 }
 
+async function persistDeferredIngressUntilStored(envelope, error) {
+  let nextLogAt = 0;
+  for (;;) {
+    try {
+      await persistDeferredIngress(envelope, error);
+      return;
+    } catch (persistError) {
+      const now = Date.now();
+      if (now >= nextLogAt) {
+        console.error(
+          "failed to persist deferred ingress; retrying before releasing sidecar drain",
+          persistError
+        );
+        nextLogAt = now + 10000;
+      }
+      await sleep(Number.isFinite(ingressRetryDelayMs) ? ingressRetryDelayMs : 1000);
+    }
+  }
+}
+
 function refreshReplayEnvelope(envelope) {
   if (
     envelope?.kind === "message_created" ||
@@ -362,7 +382,7 @@ async function sendEnvelope(envelope, options = {}) {
       return;
     } catch (error) {
       if (options.deferOnLifecycleRejection === true && error?.lifecycleRejected) {
-        await persistDeferredIngress(envelope, error);
+        await persistDeferredIngressUntilStored(envelope, error);
         await stopWebexListeners();
         return SEND_DEFERRED;
       }
