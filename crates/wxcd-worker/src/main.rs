@@ -321,14 +321,20 @@ impl LifecycleControl {
         self: &Arc<Self>,
     ) -> std::result::Result<LifecycleWorkPermit, String> {
         let phase = self.phase.lock().expect("lifecycle phase poisoned");
-        if *phase == LifecycleAdmissionPhase::ShuttingDown {
-            Err("plugin is shutting down and is not accepting new Webex work".to_string())
-        } else {
-            self.in_flight.fetch_add(1, Ordering::SeqCst);
-            Ok(LifecycleWorkPermit {
-                lifecycle: Arc::clone(self),
-                finished: false,
-            })
+        match *phase {
+            LifecycleAdmissionPhase::Active => {
+                self.in_flight.fetch_add(1, Ordering::SeqCst);
+                Ok(LifecycleWorkPermit {
+                    lifecycle: Arc::clone(self),
+                    finished: false,
+                })
+            }
+            LifecycleAdmissionPhase::Quiescing => {
+                Err("plugin is quiescing and is not accepting new Webex work".to_string())
+            }
+            LifecycleAdmissionPhase::ShuttingDown => {
+                Err("plugin is shutting down and is not accepting new Webex work".to_string())
+            }
         }
     }
 

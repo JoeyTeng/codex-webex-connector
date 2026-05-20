@@ -1676,16 +1676,19 @@ async fn lifecycle_quiesce_blocks_new_external_work_until_unquiesce() {
 }
 
 #[test]
-fn lifecycle_accepts_drainable_sidecar_work_while_quiescing() {
+fn lifecycle_rejects_drainable_sidecar_work_while_quiescing() {
     let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Quiescing));
-    let work_permit = lifecycle
-        .try_begin_drainable_external_work()
-        .expect("quiesced lifecycle accepts sidecar-owned drainable work");
-
-    assert_eq!(lifecycle.in_flight_count(), 1);
+    assert!(lifecycle.try_begin_drainable_external_work().is_err());
     assert!(lifecycle.try_begin_external_work().is_err());
-    drop(work_permit);
     assert_eq!(lifecycle.in_flight_count(), 0);
+
+    let active = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
+    let work_permit = active
+        .try_begin_drainable_external_work()
+        .expect("active lifecycle accepts sidecar-owned drainable work");
+    assert_eq!(active.in_flight_count(), 1);
+    drop(work_permit);
+    assert_eq!(active.in_flight_count(), 0);
 
     let shutting_down = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::ShuttingDown));
     assert!(shutting_down.try_begin_drainable_external_work().is_err());
