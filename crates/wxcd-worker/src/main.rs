@@ -544,7 +544,7 @@ impl LifecycleControl {
         }
 
         if matches!(request.mode, PluginLifecycleMode::PreActive)
-            && phase == LifecycleAdmissionPhase::Active
+            && phase != LifecycleAdmissionPhase::Quiescing
         {
             return PluginHealthCheckResponse {
                 healthy: false,
