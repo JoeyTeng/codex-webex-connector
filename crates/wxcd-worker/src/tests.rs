@@ -3,21 +3,22 @@ use super::{
     CleanupFailedCommand, CodexConnectionConfig, DiagnoseCommand, LifecycleAdmissionPhase,
     LifecycleCommand, LifecycleCommandResponse, LifecycleControl, ListCommand, ListMode,
     LocalMirrorClaimScope, PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT, PurgeArchivedCommand,
-    RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerState, abbreviate,
-    apply_thread_probe, attached_session_for_thread, build_async_notification_delivery_request,
-    durable_local_snapshot_path, ensure_approval_belongs_to_installation,
-    ensure_failed_cleanup_target, ensure_session_id_belongs_to_installation,
-    extract_thread_history_turns, generate_installation_id, handle_lifecycle_command,
-    ingress_requires_processing_ack, ingress_uses_delivery_enqueue,
-    initial_lifecycle_phase_from_env, is_control_list_session, is_default_list_session,
-    is_failed_session_room_command, lifecycle_control_socket_path_from_env,
-    lifecycle_runtime_in_flight_total, load_durable_local_snapshot_with_metadata,
-    load_local_snapshot_with_metadata, load_or_create_installation_identity,
-    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
-    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
-    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
-    repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
-    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
+    QueuedLifecycleCommand, RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerQueueItem,
+    WorkerState, abbreviate, apply_thread_probe, attached_session_for_thread,
+    build_async_notification_delivery_request, durable_local_snapshot_path,
+    ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
+    ensure_session_id_belongs_to_installation, extract_thread_history_turns,
+    generate_installation_id, handle_lifecycle_command, ingress_requires_processing_ack,
+    ingress_uses_delivery_enqueue, initial_lifecycle_phase_from_env, is_control_list_session,
+    is_default_list_session, is_failed_session_room_command, lifecycle_command_response,
+    lifecycle_control_socket_path_from_env, lifecycle_runtime_in_flight_total,
+    load_durable_local_snapshot_with_metadata, load_local_snapshot_with_metadata,
+    load_or_create_installation_identity, normalize_control_command_text,
+    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
+    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
+    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
+    resolve_codex_connection, resolve_delivery_broker_connection, session_belongs_to_installation,
+    session_requires_codex_archive, sessions_for_diagnostics,
     should_process_async_notification_event, slice_thread_history_page,
     validate_purge_archived_session, webex_delivery_idempotency_key, worker_active_check_ack,
     write_supervisor_shutdown_marker_at,
@@ -26,7 +27,9 @@ use chrono::{Duration, Utc};
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
-use wxcd_cbth_rpc::{PluginDrainRequest, PluginHealthCheckRequest, PluginShutdownRequest};
+use wxcd_cbth_rpc::{
+    PluginDrainRequest, PluginHealthCheckRequest, PluginRpcErrorKind, PluginShutdownRequest,
+};
 use wxcd_proto::{
     AppConfig, BridgeConfig, BridgeSnapshot, CbthPluginConfig, DiagnosticsConfig,
     LocalSessionMirror, RepoConfig, SessionAuthority, SessionFailure, SessionFailureKind,
@@ -1698,6 +1701,45 @@ fn lifecycle_rejects_drainable_sidecar_work_while_quiescing() {
 #[test]
 fn lifecycle_runtime_count_includes_drainable_ingress() {
     assert_eq!(lifecycle_runtime_in_flight_total(2, 3, 5), 10);
+}
+
+#[tokio::test]
+async fn lifecycle_command_response_times_out_when_queue_is_full() {
+    let (events_tx, _events_rx) = tokio::sync::mpsc::channel(1);
+    let (completion, _completion_rx) = tokio::sync::oneshot::channel();
+    events_tx
+        .send(WorkerQueueItem::Lifecycle(QueuedLifecycleCommand {
+            command: LifecycleCommand::Drain(PluginDrainRequest {
+                reason: "held".to_string(),
+            }),
+            completion,
+            response_flushed: None,
+            expires_at: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        }))
+        .await
+        .unwrap();
+
+    let error = match lifecycle_command_response(
+        &events_tx,
+        LifecycleCommand::Drain(PluginDrainRequest {
+            reason: "upgrade".to_string(),
+        }),
+        None,
+    )
+    .await
+    {
+        Ok(_) => panic!("lifecycle command response should time out"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind, PluginRpcErrorKind::TransientDaemonUnavailable);
+    assert!(
+        error
+            .message
+            .contains("enqueueing worker lifecycle command"),
+        "{}",
+        error.message
+    );
 }
 
 #[tokio::test]

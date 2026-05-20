@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, mpsc, oneshot};
-use tokio::time::{Duration, Instant, timeout};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use wxcd_cbth_rpc::{
@@ -58,6 +58,14 @@ const PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT: Duration =
 const ASYNC_NOTIFICATION_INGRESS_ACK_TIMEOUT: Duration =
     Duration::from_secs(C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS + 45);
 const PLUGIN_LIFECYCLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
+const PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(65);
+#[cfg(test)]
+const PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_millis(75);
 const PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PLUGIN_LIFECYCLE_CODEX_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
@@ -184,6 +192,7 @@ struct QueuedLifecycleCommand {
     command: LifecycleCommand,
     completion: oneshot::Sender<std::result::Result<LifecycleCommandResponse, String>>,
     response_flushed: Option<oneshot::Receiver<()>>,
+    expires_at: Instant,
 }
 
 enum LifecycleCommand {
@@ -734,7 +743,15 @@ async fn run() -> Result<()> {
                             command,
                             completion,
                             response_flushed,
+                            expires_at,
                         } = command;
+                        if Instant::now() >= expires_at {
+                            let _ = completion.send(Err(format!(
+                                "lifecycle command expired after {}s before worker loop handled it",
+                                PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT.as_secs()
+                            )));
+                            continue;
+                        }
                         let should_shutdown = matches!(&command, LifecycleCommand::Shutdown(_));
                         let result = match command {
                             LifecycleCommand::Unquiesce(request) => {
@@ -3384,28 +3401,50 @@ async fn lifecycle_command_response(
     response_flushed: Option<oneshot::Receiver<()>>,
 ) -> std::result::Result<LifecycleCommandResponse, PluginRpcError> {
     let (completion, response) = oneshot::channel();
-    events_tx
-        .send(WorkerQueueItem::Lifecycle(QueuedLifecycleCommand {
+    let expires_at = Instant::now() + PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT;
+    timeout_at(
+        expires_at,
+        events_tx.send(WorkerQueueItem::Lifecycle(QueuedLifecycleCommand {
             command,
             completion,
             response_flushed,
-        }))
+            expires_at,
+        })),
+    )
+    .await
+    .map_err(|_| {
+        PluginRpcError::new(
+            PluginRpcErrorKind::TransientDaemonUnavailable,
+            format!(
+                "timed out after {}s enqueueing worker lifecycle command",
+                PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT.as_secs()
+            ),
+        )
+    })?
+    .map_err(|_| {
+        PluginRpcError::new(
+            PluginRpcErrorKind::TransientDaemonUnavailable,
+            "worker lifecycle command queue is closed",
+        )
+    })?;
+    let response = timeout(PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT, response)
         .await
         .map_err(|_| {
             PluginRpcError::new(
                 PluginRpcErrorKind::TransientDaemonUnavailable,
-                "worker lifecycle command queue is closed",
+                format!(
+                    "timed out after {}s waiting for worker lifecycle command response",
+                    PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT.as_secs()
+                ),
             )
-        })?;
-    response
-        .await
+        })?
         .map_err(|_| {
             PluginRpcError::new(
                 PluginRpcErrorKind::TransientDaemonUnavailable,
                 "worker stopped before completing lifecycle command",
             )
-        })?
-        .map_err(|message| PluginRpcError::new(PluginRpcErrorKind::Internal, message))
+        })?;
+    response.map_err(|message| PluginRpcError::new(PluginRpcErrorKind::Internal, message))
 }
 
 fn decode_lifecycle_params<T>(
