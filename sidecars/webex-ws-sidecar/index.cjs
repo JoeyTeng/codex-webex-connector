@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require("node:fs/promises");
+const crypto = require("node:crypto");
 const net = require("node:net");
 const path = require("node:path");
 const process = require("node:process");
@@ -21,6 +22,7 @@ const ingressRetryDelayMs = Number.parseInt(process.env.WXCD_INGRESS_RETRY_DELAY
 const pluginHome = process.env.CBTH_PLUGIN_HOME || process.env.WXCD_PLUGIN_HOME || "";
 const pluginInstanceId = process.env.WXCD_PLUGIN_INSTANCE_ID || "standalone";
 const pluginReleaseId = process.env.CBTH_PLUGIN_RELEASE_ID || process.env.WXCD_PLUGIN_RELEASE_ID || "unknown";
+const deferredIngressDir = pluginHome ? path.join(pluginHome, "webex-sidecar-deferred-ingress") : "";
 const sidecarDrainStatePath = pluginHome
   ? path.join(
       pluginHome,
@@ -44,6 +46,7 @@ let shuttingDown = false;
 let listenersActive = false;
 let sidecarInFlightCount = 0;
 let sidecarDrainStateWrite = Promise.resolve();
+let replayDeferredIngressTask = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -81,6 +84,19 @@ function queueSidecarDrainStateWrite() {
   return sidecarDrainStateWrite;
 }
 
+async function clearSidecarDrainState() {
+  if (!sidecarDrainStatePath) {
+    return;
+  }
+  sidecarInFlightCount = 0;
+  await queueSidecarDrainStateWrite();
+  try {
+    await fs.rm(sidecarDrainStatePath, { force: true });
+  } catch (error) {
+    console.error("failed to remove sidecar drain state", error);
+  }
+}
+
 async function withSidecarDrainTracking(callback) {
   sidecarInFlightCount += 1;
   await queueSidecarDrainStateWrite();
@@ -114,9 +130,80 @@ function isRetryableWorkerAck(ack) {
   );
 }
 
+function deferredIngressPath(envelope) {
+  const eventId = String(envelope?.event_id || `${Date.now()}-${Math.random()}`);
+  const digest = crypto.createHash("sha256").update(eventId).digest("hex").slice(0, 16);
+  const stem = drainStateComponent(eventId).slice(0, 80);
+  return path.join(deferredIngressDir, `${stem}--${digest}.json`);
+}
+
+async function persistDeferredIngress(envelope, error) {
+  if (!deferredIngressDir) {
+    throw error;
+  }
+  await fs.mkdir(deferredIngressDir, { recursive: true });
+  const targetPath = deferredIngressPath(envelope);
+  const tmpPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+  const record = {
+    plugin_instance_id: pluginInstanceId,
+    plugin_release_id: pluginReleaseId,
+    event_id: envelope?.event_id || null,
+    deferred_at: new Date().toISOString(),
+    reason: error?.message || "worker rejected ingress during lifecycle transition",
+    envelope,
+  };
+  await fs.writeFile(tmpPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  await fs.rename(tmpPath, targetPath);
+}
+
+async function replayDeferredIngress() {
+  if (!deferredIngressDir) {
+    return;
+  }
+  if (replayDeferredIngressTask) {
+    return replayDeferredIngressTask;
+  }
+  replayDeferredIngressTask = (async () => {
+    let entries;
+    try {
+      entries = await fs.readdir(deferredIngressDir);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return;
+      }
+      throw error;
+    }
+
+    for (const entry of entries.filter((name) => name.endsWith(".json")).sort()) {
+      const recordPath = path.join(deferredIngressDir, entry);
+      let record;
+      try {
+        record = JSON.parse(await fs.readFile(recordPath, "utf8"));
+      } catch (error) {
+        console.error("failed to parse deferred Webex ingress; leaving record for inspection", {
+          path: recordPath,
+          error,
+        });
+        continue;
+      }
+      await sendEnvelope(record.envelope, {
+        retryUnavailable: true,
+        retryLifecycleRejection: true,
+      });
+      await fs.rm(recordPath, { force: true });
+    }
+  })();
+  try {
+    await replayDeferredIngressTask;
+  } finally {
+    replayDeferredIngressTask = null;
+  }
+}
+
 function workerAckError(ack, options = {}) {
   const error = new Error(`worker rejected ingress: ${ack?.detail || "negative ack"}`);
-  error.retryable = options.retryLifecycleRejection === true && isRetryableWorkerAck(ack);
+  error.lifecycleRejected = isRetryableWorkerAck(ack);
+  error.retryable = options.retryLifecycleRejection === true && error.lifecycleRejected;
   error.ack = ack;
   return error;
 }
@@ -191,6 +278,11 @@ async function sendEnvelope(envelope, options = {}) {
       await sendEnvelopeOnce(envelope, options);
       return;
     } catch (error) {
+      if (options.deferOnLifecycleRejection === true && error?.lifecycleRejected) {
+        await persistDeferredIngress(envelope, error);
+        await stopWebexListeners();
+        return;
+      }
       if (options.retryUnavailable !== true || !error?.retryable || shuttingDown) {
         throw error;
       }
@@ -280,6 +372,7 @@ async function monitorWorkerActive() {
         { kind: "active_check" },
         { retryLifecycleRejection: true }
       );
+      await replayDeferredIngress();
       await startWebexListeners();
     } catch (error) {
       if (!error?.retryable) {
@@ -367,6 +460,8 @@ async function forwardMessage(payload) {
       },
       {
         retryUnavailable: true,
+        retryLifecycleRejection: true,
+        deferOnLifecycleRejection: true,
       }
     );
   });
@@ -394,6 +489,8 @@ async function forwardAttachmentAction(payload) {
       },
       {
         retryUnavailable: true,
+        retryLifecycleRejection: true,
+        deferOnLifecycleRejection: true,
       }
     );
   });
@@ -402,6 +499,7 @@ async function forwardAttachmentAction(payload) {
 async function main() {
   await queueSidecarDrainStateWrite();
   await waitForActiveWorker();
+  await replayDeferredIngress();
   await webex.people.get("me");
   installMercuryWatchdog();
 
@@ -441,6 +539,7 @@ async function shutdown() {
   } catch (error) {
     console.error("failed to disconnect mercury", error);
   }
+  await clearSidecarDrainState();
 }
 
 process.on("SIGINT", () => {
