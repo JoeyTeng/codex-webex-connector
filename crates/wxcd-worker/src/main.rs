@@ -3201,6 +3201,16 @@ async fn sidecar_drain_in_flight_count(config: &AppConfig) -> u64 {
         if state.plugin_instance_id == config.bridge.cbth_plugin.plugin_instance_id
             && state.plugin_release_id == config.bridge.cbth_plugin.plugin_release_id
         {
+            if let Some(pid) = state.pid
+                && !process_is_alive(pid)
+            {
+                warn!(
+                    "ignoring stale sidecar drain state {} for exited pid={pid}",
+                    path.display()
+                );
+                remove_sidecar_drain_state_file(&path).await;
+                continue;
+            }
             count += state.in_flight_count;
         }
     }
@@ -3244,7 +3254,40 @@ struct SidecarDrainState {
     plugin_instance_id: String,
     plugin_release_id: String,
     #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
     in_flight_count: u64,
+}
+
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    let result = unsafe { kill(pid, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
+async fn remove_sidecar_drain_state_file(path: &Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(
+                "failed to remove stale sidecar drain state {}; ignoring stale state: {error:#}",
+                path.display()
+            );
+        }
+    }
 }
 
 fn lifecycle_runtime_wait_interval(remaining: Duration) -> Duration {
@@ -4607,6 +4650,12 @@ async fn remove_stale_socket(socket_path: &Path) -> Result<()> {
 async fn remove_stale_lifecycle_socket(socket_path: &Path) -> Result<()> {
     match tokio::fs::symlink_metadata(socket_path).await {
         Ok(metadata) if metadata.file_type().is_socket() => {
+            if UnixStream::connect(socket_path).await.is_ok() {
+                bail!(
+                    "refusing to replace live lifecycle socket {}; set WXCD_CBTH_LIFECYCLE_SOCKET to a release-scoped path",
+                    socket_path.display()
+                );
+            }
             tokio::fs::remove_file(socket_path).await.with_context(|| {
                 format!(
                     "failed to remove stale lifecycle socket {}",

@@ -1836,7 +1836,7 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
         serde_json::to_vec(&json!({
             "plugin_instance_id": "instance-1",
             "plugin_release_id": "0.1.0",
-            "pid": 12345,
+            "pid": std::process::id(),
             "in_flight_count": 2,
             "updated_at": Utc::now().to_rfc3339()
         }))
@@ -1860,6 +1860,19 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
     tokio::fs::write(
         drain_state_dir.join("instance-1--old-release--malformed.json"),
         b"not-json",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        drain_state_dir.join("instance-1--0.1.0--2147483647.json"),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "pid": 2_147_483_647_u32,
+            "in_flight_count": 7,
+            "updated_at": Utc::now().to_rfc3339()
+        }))
+        .unwrap(),
     )
     .await
     .unwrap();
@@ -1968,6 +1981,30 @@ async fn lifecycle_socket_cleanup_refuses_non_socket_path() {
         "{error:#}"
     );
     assert!(tokio::fs::try_exists(&socket_path).await.unwrap());
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_socket_cleanup_refuses_live_socket_path() {
+    let state_dir = std::path::PathBuf::from("/tmp")
+        .join(format!("wxcd-ls-{}", generate_installation_id(Utc::now())));
+    let socket_path = state_dir.join("l.sock");
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+    let error = remove_stale_lifecycle_socket(&socket_path)
+        .await
+        .expect_err("live lifecycle path should be refused");
+
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to replace live lifecycle socket"),
+        "{error:#}"
+    );
+    assert!(tokio::fs::try_exists(&socket_path).await.unwrap());
+    drop(listener);
+    tokio::fs::remove_file(&socket_path).await.unwrap();
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 

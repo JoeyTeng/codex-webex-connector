@@ -6,7 +6,7 @@
 - W2 plugin packaging/RPC client foundation 已落地：standalone legacy mode 仍是默认路径，显式 cbth plugin mode 支持 manifest、`plugin.hello` UDS readiness check 和 `wxcd-worker doctor`。
 - W3 cbth-managed app-server usage 已落地：显式 cbth plugin mode 由 supervisor 通过 C3 `app_server.ensure/refresh/stop` 管理 loopback Codex app-server 租约，worker 通过 managed `ws://` endpoint 连接；standalone/direct mode 仍默认直接启动 `codex app-server --listen stdio://`。
 - W4 delivery enqueue routing 已落地：Webex async/background notifications 通过 supervisor-owned broker 调用 cbth C5 `delivery.enqueue` delivery-owned `codex_app_server` target；普通 Webex user-message forwarding 仍走 W3 direct app-server path。
-- W5 lifecycle hooks 已落地：显式 cbth plugin mode 提供 C7 `plugin.health_check`、`plugin.quiesce`、`plugin.drain`、`plugin.shutdown`、`plugin.unquiesce` 的保守实现；quiesce/shutdown 后拒绝新的 Webex 外部 ingress，drain 等待已接收 handler 与 sidecar callback/retry backlog 完成并在 cbth plugin home 持久化 local session mirror 后返回。
+- W5 lifecycle hooks 已落地：显式 cbth plugin mode 提供 C7 `plugin.health_check`、`plugin.quiesce`、`plugin.drain`、`plugin.shutdown`、`plugin.unquiesce` 的保守实现；quiesce/shutdown 后拒绝新的 Webex 外部 ingress，drain 等待已接收 handler 与 live sidecar callback/retry backlog 完成并在 cbth plugin home 持久化 local session mirror 后返回。
 - GitHub pull requests run `codex/review-gate` through the repository workflow.
 - 详细历史、验证证据和迁移前 tracker 原文已移入 `docs/project_journal/`：
   - W5 lifecycle hooks：`docs/project_journal/2026/05/2026-05-19-w5-lifecycle-hooks-ab986d1.md`

@@ -42,7 +42,7 @@ const PLUGIN_DELIVERY_BROKER_SOCKET_MODE: u32 = 0o600;
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
 const WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV: &str = "WXCD_SUPERVISOR_SHUTDOWN_MARKER";
-const SUPERVISOR_SHUTDOWN_MARKER_FILE: &str = "supervisor-shutdown-requested.json";
+const SUPERVISOR_SHUTDOWN_MARKER_FILE_PREFIX: &str = "supervisor-shutdown-requested";
 
 #[derive(Parser)]
 struct Cli {
@@ -1033,7 +1033,12 @@ fn plugin_hello_request(config: &CbthPluginConfig) -> PluginHelloRequest {
 }
 
 fn supervisor_shutdown_marker_path(config: &CbthPluginConfig) -> PathBuf {
-    config.plugin_home.join(SUPERVISOR_SHUTDOWN_MARKER_FILE)
+    config.plugin_home.join(format!(
+        "{}-{}--{}.json",
+        SUPERVISOR_SHUTDOWN_MARKER_FILE_PREFIX,
+        ascii_token_component(&config.plugin_instance_id),
+        ascii_token_component(&config.plugin_release_id)
+    ))
 }
 
 async fn clear_supervisor_shutdown_marker(path: &Path) -> Result<()> {
@@ -1432,7 +1437,29 @@ mod tests {
 
         assert_eq!(
             supervisor_shutdown_marker_path(&config),
-            PathBuf::from("/tmp/plugin-home").join(SUPERVISOR_SHUTDOWN_MARKER_FILE)
+            PathBuf::from("/tmp/plugin-home")
+                .join("supervisor-shutdown-requested-instance-1--release-1.json")
+        );
+    }
+
+    #[test]
+    fn supervisor_shutdown_marker_is_release_scoped() {
+        let current = CbthPluginConfig {
+            enabled: true,
+            socket_path: Some("/tmp/cbth.sock".into()),
+            plugin_home: "/tmp/plugin-home".into(),
+            plugin_instance_id: "instance-1".to_string(),
+            plugin_release_id: "release-1".to_string(),
+            manifest_path: "/tmp/plugin/manifest.json".into(),
+        };
+        let previous = CbthPluginConfig {
+            plugin_release_id: "old-release".to_string(),
+            ..current.clone()
+        };
+
+        assert_ne!(
+            supervisor_shutdown_marker_path(&current),
+            supervisor_shutdown_marker_path(&previous)
         );
     }
 
