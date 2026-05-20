@@ -655,8 +655,6 @@ async fn run() -> Result<()> {
     }
     let installation = load_or_create_installation_identity(&config).await?;
 
-    remove_stale_socket(&config.bridge.socket_path).await?;
-
     let webex = WebexClient::new(&config.webex.bot_token)?;
     if config.webex.bot_display_name.is_none() {
         match webex.get_me().await {
@@ -829,6 +827,16 @@ async fn run() -> Result<()> {
         .await?;
     }
     let (work_tx, mut work_rx) = mpsc::channel(256);
+    if let Some(socket_path) = lifecycle_control_socket_path(&config) {
+        start_lifecycle_control_server(
+            &socket_path,
+            work_tx.clone(),
+            Arc::clone(&healthy),
+            Arc::clone(&lifecycle),
+        )
+        .await?;
+    }
+    remove_stale_socket(&config.bridge.socket_path).await?;
     let listener = UnixListener::bind(&config.bridge.socket_path).with_context(|| {
         format!(
             "failed to bind unix socket {}",
@@ -841,15 +849,6 @@ async fn run() -> Result<()> {
         Arc::clone(&healthy),
         Arc::clone(&lifecycle),
     ));
-    if let Some(socket_path) = lifecycle_control_socket_path(&config) {
-        start_lifecycle_control_server(
-            &socket_path,
-            work_tx.clone(),
-            Arc::clone(&healthy),
-            Arc::clone(&lifecycle),
-        )
-        .await?;
-    }
     healthy.store(true, Ordering::Relaxed);
     info!("wxcd worker is healthy");
 

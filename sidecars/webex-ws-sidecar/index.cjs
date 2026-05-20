@@ -182,6 +182,21 @@ function refreshReplayEnvelope(envelope) {
   return envelope;
 }
 
+function replayRecordSortTime(record) {
+  const candidates = [
+    record?.envelope?.created,
+    record?.envelope?.created_at,
+    record?.deferred_at,
+  ];
+  for (const candidate of candidates) {
+    const parsed = Date.parse(candidate);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return 0;
+}
+
 async function replayDeferredIngress() {
   if (!deferredIngressDir) {
     return;
@@ -200,6 +215,7 @@ async function replayDeferredIngress() {
       throw error;
     }
 
+    const records = [];
     for (const entry of entries.filter((name) => name.endsWith(".json")).sort()) {
       const recordPath = path.join(deferredIngressDir, entry);
       let record;
@@ -212,6 +228,22 @@ async function replayDeferredIngress() {
         });
         continue;
       }
+      records.push({
+        entry,
+        record,
+        recordPath,
+        sortTime: replayRecordSortTime(record),
+      });
+    }
+    records.sort((left, right) => {
+      const timeOrder = left.sortTime - right.sortTime;
+      if (timeOrder !== 0) {
+        return timeOrder;
+      }
+      return left.entry.localeCompare(right.entry);
+    });
+
+    for (const { record, recordPath } of records) {
       const replayEnvelope = refreshReplayEnvelope(record.envelope);
       const replayResult = await withSidecarDrainTracking(() =>
         sendEnvelope(replayEnvelope, {
