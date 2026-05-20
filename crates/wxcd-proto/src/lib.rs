@@ -7,6 +7,6 @@ pub use config::{
 pub use model::{
     ApprovalDecision, ApprovalKind, BridgeEvent, BridgeEventEnvelope, BridgeSnapshot,
     LocalSessionMirror, PendingApproval, SessionAuthority, SessionFailure, SessionFailureKind,
-    SessionRecord, SessionState, WebexAttachmentActionEvent, WebexIngressAck, WebexIngressEnvelope,
-    WebexMessageEvent, generate_session_id,
+    SessionRecord, SessionState, WebexAsyncNotificationEvent, WebexAttachmentActionEvent,
+    WebexIngressAck, WebexIngressEnvelope, WebexMessageEvent, generate_session_id,
 };

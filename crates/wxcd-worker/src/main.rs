@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -12,20 +12,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, timeout};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use wxcd_cbth_rpc::{
-    PLUGIN_RPC_PROTOCOL_VERSION_V1, PluginCapability, PluginHelloRequest, PluginRpcClient,
+    PLUGIN_RPC_PROTOCOL_VERSION_V1, PluginCapability, PluginDeliveryEnqueueRequest,
+    PluginDeliveryTarget, PluginHelloRequest, PluginRpcClient,
 };
 use wxcd_codex::{CodexClient, CodexEvent, CodexThreadSummary};
 use wxcd_eventlog::{EventLog, ReplayState};
 use wxcd_proto::{
     AppConfig, ApprovalDecision, ApprovalKind, BridgeEvent, CbthPluginConfig, DiagnosticsConfig,
     LocalSessionMirror, PendingApproval, SessionAuthority, SessionFailure, SessionFailureKind,
-    SessionRecord, SessionState, WebexAttachmentActionEvent, WebexIngressAck, WebexIngressEnvelope,
-    WebexMessageEvent, generate_session_id,
+    SessionRecord, SessionState, WebexAsyncNotificationEvent, WebexAttachmentActionEvent,
+    WebexIngressAck, WebexIngressEnvelope, WebexMessageEvent, generate_session_id,
 };
 use wxcd_render::{
     ImportedHistoryTurn, LocalThreadListItem, build_approval_attachment, build_overview_attachment,
@@ -42,7 +43,15 @@ const RECENT_EVENT_ID_LIMIT: usize = 1024;
 const INSTALLATION_IDENTITY_FILE: &str = "installation-identity.json";
 const LOCAL_SNAPSHOT_FILE: &str = "bridge-state.json";
 const PLUGIN_RPC_DOCTOR_TIMEOUT: Duration = Duration::from_secs(3);
+const C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS: u64 = 60;
+const PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT: Duration =
+    Duration::from_secs(C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS + 30);
+const ASYNC_NOTIFICATION_INGRESS_ACK_TIMEOUT: Duration =
+    Duration::from_secs(C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS + 45);
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
+const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
+const WEBEX_DELIVERY_MAX_ATTEMPTS: i64 = 3;
+const WEBEX_DELIVERY_REDELIVERY_WINDOW_SECONDS: i64 = 3600;
 
 #[derive(Parser)]
 struct Args {
@@ -146,6 +155,11 @@ struct ImportedThreadHistory {
     total_turns: usize,
 }
 
+struct QueuedIngress {
+    event: WebexIngressEnvelope,
+    completion: Option<oneshot::Sender<std::result::Result<(), String>>>,
+}
+
 struct CreateBridgeSessionInput<'a> {
     owner_email: &'a str,
     repo_name: &'a str,
@@ -159,6 +173,11 @@ struct CreateBridgeSessionInput<'a> {
 enum CodexConnectionConfig {
     Standalone,
     ManagedAppServer { url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryBrokerConfig {
+    socket_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -225,6 +244,10 @@ async fn run() -> Result<()> {
         .initialize("wxcd-worker", true)
         .await
         .context("failed to initialize codex app-server")?;
+    let delivery_broker = resolve_delivery_broker_connection(
+        &config,
+        std::env::var(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV).ok(),
+    )?;
 
     let event_log = EventLog::new(&webex, &data_room.id);
     let local_snapshot_path = config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE);
@@ -377,17 +400,22 @@ async fn run() -> Result<()> {
                 let Some(event) = maybe_ingress else {
                     break;
                 };
-                if let Err(error) = handle_webex_ingress(
+                let result = handle_webex_ingress(
                     &config,
                     &webex,
                     &event_log,
                     &mut state,
                     &mut codex,
+                    delivery_broker.as_ref(),
                     &control_room.id,
                     &installation,
-                    event,
-                ).await {
-                    error!("failed to handle Webex ingress: {error:#}");
+                    event.event,
+                ).await.map_err(|error| format!("{error:#}"));
+                if let Some(completion) = event.completion {
+                    let _ = completion.send(result.clone());
+                }
+                if let Err(error) = result {
+                    error!("failed to handle Webex ingress: {error}");
                 }
             }
             maybe_codex = codex.events().recv() => {
@@ -442,6 +470,20 @@ fn resolve_codex_connection(
             bail!("cbth plugin mode requires {WXCD_CODEX_APP_SERVER_URL_ENV} from wxcd-supervisor")
         }
     }
+}
+
+fn resolve_delivery_broker_connection(
+    config: &AppConfig,
+    broker_socket_path: Option<String>,
+) -> Result<Option<DeliveryBrokerConfig>> {
+    if !config.bridge.cbth_plugin.enabled {
+        return Ok(None);
+    }
+
+    Ok(broker_socket_path
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .map(|socket_path| DeliveryBrokerConfig { socket_path }))
 }
 
 async fn run_doctor() -> Result<()> {
@@ -586,6 +628,7 @@ async fn handle_webex_ingress(
     event_log: &EventLog<'_>,
     state: &mut WorkerState,
     codex: &mut CodexClient,
+    delivery_broker: Option<&DeliveryBrokerConfig>,
     control_room_id: &str,
     installation: &InstallationIdentity,
     event: WebexIngressEnvelope,
@@ -630,10 +673,181 @@ async fn handle_webex_ingress(
             handle_attachment_action(config, webex, event_log, state, codex, installation, action)
                 .await?;
         }
+        WebexIngressEnvelope::AsyncNotification(notification) => {
+            if !should_process_async_notification_event(state, &notification.event_id) {
+                return Ok(());
+            }
+            enqueue_async_notification(delivery_broker, state, &notification).await?;
+            state.remember_event(&notification.event_id);
+        }
         WebexIngressEnvelope::HealthCheck => {}
     }
 
     Ok(())
+}
+
+async fn enqueue_async_notification(
+    delivery_broker: Option<&DeliveryBrokerConfig>,
+    state: &WorkerState,
+    notification: &WebexAsyncNotificationEvent,
+) -> Result<()> {
+    let delivery_broker = delivery_broker
+        .ok_or_else(|| anyhow!("async notification delivery requires cbth delivery broker"))?;
+    let request = build_async_notification_delivery_request(state, notification)?;
+    let result = timeout(PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT, async {
+        let mut client = PluginRpcClient::connect(&delivery_broker.socket_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to connect cbth delivery broker {}",
+                    delivery_broker.socket_path.display()
+                )
+            })?;
+        client.delivery_enqueue(request).await
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "timed out after {}s enqueueing async notification through cbth delivery broker",
+            PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT.as_secs()
+        )
+    })?
+    .context("failed to enqueue async notification through cbth delivery broker")?;
+    let driver_state = result
+        .get("driver_state")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    info!(
+        "enqueued Webex async notification {} through cbth delivery broker with driver_state={driver_state}",
+        notification.event_id
+    );
+    Ok(())
+}
+
+fn build_async_notification_delivery_request(
+    state: &WorkerState,
+    notification: &WebexAsyncNotificationEvent,
+) -> Result<PluginDeliveryEnqueueRequest> {
+    let (session_id, thread_id) = resolve_async_notification_target(state, notification)?;
+    let summary = notification.summary.trim();
+    if summary.is_empty() {
+        bail!("async notification summary must not be empty");
+    }
+    let event_id = notification.event_id.trim();
+    if event_id.is_empty() {
+        bail!("async notification event_id must not be empty");
+    }
+    let payload = json!({
+        "kind": "webex_async_notification",
+        "event_id": event_id,
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "summary": summary,
+        "payload": notification.payload.clone(),
+        "created": notification.created.to_rfc3339(),
+    });
+    Ok(PluginDeliveryEnqueueRequest {
+        source_thread_id: thread_id.to_string(),
+        summary: summary.to_string(),
+        idempotency_key: webex_delivery_idempotency_key(event_id),
+        inline_payload: Some(payload),
+        artifact: None,
+        delivery_policy: None,
+        max_delivery_attempts: Some(WEBEX_DELIVERY_MAX_ATTEMPTS),
+        redelivery_window_seconds: Some(WEBEX_DELIVERY_REDELIVERY_WINDOW_SECONDS),
+        target: PluginDeliveryTarget {
+            driver: "codex_app_server".to_string(),
+            app_server_lease_id: None,
+            managed_session_id: None,
+            session_epoch: None,
+            codex_binary: None,
+        },
+        plugin_metadata: Some(json!({
+            "kind": "webex_async_notification",
+            "webex_event_id": event_id,
+            "session_id": session_id,
+            "thread_id": thread_id,
+        })),
+    })
+}
+
+fn resolve_async_notification_target<'a>(
+    state: &'a WorkerState,
+    notification: &'a WebexAsyncNotificationEvent,
+) -> Result<(&'a str, &'a str)> {
+    match (
+        notification.session_id.as_deref(),
+        notification.thread_id.as_deref(),
+    ) {
+        (Some(session_id), Some(thread_id)) => {
+            let session = state
+                .sessions
+                .get(session_id)
+                .with_context(|| format!("unknown async notification session `{session_id}`"))?;
+            ensure_async_delivery_session_is_executable(state, session)?;
+            if session.thread_id != thread_id {
+                bail!(
+                    "async notification thread `{thread_id}` does not match session `{session_id}`"
+                );
+            }
+            Ok((session_id, session.thread_id.as_str()))
+        }
+        (Some(session_id), None) => {
+            let session = state
+                .sessions
+                .get(session_id)
+                .with_context(|| format!("unknown async notification session `{session_id}`"))?;
+            ensure_async_delivery_session_is_executable(state, session)?;
+            Ok((session_id, session.thread_id.as_str()))
+        }
+        (None, Some(thread_id)) => {
+            let session_id = state
+                .thread_to_session
+                .get(thread_id)
+                .with_context(|| format!("unknown async notification thread `{thread_id}`"))?;
+            Ok((session_id.as_str(), thread_id))
+        }
+        (None, None) => bail!("async notification must include session_id or thread_id"),
+    }
+}
+
+fn ensure_async_delivery_session_is_executable(
+    state: &WorkerState,
+    session: &SessionRecord,
+) -> Result<()> {
+    if state.should_index_session_thread(session) {
+        return Ok(());
+    }
+    bail!(
+        "async notification session `{}` is not executable by this worker",
+        session.session_id
+    )
+}
+
+fn webex_delivery_idempotency_key(event_id: &str) -> String {
+    format!("webex-delivery-{}", stable_fnv1a_hex(event_id))
+}
+
+fn stable_fnv1a_hex(value: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn should_process_async_notification_event(state: &WorkerState, event_id: &str) -> bool {
+    !state.recent_event_ids.contains(event_id)
+}
+
+fn ingress_requires_processing_ack(event: &WebexIngressEnvelope) -> bool {
+    matches!(event, WebexIngressEnvelope::AsyncNotification(_))
+}
+
+#[cfg(test)]
+fn ingress_uses_delivery_enqueue(event: &WebexIngressEnvelope) -> bool {
+    matches!(event, WebexIngressEnvelope::AsyncNotification(_))
 }
 
 async fn handle_control_message(
@@ -2217,7 +2431,7 @@ async fn persist_snapshot(
 
 async fn run_ingress_server(
     listener: UnixListener,
-    events_tx: mpsc::Sender<WebexIngressEnvelope>,
+    events_tx: mpsc::Sender<QueuedIngress>,
     healthy: Arc<AtomicBool>,
 ) {
     loop {
@@ -2240,7 +2454,7 @@ async fn run_ingress_server(
 
 async fn handle_ingress_connection(
     stream: UnixStream,
-    events_tx: mpsc::Sender<WebexIngressEnvelope>,
+    events_tx: mpsc::Sender<QueuedIngress>,
     healthy: Arc<AtomicBool>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
@@ -2252,16 +2466,67 @@ async fn handle_ingress_connection(
         .ok_or_else(|| anyhow!("ingress payload was empty"))?;
     let event: WebexIngressEnvelope =
         serde_json::from_str(&line).context("failed to decode ingress payload")?;
-    if !matches!(event, WebexIngressEnvelope::HealthCheck) {
-        events_tx
-            .send(event)
+    let ack = match event {
+        WebexIngressEnvelope::HealthCheck => WebexIngressAck {
+            ok: true,
+            healthy: healthy.load(Ordering::Relaxed),
+            detail: None,
+        },
+        event if ingress_requires_processing_ack(&event) => {
+            let (completion_tx, completion_rx) = oneshot::channel();
+            match timeout(ASYNC_NOTIFICATION_INGRESS_ACK_TIMEOUT, async {
+                events_tx
+                    .send(QueuedIngress {
+                        event,
+                        completion: Some(completion_tx),
+                    })
+                    .await
+                    .context("failed to enqueue ingress event")?;
+                completion_rx
+                    .await
+                    .map_err(|_| anyhow!("ingress handler stopped before processing event"))
+            })
             .await
-            .context("failed to enqueue ingress event")?;
-    }
-    let ack = WebexIngressAck {
-        ok: true,
-        healthy: healthy.load(Ordering::Relaxed),
-        detail: None,
+            {
+                Ok(Ok(Ok(()))) => WebexIngressAck {
+                    ok: true,
+                    healthy: healthy.load(Ordering::Relaxed),
+                    detail: None,
+                },
+                Ok(Ok(Err(detail))) => WebexIngressAck {
+                    ok: false,
+                    healthy: healthy.load(Ordering::Relaxed),
+                    detail: Some(detail),
+                },
+                Ok(Err(error)) => WebexIngressAck {
+                    ok: false,
+                    healthy: healthy.load(Ordering::Relaxed),
+                    detail: Some(format!("{error:#}")),
+                },
+                Err(_) => WebexIngressAck {
+                    ok: false,
+                    healthy: healthy.load(Ordering::Relaxed),
+                    detail: Some(format!(
+                        "timed out after {}s processing async notification",
+                        ASYNC_NOTIFICATION_INGRESS_ACK_TIMEOUT.as_secs()
+                    )),
+                },
+            }
+        }
+        event => {
+            events_tx
+                .send(QueuedIngress {
+                    event,
+                    completion: None,
+                })
+                .await
+                .context("failed to enqueue ingress event")?;
+            WebexIngressAck {
+                ok: true,
+                healthy: healthy.load(Ordering::Relaxed),
+                detail: None,
+            }
+        }
     };
     let encoded = serde_json::to_vec(&ack)?;
     writer.write_all(&encoded).await?;
