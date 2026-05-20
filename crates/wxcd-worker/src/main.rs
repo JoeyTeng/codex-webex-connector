@@ -77,9 +77,9 @@ const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SO
 const WXCD_CBTH_LIFECYCLE_SOCKET_ENV: &str = "WXCD_CBTH_LIFECYCLE_SOCKET";
 const WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV: &str = "WXCD_SUPERVISOR_SHUTDOWN_MARKER";
 const SIDECAR_DRAIN_STATE_DIR: &str = "webex-sidecar-drain-state";
+#[cfg(test)]
 const SIDECAR_DEFERRED_INGRESS_DIR: &str = "webex-sidecar-deferred-ingress";
 const SIDECAR_DRAIN_STATE_STALE_AFTER: Duration = Duration::from_secs(120);
-const SIDECAR_DEFERRED_INGRESS_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const WEBEX_DELIVERY_MAX_ATTEMPTS: i64 = 3;
 const WEBEX_DELIVERY_REDELIVERY_WINDOW_SECONDS: i64 = 3600;
 
@@ -3331,17 +3331,16 @@ async fn process_pending_codex_events(ctx: &mut LifecycleCommandContext<'_, '_>)
 }
 
 async fn lifecycle_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_, '_>) -> u64 {
-    let sidecar_drain_count = sidecar_drain_in_flight_count_after(
+    let sidecar_in_flight_count = lifecycle_sidecar_in_flight_count(
         ctx.config,
         ctx.lifecycle.sidecar_drain_barrier_started_at(),
     )
     .await;
-    let sidecar_deferred_count = sidecar_deferred_ingress_count(ctx.config).await;
     lifecycle_runtime_in_flight_total(
         ctx.lifecycle.in_flight_count(),
         ctx.state.lifecycle_codex_in_flight_count(),
         ctx.codex.events().len(),
-        sidecar_drain_count.saturating_add(sidecar_deferred_count),
+        sidecar_in_flight_count,
     )
 }
 
@@ -3369,6 +3368,13 @@ fn lifecycle_runtime_in_flight_total(
 #[cfg(test)]
 async fn sidecar_drain_in_flight_count(config: &AppConfig) -> u64 {
     sidecar_drain_in_flight_count_after(config, None).await
+}
+
+async fn lifecycle_sidecar_in_flight_count(
+    config: &AppConfig,
+    inactive_observed_after: Option<DateTime<Utc>>,
+) -> u64 {
+    sidecar_drain_in_flight_count_after(config, inactive_observed_after).await
 }
 
 async fn sidecar_drain_in_flight_count_after(
@@ -3470,76 +3476,6 @@ async fn sidecar_drain_in_flight_count_after(
     }
 }
 
-async fn sidecar_deferred_ingress_count(config: &AppConfig) -> u64 {
-    if !config.bridge.cbth_plugin.enabled {
-        return 0;
-    }
-    let dir = config
-        .bridge
-        .cbth_plugin
-        .plugin_home
-        .join(SIDECAR_DEFERRED_INGRESS_DIR);
-    let mut entries = match tokio::fs::read_dir(&dir).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
-        Err(error) => {
-            warn!(
-                "failed to read sidecar deferred ingress dir {}; treating deferred ingress as in flight: {error:#}",
-                dir.display()
-            );
-            return 1;
-        }
-    };
-    let mut count = 0;
-    let now = Utc::now();
-    loop {
-        let entry = match entries.next_entry().await {
-            Ok(Some(entry)) => entry,
-            Ok(None) => return count,
-            Err(error) => {
-                warn!(
-                    "failed to iterate sidecar deferred ingress dir {}; treating deferred ingress as in flight: {error:#}",
-                    dir.display()
-                );
-                return count + 1;
-            }
-        };
-        let path = entry.path();
-        if !path
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(|name| name.ends_with(".json"))
-        {
-            continue;
-        }
-        let contents = match tokio::fs::read(&path).await {
-            Ok(contents) => contents,
-            Err(error) => {
-                warn!(
-                    "failed to read sidecar deferred ingress {}; treating deferred ingress as in flight: {error:#}",
-                    path.display()
-                );
-                count += 1;
-                continue;
-            }
-        };
-        let record: SidecarDeferredIngressRecord = match serde_json::from_slice(&contents) {
-            Ok(record) => record,
-            Err(error) => {
-                warn!(
-                    "failed to parse sidecar deferred ingress {}; treating deferred ingress as in flight: {error:#}",
-                    path.display()
-                );
-                count += 1;
-                continue;
-            }
-        };
-        if sidecar_deferred_ingress_record_matches_current_scope(&record, config, now) {
-            count += 1;
-        }
-    }
-}
-
 fn sidecar_drain_state_file_prefix(config: &AppConfig) -> String {
     format!(
         "scope-{}--",
@@ -3574,34 +3510,6 @@ impl SidecarDrainState {
     fn sidecar_observed_inactive_after(&self, cutoff: DateTime<Utc>) -> bool {
         self.worker_inactive_observed_at
             .is_some_and(|observed_at| observed_at.timestamp_millis() > cutoff.timestamp_millis())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct SidecarDeferredIngressRecord {
-    plugin_instance_id: String,
-    plugin_release_id: String,
-    #[serde(default)]
-    deferred_at: Option<DateTime<Utc>>,
-}
-
-fn sidecar_deferred_ingress_record_matches_current_scope(
-    record: &SidecarDeferredIngressRecord,
-    config: &AppConfig,
-    now: DateTime<Utc>,
-) -> bool {
-    if record.plugin_instance_id != config.bridge.cbth_plugin.plugin_instance_id {
-        return false;
-    }
-    if record.plugin_release_id == config.bridge.cbth_plugin.plugin_release_id {
-        return true;
-    }
-    let Some(deferred_at) = record.deferred_at else {
-        return false;
-    };
-    match now.signed_duration_since(deferred_at).to_std() {
-        Ok(age) => age <= SIDECAR_DEFERRED_INGRESS_STALE_AFTER,
-        Err(_) => true,
     }
 }
 

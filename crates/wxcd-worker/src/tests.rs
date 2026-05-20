@@ -13,17 +13,18 @@ use super::{
     ingress_uses_delivery_enqueue, initial_lifecycle_phase_from_env, is_control_list_session,
     is_default_list_session, is_failed_session_room_command, lifecycle_command_response,
     lifecycle_control_socket_path_from_env, lifecycle_runtime_in_flight_total,
-    load_durable_local_snapshot_with_metadata, load_local_snapshot_with_metadata,
-    load_or_create_installation_identity, normalize_control_command_text,
-    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
-    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
-    parse_resume_local_thread_id, parse_session_history_page, remove_stale_lifecycle_socket,
-    repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
-    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
-    should_process_async_notification_event, sidecar_deferred_ingress_count,
-    sidecar_drain_in_flight_count, sidecar_drain_in_flight_count_after,
-    sidecar_drain_state_file_prefix, sidecar_received_before_cutoff, slice_thread_history_page,
-    stable_fnv1a_hex, startup_snapshot_persist_now, validate_purge_archived_session,
+    lifecycle_sidecar_in_flight_count, load_durable_local_snapshot_with_metadata,
+    load_local_snapshot_with_metadata, load_or_create_installation_identity,
+    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
+    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
+    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
+    remove_stale_lifecycle_socket, repo_name_for_cwd, resolve_codex_connection,
+    resolve_delivery_broker_connection, session_belongs_to_installation,
+    session_requires_codex_archive, sessions_for_diagnostics,
+    should_process_async_notification_event, sidecar_drain_in_flight_count,
+    sidecar_drain_in_flight_count_after, sidecar_drain_state_file_prefix,
+    sidecar_received_before_cutoff, slice_thread_history_page, stable_fnv1a_hex,
+    startup_snapshot_persist_now, validate_purge_archived_session,
     wait_for_lifecycle_response_flush, webex_delivery_idempotency_key, worker_active_check_ack,
     worker_ingress_socket_path_for, worker_ingress_socket_path_from_env,
     write_supervisor_shutdown_marker_at,
@@ -2040,7 +2041,7 @@ fn sidecar_drain_state_file_prefix_is_bounded() {
 }
 
 #[tokio::test]
-async fn lifecycle_runtime_count_includes_deferred_ingress_records() {
+async fn deferred_ingress_records_do_not_block_lifecycle_drain() {
     let state_dir = std::env::temp_dir().join(format!(
         "wxcd-worker-sidecar-deferred-ingress-test-{}",
         generate_installation_id(Utc::now())
@@ -2102,10 +2103,10 @@ async fn lifecycle_runtime_count_includes_deferred_ingress_records() {
         .await
         .unwrap();
 
-    assert_eq!(sidecar_deferred_ingress_count(&config).await, 3);
+    assert_eq!(lifecycle_sidecar_in_flight_count(&config, None).await, 0);
 
     config.bridge.cbth_plugin.enabled = false;
-    assert_eq!(sidecar_deferred_ingress_count(&config).await, 0);
+    assert_eq!(lifecycle_sidecar_in_flight_count(&config, None).await, 0);
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 
