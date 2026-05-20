@@ -2332,6 +2332,23 @@ fn lifecycle_cancelled_unquiesce_does_not_claim_activation() {
 }
 
 #[test]
+fn lifecycle_cancelled_activation_rejects_stale_completion() {
+    let lifecycle = LifecycleControl::new(LifecycleAdmissionPhase::Quiescing);
+    let token = lifecycle
+        .prepare_unquiesce()
+        .expect("quiesced lifecycle prepares unquiesce");
+    let activation = lifecycle
+        .begin_unquiesce_activation(token)
+        .expect("current unquiesce token is claimed");
+
+    lifecycle.cancel_unquiesce_activation(activation);
+
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Quiescing);
+    assert!(!lifecycle.complete_unquiesce_activation(activation));
+    assert!(lifecycle.prepare_unquiesce().is_some());
+}
+
+#[test]
 fn executable_indexes_only_include_current_installation_sessions() {
     let installation_id = "ins_current";
     let mut state = WorkerState::default();

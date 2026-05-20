@@ -3498,6 +3498,16 @@ async fn handle_lifecycle_unquiesce(
             }
             *ctx.startup_snapshot_persist_pending = false;
         }
+        if Instant::now() >= ctx.response_expires_at {
+            ctx.lifecycle.cancel_unquiesce_activation(activation_token);
+            warn!(
+                "lifecycle unquiesce expired after startup reconcile: {}",
+                request.reason
+            );
+            return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                accepted: false,
+            }));
+        }
         *ctx.startup_reconcile_pending = false;
         let accepted = ctx
             .lifecycle

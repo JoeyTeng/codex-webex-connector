@@ -44,6 +44,8 @@ const webex = new WebexCore({
 let exitingForRestart = false;
 let shuttingDown = false;
 let listenersActive = false;
+let messagesListenerActive = false;
+let attachmentActionsListenerActive = false;
 let sidecarInFlightCount = 0;
 let sidecarDrainStateWrite = Promise.resolve();
 let replayDeferredIngressTask = null;
@@ -417,32 +419,60 @@ async function startWebexListeners() {
   }
   try {
     await webex.messages.listen();
+    messagesListenerActive = true;
     await webex.attachmentActions.listen();
+    attachmentActionsListenerActive = true;
     listenersActive = true;
     console.log("webex-ws-sidecar is listening for Webex events");
   } catch (error) {
-    await stopWebexListeners();
+    try {
+      await stopWebexListeners();
+    } catch (stopError) {
+      console.error("failed to stop Webex listeners after startup failure", stopError);
+    }
     throw error;
   }
 }
 
 async function stopWebexListeners() {
-  try {
-    if (typeof webex.messages.stopListening === "function") {
-      await webex.messages.stopListening();
+  const failures = [];
+
+  if (messagesListenerActive) {
+    if (typeof webex.messages.stopListening !== "function") {
+      failures.push(new Error("messages stopListening is unavailable"));
+    } else {
+      try {
+        await webex.messages.stopListening();
+        messagesListenerActive = false;
+      } catch (error) {
+        failures.push(error);
+        console.error("failed to stop messages listener", error);
+      }
     }
-  } catch (error) {
-    console.error("failed to stop messages listener", error);
   }
 
-  try {
-    if (typeof webex.attachmentActions.stopListening === "function") {
-      await webex.attachmentActions.stopListening();
+  if (attachmentActionsListenerActive) {
+    if (typeof webex.attachmentActions.stopListening !== "function") {
+      failures.push(new Error("attachment actions stopListening is unavailable"));
+    } else {
+      try {
+        await webex.attachmentActions.stopListening();
+        attachmentActionsListenerActive = false;
+      } catch (error) {
+        failures.push(error);
+        console.error("failed to stop attachment actions listener", error);
+      }
     }
-  } catch (error) {
-    console.error("failed to stop attachment actions listener", error);
   }
-  listenersActive = false;
+
+  listenersActive = messagesListenerActive || attachmentActionsListenerActive;
+  if (failures.length > 0) {
+    throw new Error(
+      `failed to stop Webex listeners: ${failures
+        .map((error) => error?.message || String(error))
+        .join("; ")}`
+    );
+  }
 }
 
 async function monitorWorkerActive() {
@@ -457,8 +487,8 @@ async function monitorWorkerActive() {
       );
       await clearWorkerInactiveObservation();
       if ((await replayDeferredIngress()) === SEND_DEFERRED) {
-        await recordWorkerInactiveObservation();
         await stopWebexListeners();
+        await recordWorkerInactiveObservation();
         await sleep(Number.isFinite(ingressRetryDelayMs) ? ingressRetryDelayMs : 1000);
         continue;
       }
@@ -624,7 +654,11 @@ async function main() {
 
 async function shutdown() {
   shuttingDown = true;
-  await stopWebexListeners();
+  try {
+    await stopWebexListeners();
+  } catch (error) {
+    console.error("failed to stop Webex listeners during shutdown", error);
+  }
 
   try {
     if (webex.internal?.mercury?.connected) {
