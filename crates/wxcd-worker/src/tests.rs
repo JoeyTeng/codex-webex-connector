@@ -1,10 +1,10 @@
 use super::{
     ASYNC_NOTIFICATION_INGRESS_ACK_TIMEOUT, C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS,
     CleanupFailedCommand, CodexConnectionConfig, DiagnoseCommand, LifecycleAdmissionPhase,
-    LifecycleCommand, LifecycleCommandResponse, LifecycleControl, ListCommand, ListMode,
-    LocalMirrorClaimScope, PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT, PurgeArchivedCommand,
-    QueuedLifecycleCommand, RECENT_EVENT_ID_LIMIT, SIDECAR_DRAIN_STATE_FILE, ThreadProbe,
-    ThreadProbeKind, WorkerQueueItem, WorkerState, abbreviate, apply_thread_probe,
+    LifecycleCommand, LifecycleCommandResponse, LifecycleControl, LifecycleTransitionToken,
+    ListCommand, ListMode, LocalMirrorClaimScope, PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT,
+    PurgeArchivedCommand, QueuedLifecycleCommand, RECENT_EVENT_ID_LIMIT, SIDECAR_DRAIN_STATE_DIR,
+    ThreadProbe, ThreadProbeKind, WorkerQueueItem, WorkerState, abbreviate, apply_thread_probe,
     attached_session_for_thread, build_async_notification_delivery_request,
     durable_local_snapshot_path, ensure_approval_belongs_to_installation,
     ensure_failed_cleanup_target, ensure_session_id_belongs_to_installation,
@@ -42,6 +42,15 @@ use wxcd_render::ImportedHistoryTurn;
 
 const BOT_EMAIL: &str = "codex-webex-connector@webex.bot";
 const BOT_DISPLAY_NAME: &str = "Codex Webex Connector";
+
+fn lifecycle_drain_command(reason: &str) -> LifecycleCommand {
+    LifecycleCommand::Drain {
+        request: PluginDrainRequest {
+            reason: reason.to_string(),
+        },
+        token: LifecycleTransitionToken { generation: 0 },
+    }
+}
 
 fn app_config_with_plugin(enabled: bool) -> AppConfig {
     AppConfig {
@@ -1588,15 +1597,10 @@ async fn lifecycle_drain_persists_plugin_home_snapshot_before_reporting_complete
         "ins_current",
     ));
 
-    let response = handle_lifecycle_command(
-        &config,
-        &mut state,
-        LifecycleCommand::Drain(PluginDrainRequest {
-            reason: "upgrade".to_string(),
-        }),
-    )
-    .await
-    .unwrap();
+    let response =
+        handle_lifecycle_command(&config, &mut state, lifecycle_drain_command("upgrade"))
+            .await
+            .unwrap();
 
     assert!(matches!(
         response,
@@ -1703,6 +1707,38 @@ fn lifecycle_unquiesce_token_is_invalidated_by_later_quiesce() {
 }
 
 #[test]
+fn lifecycle_drain_token_is_cancelled_by_unquiesce() {
+    let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
+    let drain_token = lifecycle
+        .quiesce_for_drain()
+        .expect("active lifecycle begins drain quiesce");
+    assert!(lifecycle.is_current_quiesce(drain_token));
+
+    let unquiesce_token = lifecycle
+        .prepare_unquiesce()
+        .expect("quiesced lifecycle prepares unquiesce");
+    assert!(lifecycle.unquiesce_if_current(unquiesce_token));
+
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Active);
+    assert!(!lifecycle.is_current_quiesce(drain_token));
+}
+
+#[test]
+fn lifecycle_drain_token_is_invalidated_by_later_quiesce() {
+    let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
+    let stale_token = lifecycle
+        .quiesce_for_drain()
+        .expect("active lifecycle begins drain quiesce");
+    let current_token = lifecycle
+        .quiesce_for_drain()
+        .expect("quiesced lifecycle refreshes drain quiesce");
+
+    assert_ne!(stale_token, current_token);
+    assert!(!lifecycle.is_current_quiesce(stale_token));
+    assert!(lifecycle.is_current_quiesce(current_token));
+}
+
+#[test]
 fn lifecycle_rejects_drainable_sidecar_work_while_quiescing() {
     let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Quiescing));
     assert!(lifecycle.try_begin_drainable_external_work(None).is_err());
@@ -1793,14 +1829,37 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
     let mut config = app_config_with_state_dir(&state_dir, true);
     let plugin_home = config.bridge.cbth_plugin.plugin_home.clone();
     tokio::fs::create_dir_all(&plugin_home).await.unwrap();
+    let drain_state_dir = plugin_home.join(SIDECAR_DRAIN_STATE_DIR);
+    tokio::fs::create_dir_all(&drain_state_dir).await.unwrap();
     tokio::fs::write(
-        plugin_home.join(SIDECAR_DRAIN_STATE_FILE),
+        drain_state_dir.join("instance-1--0.1.0--12345.json"),
         serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
             "pid": 12345,
             "in_flight_count": 2,
             "updated_at": Utc::now().to_rfc3339()
         }))
         .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        drain_state_dir.join("instance-1--old-release--12346.json"),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "old-release",
+            "pid": 12346,
+            "in_flight_count": 5,
+            "updated_at": Utc::now().to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        drain_state_dir.join("instance-1--old-release--malformed.json"),
+        b"not-json",
     )
     .await
     .unwrap();
@@ -1818,9 +1877,7 @@ async fn lifecycle_command_response_times_out_when_queue_is_full() {
     let (completion, _completion_rx) = tokio::sync::oneshot::channel();
     events_tx
         .send(WorkerQueueItem::Lifecycle(QueuedLifecycleCommand {
-            command: LifecycleCommand::Drain(PluginDrainRequest {
-                reason: "held".to_string(),
-            }),
+            command: lifecycle_drain_command("held"),
             completion,
             response_flushed: None,
             expires_at: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
@@ -1831,9 +1888,7 @@ async fn lifecycle_command_response_times_out_when_queue_is_full() {
 
     let error = match lifecycle_command_response(
         &events_tx,
-        LifecycleCommand::Drain(PluginDrainRequest {
-            reason: "upgrade".to_string(),
-        }),
+        lifecycle_drain_command("upgrade"),
         None,
     )
     .await
@@ -1856,14 +1911,7 @@ async fn lifecycle_command_response_times_out_when_queue_is_full() {
 async fn lifecycle_command_response_preserves_typed_worker_errors() {
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(1);
     let response_task = tokio::spawn(async move {
-        lifecycle_command_response(
-            &events_tx,
-            LifecycleCommand::Drain(PluginDrainRequest {
-                reason: "upgrade".to_string(),
-            }),
-            None,
-        )
-        .await
+        lifecycle_command_response(&events_tx, lifecycle_drain_command("upgrade"), None).await
     });
 
     let WorkerQueueItem::Lifecycle(command) =

@@ -73,7 +73,7 @@ const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
 const WXCD_CBTH_LIFECYCLE_SOCKET_ENV: &str = "WXCD_CBTH_LIFECYCLE_SOCKET";
 const WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV: &str = "WXCD_SUPERVISOR_SHUTDOWN_MARKER";
-const SIDECAR_DRAIN_STATE_FILE: &str = "webex-sidecar-drain-state.json";
+const SIDECAR_DRAIN_STATE_DIR: &str = "webex-sidecar-drain-state";
 const WEBEX_DELIVERY_MAX_ATTEMPTS: i64 = 3;
 const WEBEX_DELIVERY_REDELIVERY_WINDOW_SECONDS: i64 = 3600;
 
@@ -199,7 +199,10 @@ struct QueuedLifecycleCommand {
 }
 
 enum LifecycleCommand {
-    Drain(PluginDrainRequest),
+    Drain {
+        request: PluginDrainRequest,
+        token: LifecycleTransitionToken,
+    },
     Shutdown {
         request: PluginShutdownRequest,
         previous_phase: LifecyclePhaseState,
@@ -289,21 +292,38 @@ impl LifecycleControl {
         self.phase.lock().expect("lifecycle phase poisoned").phase
     }
 
-    fn quiesce(&self) -> bool {
+    fn begin_quiesce(&self) -> Option<LifecycleTransitionToken> {
         let mut state = self.phase.lock().expect("lifecycle phase poisoned");
         match state.phase {
             LifecycleAdmissionPhase::Active => {
                 state.phase = LifecycleAdmissionPhase::Quiescing;
                 state.generation = state.generation.wrapping_add(1);
                 state.phase_started_at = Utc::now();
-                true
+                Some(LifecycleTransitionToken {
+                    generation: state.generation,
+                })
             }
             LifecycleAdmissionPhase::Quiescing => {
                 state.generation = state.generation.wrapping_add(1);
-                true
+                Some(LifecycleTransitionToken {
+                    generation: state.generation,
+                })
             }
-            LifecycleAdmissionPhase::ShuttingDown => false,
+            LifecycleAdmissionPhase::ShuttingDown => None,
         }
+    }
+
+    fn quiesce(&self) -> bool {
+        self.begin_quiesce().is_some()
+    }
+
+    fn quiesce_for_drain(&self) -> Option<LifecycleTransitionToken> {
+        self.begin_quiesce()
+    }
+
+    fn is_current_quiesce(&self, token: LifecycleTransitionToken) -> bool {
+        let state = self.phase.lock().expect("lifecycle phase poisoned");
+        state.phase == LifecycleAdmissionPhase::Quiescing && state.generation == token.generation
     }
 
     fn prepare_unquiesce(&self) -> Option<LifecycleTransitionToken> {
@@ -2912,7 +2932,7 @@ async fn handle_lifecycle_command(
 ) -> Result<LifecycleCommandResponse> {
     persist_durable_lifecycle_mirror(config, state).await?;
     match command {
-        LifecycleCommand::Drain(request) => {
+        LifecycleCommand::Drain { request, .. } => {
             info!("lifecycle drain completed: {}", request.reason);
             Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
                 drained: true,
@@ -2938,7 +2958,19 @@ async fn handle_lifecycle_command_with_runtime_drain(
 ) -> Result<LifecycleCommandResponse> {
     let mut ctx = ctx;
     match command {
-        LifecycleCommand::Drain(request) => {
+        LifecycleCommand::Drain { request, token } => {
+            if !ctx.lifecycle.is_current_quiesce(token) {
+                persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
+                warn!(
+                    "lifecycle drain cancelled because the quiesce generation changed: {}",
+                    request.reason
+                );
+                return Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                    drained: false,
+                    in_flight_count: Some(in_flight_count),
+                }));
+            }
             let ingress_in_flight_count = ctx.lifecycle.in_flight_count();
             if ingress_in_flight_count > 0 {
                 persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
@@ -2952,8 +2984,31 @@ async fn handle_lifecycle_command_with_runtime_drain(
                 }));
             }
             let _ = drain_codex_runtime(&mut ctx).await?;
+            if !ctx.lifecycle.is_current_quiesce(token) {
+                persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
+                warn!(
+                    "lifecycle drain cancelled after Codex runtime drain because the quiesce generation changed: {}",
+                    request.reason
+                );
+                return Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                    drained: false,
+                    in_flight_count: Some(in_flight_count),
+                }));
+            }
             let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
             persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+            if !ctx.lifecycle.is_current_quiesce(token) {
+                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
+                warn!(
+                    "lifecycle drain cancelled before completion because the quiesce generation changed: {}",
+                    request.reason
+                );
+                return Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                    drained: false,
+                    in_flight_count: Some(in_flight_count),
+                }));
+            }
             if in_flight_count > 0 {
                 warn!(
                     "lifecycle drain incomplete: {in_flight_count} Webex ingress, Codex events, or sessions remain in flight"
@@ -3089,37 +3144,105 @@ async fn sidecar_drain_in_flight_count(config: &AppConfig) -> u64 {
     if !config.bridge.cbth_plugin.enabled {
         return 0;
     }
-    let path = config
+    let dir = config
         .bridge
         .cbth_plugin
         .plugin_home
-        .join(SIDECAR_DRAIN_STATE_FILE);
-    let contents = match tokio::fs::read(&path).await {
-        Ok(contents) => contents,
+        .join(SIDECAR_DRAIN_STATE_DIR);
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
         Err(error) => {
             warn!(
-                "failed to read sidecar drain state {}; treating sidecar as in flight: {error:#}",
-                path.display()
+                "failed to read sidecar drain state dir {}; treating sidecar as in flight: {error:#}",
+                dir.display()
             );
             return 1;
         }
     };
-    let state: SidecarDrainState = match serde_json::from_slice(&contents) {
-        Ok(state) => state,
-        Err(error) => {
-            warn!(
-                "failed to parse sidecar drain state {}; treating sidecar as in flight: {error:#}",
-                path.display()
-            );
-            return 1;
+    let mut count = 0;
+    let matching_file_prefix = sidecar_drain_state_file_prefix(config);
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return count,
+            Err(error) => {
+                warn!(
+                    "failed to iterate sidecar drain state dir {}; treating sidecar as in flight: {error:#}",
+                    dir.display()
+                );
+                return count + 1;
+            }
+        };
+        let path = entry.path();
+        if !sidecar_drain_state_file_matches(&path, &matching_file_prefix) {
+            continue;
         }
-    };
-    state.in_flight_count
+        let contents = match tokio::fs::read(&path).await {
+            Ok(contents) => contents,
+            Err(error) => {
+                warn!(
+                    "failed to read sidecar drain state {}; treating sidecar as in flight: {error:#}",
+                    path.display()
+                );
+                return count + 1;
+            }
+        };
+        let state: SidecarDrainState = match serde_json::from_slice(&contents) {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(
+                    "failed to parse sidecar drain state {}; treating sidecar as in flight: {error:#}",
+                    path.display()
+                );
+                return count + 1;
+            }
+        };
+        if state.plugin_instance_id == config.bridge.cbth_plugin.plugin_instance_id
+            && state.plugin_release_id == config.bridge.cbth_plugin.plugin_release_id
+        {
+            count += state.in_flight_count;
+        }
+    }
+}
+
+fn sidecar_drain_state_file_prefix(config: &AppConfig) -> String {
+    format!(
+        "{}--{}--",
+        sidecar_drain_state_component(&config.bridge.cbth_plugin.plugin_instance_id),
+        sidecar_drain_state_component(&config.bridge.cbth_plugin.plugin_release_id)
+    )
+}
+
+fn sidecar_drain_state_component(value: &str) -> String {
+    let normalized: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect();
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn sidecar_drain_state_file_matches(path: &Path, matching_file_prefix: &str) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with(matching_file_prefix) && name.ends_with(".json"))
 }
 
 #[derive(Debug, Deserialize)]
 struct SidecarDrainState {
+    plugin_instance_id: String,
+    plugin_release_id: String,
     #[serde(default)]
     in_flight_count: u64,
 }
@@ -3435,20 +3558,36 @@ async fn handle_lifecycle_rpc_frame(
         PLUGIN_RPC_PLUGIN_DRAIN_METHOD => {
             match decode_lifecycle_params::<PluginDrainRequest>(&frame) {
                 Ok(request) => {
-                    lifecycle.quiesce();
-                    if !lifecycle
-                        .wait_until_drained(PLUGIN_LIFECYCLE_DRAIN_TIMEOUT)
-                        .await
-                    {
+                    let Some(token) = lifecycle.quiesce_for_drain() else {
+                        return LifecycleRpcResponse {
+                            frame: PluginRpcResponseFrame::success(
+                                frame.id,
+                                serde_json::to_value(PluginDrainResponse {
+                                    drained: false,
+                                    in_flight_count: Some(lifecycle.in_flight_count()),
+                                })
+                                .expect("drain response serializes"),
+                            ),
+                            response_flushed: None,
+                        };
+                    };
+                    let incomplete_drain_response = || {
                         Ok(serde_json::to_value(PluginDrainResponse {
                             drained: false,
                             in_flight_count: Some(lifecycle.in_flight_count()),
                         })
                         .expect("drain response serializes"))
+                    };
+                    if !lifecycle
+                        .wait_until_drained(PLUGIN_LIFECYCLE_DRAIN_TIMEOUT)
+                        .await
+                        || !lifecycle.is_current_quiesce(token)
+                    {
+                        incomplete_drain_response()
                     } else {
                         lifecycle_command_response(
                             events_tx,
-                            LifecycleCommand::Drain(request),
+                            LifecycleCommand::Drain { request, token },
                             None,
                         )
                         .await

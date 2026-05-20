@@ -146,6 +146,14 @@ async fn run_supervisor() -> Result<()> {
             .arg(&sidecar_path)
             .env("WXCD_SOCKET_PATH", &config.bridge.socket_path)
             .env("WXCD_PLUGIN_HOME", &config.bridge.cbth_plugin.plugin_home)
+            .env(
+                "WXCD_PLUGIN_INSTANCE_ID",
+                &config.bridge.cbth_plugin.plugin_instance_id,
+            )
+            .env(
+                "WXCD_PLUGIN_RELEASE_ID",
+                &config.bridge.cbth_plugin.plugin_release_id,
+            )
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()

@@ -19,8 +19,14 @@ const socketPath = process.env.WXCD_SOCKET_PATH || "/tmp/wxcd.sock";
 const botEmail = (process.env.WEBEX_BOT_EMAIL || "").toLowerCase();
 const ingressRetryDelayMs = Number.parseInt(process.env.WXCD_INGRESS_RETRY_DELAY_MS || "1000", 10);
 const pluginHome = process.env.CBTH_PLUGIN_HOME || process.env.WXCD_PLUGIN_HOME || "";
+const pluginInstanceId = process.env.WXCD_PLUGIN_INSTANCE_ID || "standalone";
+const pluginReleaseId = process.env.CBTH_PLUGIN_RELEASE_ID || process.env.WXCD_PLUGIN_RELEASE_ID || "unknown";
 const sidecarDrainStatePath = pluginHome
-  ? path.join(pluginHome, "webex-sidecar-drain-state.json")
+  ? path.join(
+      pluginHome,
+      "webex-sidecar-drain-state",
+      `${drainStateComponent(pluginInstanceId)}--${drainStateComponent(pluginReleaseId)}--${process.pid}.json`
+    )
   : "";
 
 if (!token) {
@@ -43,11 +49,18 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function drainStateComponent(value) {
+  const normalized = String(value || "unknown").replace(/[^A-Za-z0-9_.-]/g, "_");
+  return normalized.slice(0, 128) || "unknown";
+}
+
 function queueSidecarDrainStateWrite() {
   if (!sidecarDrainStatePath) {
     return Promise.resolve();
   }
   const snapshot = {
+    plugin_instance_id: pluginInstanceId,
+    plugin_release_id: pluginReleaseId,
     pid: process.pid,
     in_flight_count: sidecarInFlightCount,
     updated_at: new Date().toISOString(),
