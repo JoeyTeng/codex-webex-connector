@@ -576,6 +576,7 @@ fn normal_user_message_ingress_does_not_use_delivery_enqueue() {
         person_email: "user@example.com".to_string(),
         text: "normal user turn".to_string(),
         created: Utc::now(),
+        sidecar_received_at: None,
     });
     let async_notification = WebexIngressEnvelope::AsyncNotification(WebexAsyncNotificationEvent {
         event_id: "event-async".to_string(),
@@ -1704,21 +1705,45 @@ fn lifecycle_unquiesce_token_is_invalidated_by_later_quiesce() {
 #[test]
 fn lifecycle_rejects_drainable_sidecar_work_while_quiescing() {
     let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Quiescing));
-    assert!(lifecycle.try_begin_drainable_external_work().is_err());
+    assert!(lifecycle.try_begin_drainable_external_work(None).is_err());
     assert!(lifecycle.try_begin_external_work().is_err());
     assert_eq!(lifecycle.in_flight_count(), 0);
 
     let active = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
     let work_permit = active
-        .try_begin_drainable_external_work()
+        .try_begin_drainable_external_work(None)
         .expect("active lifecycle accepts sidecar-owned drainable work");
     assert_eq!(active.in_flight_count(), 1);
     drop(work_permit);
     assert_eq!(active.in_flight_count(), 0);
 
     let shutting_down = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::ShuttingDown));
-    assert!(shutting_down.try_begin_drainable_external_work().is_err());
+    assert!(
+        shutting_down
+            .try_begin_drainable_external_work(None)
+            .is_err()
+    );
     assert_eq!(shutting_down.in_flight_count(), 0);
+}
+
+#[test]
+fn lifecycle_accepts_already_received_sidecar_work_while_quiescing() {
+    let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
+    let received_before_quiesce = Utc::now();
+    assert!(lifecycle.quiesce());
+
+    let work_permit = lifecycle
+        .try_begin_drainable_external_work(Some(received_before_quiesce))
+        .expect("sidecar work received before quiesce remains drainable");
+    assert_eq!(lifecycle.in_flight_count(), 1);
+    drop(work_permit);
+
+    let received_after_quiesce = Utc::now() + Duration::seconds(1);
+    assert!(
+        lifecycle
+            .try_begin_drainable_external_work(Some(received_after_quiesce))
+            .is_err()
+    );
 }
 
 #[test]

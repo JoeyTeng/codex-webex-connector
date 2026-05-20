@@ -8,7 +8,7 @@ use std::sync::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -252,6 +252,7 @@ enum LifecycleAdmissionPhase {
 struct LifecyclePhaseState {
     phase: LifecycleAdmissionPhase,
     generation: u64,
+    phase_started_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +278,7 @@ impl LifecycleControl {
             phase: Mutex::new(LifecyclePhaseState {
                 phase: initial_phase,
                 generation: 0,
+                phase_started_at: Utc::now(),
             }),
             in_flight: AtomicU64::new(0),
             drained: Notify::new(),
@@ -293,6 +295,7 @@ impl LifecycleControl {
             LifecycleAdmissionPhase::Active | LifecycleAdmissionPhase::Quiescing => {
                 state.phase = LifecycleAdmissionPhase::Quiescing;
                 state.generation = state.generation.wrapping_add(1);
+                state.phase_started_at = Utc::now();
                 true
             }
             LifecycleAdmissionPhase::ShuttingDown => false,
@@ -320,6 +323,7 @@ impl LifecycleControl {
         }
         state.phase = LifecycleAdmissionPhase::Active;
         state.generation = state.generation.wrapping_add(1);
+        state.phase_started_at = Utc::now();
         true
     }
 
@@ -331,6 +335,7 @@ impl LifecycleControl {
                 let previous = state.phase;
                 state.phase = LifecycleAdmissionPhase::ShuttingDown;
                 state.generation = state.generation.wrapping_add(1);
+                state.phase_started_at = Utc::now();
                 Some(previous)
             }
         }
@@ -341,6 +346,7 @@ impl LifecycleControl {
         if state.phase == LifecycleAdmissionPhase::ShuttingDown {
             state.phase = previous;
             state.generation = state.generation.wrapping_add(1);
+            state.phase_started_at = Utc::now();
         }
     }
 
@@ -368,6 +374,7 @@ impl LifecycleControl {
 
     fn try_begin_drainable_external_work(
         self: &Arc<Self>,
+        sidecar_received_at: Option<DateTime<Utc>>,
     ) -> std::result::Result<LifecycleWorkPermit, String> {
         let state = self.phase.lock().expect("lifecycle phase poisoned");
         match state.phase {
@@ -379,10 +386,30 @@ impl LifecycleControl {
                 })
             }
             LifecycleAdmissionPhase::Quiescing => {
-                Err("plugin is quiescing and is not accepting new Webex work".to_string())
+                if sidecar_received_at
+                    .is_some_and(|received_at| received_at <= state.phase_started_at)
+                {
+                    self.in_flight.fetch_add(1, Ordering::SeqCst);
+                    Ok(LifecycleWorkPermit {
+                        lifecycle: Arc::clone(self),
+                        finished: false,
+                    })
+                } else {
+                    Err("plugin is quiescing and is not accepting new Webex work".to_string())
+                }
             }
             LifecycleAdmissionPhase::ShuttingDown => {
-                Err("plugin is shutting down and is not accepting new Webex work".to_string())
+                if sidecar_received_at
+                    .is_some_and(|received_at| received_at <= state.phase_started_at)
+                {
+                    self.in_flight.fetch_add(1, Ordering::SeqCst);
+                    Ok(LifecycleWorkPermit {
+                        lifecycle: Arc::clone(self),
+                        finished: false,
+                    })
+                } else {
+                    Err("plugin is shutting down and is not accepting new Webex work".to_string())
+                }
             }
         }
     }
@@ -3704,7 +3731,9 @@ async fn handle_ingress_connection(
             worker_active_check_ack(healthy.load(Ordering::Relaxed), lifecycle.phase())
         }
         event if ingress_requires_processing_ack(&event) => {
-            let work_permit = match lifecycle.try_begin_drainable_external_work() {
+            let sidecar_received_at = ingress_sidecar_received_at(&event);
+            let work_permit = match lifecycle.try_begin_drainable_external_work(sidecar_received_at)
+            {
                 Ok(work_permit) => work_permit,
                 Err(detail) => {
                     return write_ingress_ack(
@@ -3760,7 +3789,9 @@ async fn handle_ingress_connection(
             }
         }
         event => {
-            let work_permit = match lifecycle.try_begin_drainable_external_work() {
+            let sidecar_received_at = ingress_sidecar_received_at(&event);
+            let work_permit = match lifecycle.try_begin_drainable_external_work(sidecar_received_at)
+            {
                 Ok(work_permit) => work_permit,
                 Err(detail) => {
                     return write_ingress_ack(
@@ -3790,6 +3821,14 @@ async fn handle_ingress_connection(
         }
     };
     write_ingress_ack(&mut writer, ack).await
+}
+
+fn ingress_sidecar_received_at(event: &WebexIngressEnvelope) -> Option<DateTime<Utc>> {
+    match event {
+        WebexIngressEnvelope::MessageCreated(event) => event.sidecar_received_at,
+        WebexIngressEnvelope::AttachmentActionCreated(event) => event.sidecar_received_at,
+        _ => None,
+    }
 }
 
 fn worker_active_check_ack(

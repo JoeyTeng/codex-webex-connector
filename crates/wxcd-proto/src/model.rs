@@ -175,6 +175,8 @@ pub struct WebexMessageEvent {
     pub person_email: String,
     pub text: String,
     pub created: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_received_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +188,8 @@ pub struct WebexAttachmentActionEvent {
     pub message_id: Option<String>,
     pub inputs: serde_json::Value,
     pub created: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_received_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

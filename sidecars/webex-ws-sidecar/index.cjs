@@ -334,6 +334,7 @@ function installMercuryWatchdog() {
 }
 
 async function forwardMessage(payload) {
+  const sidecarReceivedAt = new Date().toISOString();
   await withSidecarDrainTracking(async () => {
     const message = await fetchJson(`https://webexapis.com/v1/messages/${payload.data.id}`);
     const personEmail = (message.personEmail || payload.data.personEmail || "").toLowerCase();
@@ -349,9 +350,9 @@ async function forwardMessage(payload) {
         person_email: personEmail,
         text: message.text,
         created: message.created || new Date().toISOString(),
+        sidecar_received_at: sidecarReceivedAt,
       },
       {
-        retryLifecycleRejection: true,
         retryUnavailable: true,
       }
     );
@@ -359,6 +360,7 @@ async function forwardMessage(payload) {
 }
 
 async function forwardAttachmentAction(payload) {
+  const sidecarReceivedAt = new Date().toISOString();
   await withSidecarDrainTracking(async () => {
     const action = await fetchJson(`https://webexapis.com/v1/attachment/actions/${payload.data.id}`);
     const personEmail = (action.personEmail || payload.data.personEmail || "").toLowerCase();
@@ -375,9 +377,9 @@ async function forwardAttachmentAction(payload) {
         message_id: action.messageId || null,
         inputs: action.inputs || {},
         created: action.created || new Date().toISOString(),
+        sidecar_received_at: sidecarReceivedAt,
       },
       {
-        retryLifecycleRejection: true,
         retryUnavailable: true,
       }
     );
