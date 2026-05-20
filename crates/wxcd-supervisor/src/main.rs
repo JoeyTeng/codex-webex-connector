@@ -44,6 +44,11 @@ const WXCD_SOCKET_PATH_ENV: &str = "WXCD_SOCKET_PATH";
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
 const WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV: &str = "WXCD_SUPERVISOR_SHUTDOWN_MARKER";
+const WXCD_PLUGIN_HOME_ENV: &str = "WXCD_PLUGIN_HOME";
+const WXCD_PLUGIN_INSTANCE_ID_ENV: &str = "WXCD_PLUGIN_INSTANCE_ID";
+const WXCD_PLUGIN_RELEASE_ID_ENV: &str = "WXCD_PLUGIN_RELEASE_ID";
+const CBTH_PLUGIN_HOME_ENV: &str = "CBTH_PLUGIN_HOME";
+const CBTH_PLUGIN_RELEASE_ID_ENV: &str = "CBTH_PLUGIN_RELEASE_ID";
 const SUPERVISOR_SHUTDOWN_MARKER_FILE_PREFIX: &str = "supervisor-shutdown-requested";
 
 #[derive(Parser)]
@@ -146,18 +151,14 @@ async fn run_supervisor() -> Result<()> {
 
         info!("starting sidecar from {}", sidecar_path.display());
         let node_path = std::env::var("WXCD_NODE_PATH").unwrap_or_else(|_| "node".to_string());
-        let mut sidecar = match Command::new(&node_path)
-            .arg(&sidecar_path)
-            .env(WXCD_SOCKET_PATH_ENV, &worker_socket_path)
-            .env("WXCD_PLUGIN_HOME", &config.bridge.cbth_plugin.plugin_home)
-            .env(
-                "WXCD_PLUGIN_INSTANCE_ID",
-                &config.bridge.cbth_plugin.plugin_instance_id,
-            )
-            .env(
-                "WXCD_PLUGIN_RELEASE_ID",
-                &config.bridge.cbth_plugin.plugin_release_id,
-            )
+        let mut sidecar_command = Command::new(&node_path);
+        sidecar_command.arg(&sidecar_path);
+        configure_sidecar_environment(
+            &mut sidecar_command,
+            &config.bridge.cbth_plugin,
+            &worker_socket_path,
+        );
+        let mut sidecar = match sidecar_command
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
@@ -573,6 +574,25 @@ fn configure_worker_environment(
     }
     if let Some(socket_path) = worker_ingress_socket_path {
         command.env(WXCD_SOCKET_PATH_ENV, socket_path);
+    }
+}
+
+fn configure_sidecar_environment(
+    command: &mut Command,
+    config: &CbthPluginConfig,
+    worker_ingress_socket_path: &Path,
+) {
+    command.env_remove(WXCD_SOCKET_PATH_ENV);
+    command.env_remove(WXCD_PLUGIN_HOME_ENV);
+    command.env_remove(WXCD_PLUGIN_INSTANCE_ID_ENV);
+    command.env_remove(WXCD_PLUGIN_RELEASE_ID_ENV);
+    command.env_remove(CBTH_PLUGIN_HOME_ENV);
+    command.env_remove(CBTH_PLUGIN_RELEASE_ID_ENV);
+    command.env(WXCD_SOCKET_PATH_ENV, worker_ingress_socket_path);
+    if config.enabled {
+        command.env(WXCD_PLUGIN_HOME_ENV, &config.plugin_home);
+        command.env(WXCD_PLUGIN_INSTANCE_ID_ENV, &config.plugin_instance_id);
+        command.env(WXCD_PLUGIN_RELEASE_ID_ENV, &config.plugin_release_id);
     }
 }
 
@@ -1475,6 +1495,98 @@ mod tests {
 
         configure_worker_environment(&mut command, None, None, None, None, Some(socket_path));
 
+        let socket_env = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == WXCD_SOCKET_PATH_ENV);
+        assert!(matches!(
+            socket_env,
+            Some((_, Some(value))) if value == socket_path.as_os_str()
+        ));
+    }
+
+    #[test]
+    fn sidecar_command_env_sets_plugin_scope_only_in_plugin_mode() {
+        let mut command = Command::new("node");
+        let socket_path = Path::new("/tmp/wxcd-ingress-current.sock");
+        let config = CbthPluginConfig {
+            enabled: true,
+            socket_path: Some("/tmp/cbth.sock".into()),
+            plugin_home: "/tmp/plugin-home".into(),
+            plugin_instance_id: "instance-1".to_string(),
+            plugin_release_id: "release-1".to_string(),
+            manifest_path: "/tmp/plugin/manifest.json".into(),
+        };
+
+        configure_sidecar_environment(&mut command, &config, socket_path);
+
+        let socket_env = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == WXCD_SOCKET_PATH_ENV);
+        assert!(matches!(
+            socket_env,
+            Some((_, Some(value))) if value == socket_path.as_os_str()
+        ));
+        let plugin_home_env = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == WXCD_PLUGIN_HOME_ENV);
+        assert!(matches!(
+            plugin_home_env,
+            Some((_, Some(value))) if value == Path::new("/tmp/plugin-home").as_os_str()
+        ));
+        let plugin_instance_env = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == WXCD_PLUGIN_INSTANCE_ID_ENV);
+        assert!(matches!(
+            plugin_instance_env,
+            Some((_, Some(value))) if value == std::ffi::OsStr::new("instance-1")
+        ));
+        let plugin_release_env = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == WXCD_PLUGIN_RELEASE_ID_ENV);
+        assert!(matches!(
+            plugin_release_env,
+            Some((_, Some(value))) if value == std::ffi::OsStr::new("release-1")
+        ));
+    }
+
+    #[test]
+    fn sidecar_command_env_removes_plugin_scope_in_standalone_mode() {
+        let mut command = Command::new("node");
+        command.env(WXCD_PLUGIN_HOME_ENV, "/tmp/stale-plugin-home");
+        command.env(WXCD_PLUGIN_INSTANCE_ID_ENV, "stale-instance");
+        command.env(WXCD_PLUGIN_RELEASE_ID_ENV, "stale-release");
+        command.env(CBTH_PLUGIN_HOME_ENV, "/tmp/stale-cbth-home");
+        command.env(CBTH_PLUGIN_RELEASE_ID_ENV, "stale-cbth-release");
+        let socket_path = Path::new("/tmp/wxcd.sock");
+        let config = CbthPluginConfig {
+            enabled: false,
+            socket_path: None,
+            plugin_home: "/tmp/plugin-home".into(),
+            plugin_instance_id: "standalone".to_string(),
+            plugin_release_id: "release-1".to_string(),
+            manifest_path: "/tmp/plugin/manifest.json".into(),
+        };
+
+        configure_sidecar_environment(&mut command, &config, socket_path);
+
+        for key in [
+            WXCD_PLUGIN_HOME_ENV,
+            WXCD_PLUGIN_INSTANCE_ID_ENV,
+            WXCD_PLUGIN_RELEASE_ID_ENV,
+            CBTH_PLUGIN_HOME_ENV,
+            CBTH_PLUGIN_RELEASE_ID_ENV,
+        ] {
+            let env = command
+                .as_std()
+                .get_envs()
+                .find(|(env_key, _)| *env_key == key);
+            assert!(matches!(env, Some((_, None))));
+        }
         let socket_env = command
             .as_std()
             .get_envs()
