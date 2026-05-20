@@ -7,15 +7,14 @@ use super::{
     SIDECAR_DEFERRED_INGRESS_DIR, SIDECAR_DRAIN_STATE_DIR, SidecarDrainState,
     SidecarDrainStateLiveness, ThreadProbe, ThreadProbeKind, WorkerQueueItem, WorkerState,
     abbreviate, apply_thread_probe, attached_session_for_thread,
-    build_async_notification_delivery_request, build_handoff_in_flight_state,
-    durable_local_snapshot_path, ensure_approval_belongs_to_installation,
-    ensure_failed_cleanup_target, ensure_session_id_belongs_to_installation,
-    export_handoff_snapshot, extract_thread_history_turns, generate_installation_id,
-    handle_lifecycle_command, import_handoff_snapshot, ingress_requires_processing_ack,
-    ingress_uses_delivery_enqueue, initial_lifecycle_phase_from_env, is_control_list_session,
-    is_default_list_session, is_failed_session_room_command, lifecycle_accepts_handoff_import,
-    lifecycle_command_response, lifecycle_control_socket_path_from_env,
-    lifecycle_handoff_export_in_flight_total, lifecycle_runtime_in_flight_total,
+    build_async_notification_delivery_request, durable_local_snapshot_path,
+    ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
+    ensure_session_id_belongs_to_installation, export_handoff_snapshot,
+    extract_thread_history_turns, generate_installation_id, handle_lifecycle_command,
+    import_handoff_snapshot, ingress_requires_processing_ack, ingress_uses_delivery_enqueue,
+    initial_lifecycle_phase_from_env, is_control_list_session, is_default_list_session,
+    is_failed_session_room_command, lifecycle_accepts_handoff_import, lifecycle_command_response,
+    lifecycle_control_socket_path_from_env, lifecycle_runtime_in_flight_total,
     lifecycle_sidecar_in_flight_count, load_durable_local_snapshot_with_metadata,
     load_local_snapshot_with_metadata, load_or_create_installation_identity,
     normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
@@ -2410,21 +2409,6 @@ fn lifecycle_preserves_first_quiesce_cutoff_through_drain_and_shutdown() {
 #[test]
 fn lifecycle_runtime_count_includes_drainable_ingress() {
     assert_eq!(lifecycle_runtime_in_flight_total(2, 3, 5, 7), 17);
-}
-
-#[test]
-fn handoff_export_runtime_count_allows_session_handoff_state() {
-    let mut state = WorkerState::default();
-    state.set_executable_installation("ins_current");
-    let mut running =
-        managed_session_record("ses_running", SessionState::Running, false, "ins_current");
-    running.active_turn_id = Some("turn_running".to_string());
-    state.upsert_session(running);
-
-    assert_eq!(state.lifecycle_codex_in_flight_count(), 1);
-    assert_eq!(lifecycle_handoff_export_in_flight_total(0, 0, 0), 0);
-    assert_eq!(lifecycle_handoff_export_in_flight_total(1, 2, 3), 6);
-    assert_eq!(build_handoff_in_flight_state(&state).sessions.len(), 1);
 }
 
 #[tokio::test]

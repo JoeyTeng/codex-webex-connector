@@ -3351,11 +3351,11 @@ async fn handle_lifecycle_command_with_runtime_drain(
             if !matches!(ctx.lifecycle.phase(), LifecycleAdmissionPhase::Quiescing) {
                 bail!("lifecycle handoff export requires quiesced Webex work admission");
             }
-            let in_flight_count = lifecycle_handoff_export_in_flight_count(&mut ctx).await;
+            let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
             persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
             if in_flight_count > 0 {
                 bail!(
-                    "lifecycle handoff export requires drained runtime work, but {in_flight_count} Webex ingress, queued Codex events, or sidecar callbacks remain in flight"
+                    "lifecycle handoff export requires a drained worker, but {in_flight_count} Webex ingress, Codex events, or sessions remain in flight"
                 );
             }
             let response = export_handoff_snapshot(ctx.config, ctx.state).await?;
@@ -3955,21 +3955,6 @@ async fn lifecycle_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_,
     )
 }
 
-async fn lifecycle_handoff_export_in_flight_count(
-    ctx: &mut LifecycleCommandContext<'_, '_>,
-) -> u64 {
-    let sidecar_in_flight_count = lifecycle_sidecar_in_flight_count(
-        ctx.config,
-        ctx.lifecycle.sidecar_drain_barrier_started_at(),
-    )
-    .await;
-    lifecycle_handoff_export_in_flight_total(
-        ctx.lifecycle.in_flight_count(),
-        ctx.codex.events().len(),
-        sidecar_in_flight_count,
-    )
-}
-
 fn lifecycle_codex_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_, '_>) -> u64 {
     lifecycle_runtime_in_flight_total(
         0,
@@ -3977,14 +3962,6 @@ fn lifecycle_codex_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_,
         ctx.codex.events().len(),
         0,
     )
-}
-
-fn lifecycle_handoff_export_in_flight_total(
-    ingress_in_flight_count: u64,
-    queued_codex_event_count: usize,
-    sidecar_in_flight_count: u64,
-) -> u64 {
-    ingress_in_flight_count + queued_codex_event_count as u64 + sidecar_in_flight_count
 }
 
 fn lifecycle_runtime_in_flight_total(

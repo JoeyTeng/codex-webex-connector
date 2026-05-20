@@ -48,5 +48,5 @@ superseded_by:
 - Offline frozen-diff fallback review found and W6 fixed two additional import hardening issues after PR creation:
   - `plugin.handoff_import` no longer resurrects local sessions older than the target worker's replayed remote snapshot.
   - `plugin.handoff_import` now applies imported runtime state only after sidecar handoff records and imported mirrors are successfully persisted.
-- A later frozen-diff pass found and W6 fixed an export guard mismatch:
-  - `plugin.handoff_export` now blocks on active Webex ingress, queued Codex events, and sidecar callbacks, but allows durable session-level in-flight state to be exported in the handoff payload.
+- A later frozen-diff pass found that Codex live turns and approval requests are connection-scoped:
+  - `plugin.handoff_export` remains conservative and requires a fully drained worker before exporting, rather than trying to resume active Codex streams across the release switch.
