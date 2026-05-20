@@ -114,7 +114,7 @@ enum RpcStatus {
     HelloFailed(String),
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct WorkerState {
     sessions: HashMap<String, SessionRecord>,
     room_to_session: HashMap<String, String>,
@@ -3423,7 +3423,8 @@ async fn import_handoff_snapshot(
     }
     let payload = decode_webex_handoff_payload(snapshot)?;
     validate_webex_handoff_payload(config, state, &payload)?;
-    apply_webex_handoff_payload(state, &payload)?;
+    let mut imported_state = state.clone();
+    apply_webex_handoff_payload(&mut imported_state, &payload)?;
     materialize_handoff_deferred_ingress_records(
         &config
             .bridge
@@ -3433,8 +3434,9 @@ async fn import_handoff_snapshot(
         &payload.sidecar.deferred_ingress_records,
     )
     .await?;
-    persist_durable_lifecycle_mirror(config, state).await?;
     persist_webex_handoff_state(config, &payload).await?;
+    persist_durable_lifecycle_mirror(config, &imported_state).await?;
+    *state = imported_state;
     Ok(PluginLifecycleAckResponse { accepted: true })
 }
 
@@ -3524,6 +3526,8 @@ fn apply_webex_handoff_payload(
             }
             replace_session = in_flight_session_ids.contains(local_session.session_id.as_str())
                 || local_session.updated_at >= remote_session.updated_at;
+        } else if state.local_session_is_stale_against_remote(&local_session) {
+            continue;
         }
         if local_session.authority.is_none() {
             local_session.authority = Some(SessionAuthority {

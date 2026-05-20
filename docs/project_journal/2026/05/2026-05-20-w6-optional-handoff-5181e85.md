@@ -45,3 +45,6 @@ superseded_by:
 - Helper-backed local review found and W6 fixed two import hardening issues before commit:
   - `plugin.handoff_import` now requires pre-active quiesced admission rather than any quiesced worker.
   - `plugin.handoff_import` no longer claims unowned legacy sessions that lack current installation evidence.
+- Offline frozen-diff fallback review found and W6 fixed two additional import hardening issues after PR creation:
+  - `plugin.handoff_import` no longer resurrects local sessions older than the target worker's replayed remote snapshot.
+  - `plugin.handoff_import` now applies imported runtime state only after sidecar handoff records and imported mirrors are successfully persisted.

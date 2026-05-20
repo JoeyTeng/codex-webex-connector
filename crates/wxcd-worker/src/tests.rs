@@ -1974,6 +1974,133 @@ async fn handoff_import_does_not_claim_unowned_legacy_session() {
     tokio::fs::remove_dir_all(&target_dir).await.unwrap();
 }
 
+#[tokio::test]
+async fn handoff_import_does_not_resurrect_snapshot_stale_session() {
+    let source_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-stale-source-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let target_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-stale-target-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let source_config = app_config_with_state_dir(&source_dir, true);
+    let mut target_config = app_config_with_state_dir(&target_dir, true);
+    target_config.bridge.cbth_plugin.plugin_release_id = "0.2.0".to_string();
+    let base_time = Utc::now();
+
+    let mut source_state = WorkerState::default();
+    source_state.set_executable_installation("ins_current");
+    let mut stale_session =
+        managed_session_record("ses_stale", SessionState::Idle, false, "ins_current");
+    stale_session.updated_at = base_time;
+    source_state.upsert_session(stale_session);
+    let snapshot = export_handoff_snapshot(&source_config, &source_state)
+        .await
+        .unwrap()
+        .snapshot;
+
+    let mut target_state = WorkerState {
+        remote_snapshot_created_at: Some(base_time + Duration::seconds(2)),
+        ..WorkerState::default()
+    };
+    target_state.set_executable_installation("ins_current");
+
+    let ack = import_handoff_snapshot(&target_config, &mut target_state, snapshot)
+        .await
+        .unwrap();
+
+    assert!(ack.accepted);
+    assert!(!target_state.sessions.contains_key("ses_stale"));
+    assert!(!target_state.room_to_session.contains_key("room-ses_stale"));
+    assert!(
+        !target_state
+            .thread_to_session
+            .contains_key("thread-ses_stale")
+    );
+
+    tokio::fs::remove_dir_all(&source_dir).await.unwrap();
+    tokio::fs::remove_dir_all(&target_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn handoff_import_io_failure_does_not_mutate_worker_state() {
+    let source_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-rollback-source-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let target_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-rollback-target-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let source_config = app_config_with_state_dir(&source_dir, true);
+    let mut target_config = app_config_with_state_dir(&target_dir, true);
+    target_config.bridge.cbth_plugin.plugin_release_id = "0.2.0".to_string();
+    let deferred_ingress_dir = source_config
+        .bridge
+        .cbth_plugin
+        .plugin_home
+        .join(SIDECAR_DEFERRED_INGRESS_DIR);
+    tokio::fs::create_dir_all(&deferred_ingress_dir)
+        .await
+        .unwrap();
+    tokio::fs::write(
+        deferred_ingress_dir.join("event-rollback.json"),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "event_id": "event-rollback",
+            "envelope": {
+                "kind": "message_created",
+                "event_id": "event-rollback"
+            }
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut source_state = WorkerState::default();
+    source_state.set_executable_installation("ins_current");
+    let running =
+        managed_session_record("ses_rollback", SessionState::Running, false, "ins_current");
+    source_state.upsert_session(running);
+    source_state.pending_approvals.insert(
+        "apr_rollback".to_string(),
+        pending_approval("apr_rollback", "ses_rollback"),
+    );
+    assert!(source_state.remember_event("event-rollback"));
+    let snapshot = export_handoff_snapshot(&source_config, &source_state)
+        .await
+        .unwrap()
+        .snapshot;
+
+    tokio::fs::create_dir_all(&target_dir).await.unwrap();
+    tokio::fs::write(
+        &target_config.bridge.cbth_plugin.plugin_home,
+        b"not-a-directory",
+    )
+    .await
+    .unwrap();
+    let mut target_state = WorkerState::default();
+    target_state.set_executable_installation("ins_current");
+
+    let error = import_handoff_snapshot(&target_config, &mut target_state, snapshot)
+        .await
+        .expect_err("import should fail before mutating runtime state");
+
+    assert!(
+        format!("{error:#}").contains("failed to create deferred ingress dir"),
+        "{error:#}"
+    );
+    assert!(!target_state.sessions.contains_key("ses_rollback"));
+    assert!(!target_state.pending_approvals.contains_key("apr_rollback"));
+    assert!(!target_state.recent_event_ids.contains("event-rollback"));
+
+    tokio::fs::remove_dir_all(&source_dir).await.unwrap();
+    tokio::fs::remove_dir_all(&target_dir).await.unwrap();
+}
+
 #[test]
 fn handoff_import_rejects_foreign_plugin_instance() {
     let mut config = app_config_with_plugin(true);
