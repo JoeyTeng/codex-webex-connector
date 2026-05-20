@@ -401,6 +401,9 @@ fn recent_event_dedupe_is_bounded() {
     let mut state = WorkerState::default();
     assert!(state.remember_event("first"));
     assert!(!state.remember_event("first"));
+    state.forget_event("first");
+    assert!(state.remember_event("first"));
+    assert!(!state.remember_event("first"));
 
     for index in 0..RECENT_EVENT_ID_LIMIT {
         assert!(state.remember_event(&format!("event-{index}")));

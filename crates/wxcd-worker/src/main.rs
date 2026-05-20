@@ -1307,7 +1307,9 @@ async fn handle_webex_ingress(
             {
                 return Ok(());
             }
-            if message.room_id == control_room_id {
+            let event_id = message.event_id.clone();
+            let processing_ack = message.processing_ack;
+            let result = if message.room_id == control_room_id {
                 handle_control_message(
                     config,
                     webex,
@@ -1317,7 +1319,7 @@ async fn handle_webex_ingress(
                     installation,
                     &message,
                 )
-                .await?;
+                .await
             } else if let Some(session_id) = state.room_to_session.get(&message.room_id).cloned() {
                 handle_session_message(
                     config,
@@ -1328,8 +1330,14 @@ async fn handle_webex_ingress(
                     &session_id,
                     &message.text,
                 )
-                .await?;
+                .await
+            } else {
+                Ok(())
+            };
+            if result.is_err() && processing_ack {
+                state.forget_event(&event_id);
             }
+            result?;
         }
         WebexIngressEnvelope::AttachmentActionCreated(action) => {
             if is_ignored_sender(config, &action.person_email)
@@ -1337,8 +1345,22 @@ async fn handle_webex_ingress(
             {
                 return Ok(());
             }
-            handle_attachment_action(config, webex, event_log, state, codex, installation, action)
-                .await?;
+            let event_id = action.event_id.clone();
+            let processing_ack = action.processing_ack;
+            let result = handle_attachment_action(
+                config,
+                webex,
+                event_log,
+                state,
+                codex,
+                installation,
+                action,
+            )
+            .await;
+            if result.is_err() && processing_ack {
+                state.forget_event(&event_id);
+            }
+            result?;
         }
         WebexIngressEnvelope::AsyncNotification(notification) => {
             if !should_process_async_notification_event(state, &notification.event_id) {
@@ -5561,6 +5583,12 @@ impl WorkerState {
             }
         }
         true
+    }
+
+    fn forget_event(&mut self, event_id: &str) {
+        if self.recent_event_ids.remove(event_id) {
+            self.recent_event_queue.retain(|queued| queued != event_id);
+        }
     }
 
     fn to_replay_state(&self) -> ReplayState {
