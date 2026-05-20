@@ -255,7 +255,7 @@ fn build_cbth_plugin_config(
         .unwrap_or_else(|| state_dir.join("plugin"));
     let plugin_instance_id = optional_env("WXCD_PLUGIN_INSTANCE_ID")
         .or_else(|| optional_env("CBTH_PLUGIN_INSTANCE_ID"))
-        .or_else(|| file_config.and_then(|config| config.plugin_instance_id.clone()))
+        .or_else(|| file_plugin_instance_id(enabled, file_config))
         .unwrap_or_else(|| default_plugin_instance_id(enabled, &plugin_home));
     let plugin_release_id = optional_env("CBTH_PLUGIN_RELEASE_ID")
         .or_else(|| optional_env("WXCD_PLUGIN_RELEASE_ID"))
@@ -280,6 +280,18 @@ fn build_cbth_plugin_config(
         plugin_release_id,
         manifest_path,
     })
+}
+
+fn file_plugin_instance_id(
+    enabled: bool,
+    file_config: Option<&FileCbthPluginConfig>,
+) -> Option<String> {
+    file_config
+        .and_then(|config| config.plugin_instance_id.clone())
+        .filter(|value| {
+            let trimmed = value.trim();
+            !(trimmed.is_empty() || enabled && trimmed == "standalone")
+        })
 }
 
 fn default_plugin_instance_id(enabled: bool, plugin_home: &Path) -> String {
@@ -517,10 +529,11 @@ manifest_path = "plugin/manifest.json"
     }
 
     #[test]
-    fn installed_plugin_instance_id_is_stable_when_cbth_started_at_changes() {
+    fn legacy_standalone_instance_id_uses_plugin_home_identity_in_plugin_mode() {
         let _guard = env_guard();
         clear_cbth_env();
         set_env("CBTH_PLUGIN_RPC_SOCKET", "/tmp/cbth.sock");
+        set_env("CBTH_PLUGIN_HOME", "/tmp/cbth-plugin-home");
         set_env("CBTH_PLUGIN_STARTED_AT", "456");
         let file_config: FileConfig = toml::from_str(
             r#"
@@ -533,9 +546,13 @@ plugin_instance_id = "standalone"
         let config = build_bridge_config(&file_config, None).unwrap();
 
         assert!(config.cbth_plugin.enabled);
-        assert_eq!(config.cbth_plugin.plugin_instance_id, "standalone");
+        assert_eq!(
+            config.cbth_plugin.plugin_instance_id,
+            format!("plugin-home-{}", stable_fnv1a_hex("/tmp/cbth-plugin-home"))
+        );
 
         remove_env("CBTH_PLUGIN_RPC_SOCKET");
+        remove_env("CBTH_PLUGIN_HOME");
         remove_env("CBTH_PLUGIN_STARTED_AT");
     }
 
