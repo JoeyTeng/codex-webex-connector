@@ -28,7 +28,8 @@ use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
 use wxcd_cbth_rpc::{
-    PluginDrainRequest, PluginHealthCheckRequest, PluginRpcErrorKind, PluginShutdownRequest,
+    PluginDrainRequest, PluginHealthCheckRequest, PluginRpcError, PluginRpcErrorKind,
+    PluginShutdownRequest,
 };
 use wxcd_proto::{
     AppConfig, BridgeConfig, BridgeSnapshot, CbthPluginConfig, DiagnosticsConfig,
@@ -1762,6 +1763,42 @@ async fn lifecycle_command_response_times_out_when_queue_is_full() {
         "{}",
         error.message
     );
+}
+
+#[tokio::test]
+async fn lifecycle_command_response_preserves_typed_worker_errors() {
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(1);
+    let response_task = tokio::spawn(async move {
+        lifecycle_command_response(
+            &events_tx,
+            LifecycleCommand::Drain(PluginDrainRequest {
+                reason: "upgrade".to_string(),
+            }),
+            None,
+        )
+        .await
+    });
+
+    let WorkerQueueItem::Lifecycle(command) =
+        events_rx.recv().await.expect("queued lifecycle command")
+    else {
+        panic!("expected lifecycle command");
+    };
+    command
+        .completion
+        .send(Err(PluginRpcError::new(
+            PluginRpcErrorKind::TransientDaemonUnavailable,
+            "worker loop is busy",
+        )))
+        .ok();
+
+    let error = match response_task.await.unwrap() {
+        Ok(_) => panic!("lifecycle command should return typed worker error"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind, PluginRpcErrorKind::TransientDaemonUnavailable);
+    assert!(error.retryable);
 }
 
 #[tokio::test]

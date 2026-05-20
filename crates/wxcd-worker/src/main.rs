@@ -191,7 +191,7 @@ enum WorkerQueueItem {
 
 struct QueuedLifecycleCommand {
     command: LifecycleCommand,
-    completion: oneshot::Sender<std::result::Result<LifecycleCommandResponse, String>>,
+    completion: oneshot::Sender<std::result::Result<LifecycleCommandResponse, PluginRpcError>>,
     response_flushed: Option<oneshot::Receiver<()>>,
     expires_at: Instant,
     response_expires_at: Instant,
@@ -783,9 +783,12 @@ async fn run() -> Result<()> {
                             response_expires_at,
                         } = command;
                         if Instant::now() >= expires_at {
-                            let _ = completion.send(Err(format!(
-                                "lifecycle command expired after {}s before worker loop handled it",
-                                PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT.as_secs()
+                            let _ = completion.send(Err(PluginRpcError::new(
+                                PluginRpcErrorKind::TransientDaemonUnavailable,
+                                format!(
+                                    "lifecycle command expired after {}s before worker loop handled it",
+                                    PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT.as_secs()
+                                ),
                             )));
                             continue;
                         }
@@ -823,7 +826,9 @@ async fn run() -> Result<()> {
                                 )
                                 .await
                             }
-                        }.map_err(|error| format!("{error:#}"));
+                        }.map_err(|error| {
+                            PluginRpcError::new(PluginRpcErrorKind::Internal, format!("{error:#}"))
+                        });
                         let shutdown_accepted = should_shutdown
                             && matches!(
                                 result.as_ref(),
@@ -3506,7 +3511,7 @@ async fn lifecycle_command_response(
             "worker lifecycle command queue is closed",
         )
     })?;
-    let response = timeout_at(response_expires_at, response)
+    timeout_at(response_expires_at, response)
         .await
         .map_err(|_| {
             PluginRpcError::new(
@@ -3522,8 +3527,7 @@ async fn lifecycle_command_response(
                 PluginRpcErrorKind::TransientDaemonUnavailable,
                 "worker stopped before completing lifecycle command",
             )
-        })?;
-    response.map_err(|message| PluginRpcError::new(PluginRpcErrorKind::Internal, message))
+        })?
 }
 
 fn decode_lifecycle_params<T>(

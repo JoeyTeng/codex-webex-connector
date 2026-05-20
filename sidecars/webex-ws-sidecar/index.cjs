@@ -57,20 +57,20 @@ function isRetryableWorkerAck(ack) {
   );
 }
 
-function workerAckError(ack) {
+function workerAckError(ack, options = {}) {
   const error = new Error(`worker rejected ingress: ${ack?.detail || "negative ack"}`);
-  error.retryable = isRetryableWorkerAck(ack);
+  error.retryable = options.retryLifecycleRejection === true && isRetryableWorkerAck(ack);
   error.ack = ack;
   return error;
 }
 
-function decodeWorkerAck(line) {
+function decodeWorkerAck(line, options = {}) {
   const ack = JSON.parse(line);
   if (ack?.ok === true) {
     return ack;
   }
   if (ack?.ok === false) {
-    throw workerAckError(ack);
+    throw workerAckError(ack, options);
   }
   throw new Error(`invalid worker ingress ack: ${line}`);
 }
@@ -88,7 +88,7 @@ function retryableSocketCloseError(message) {
   return error;
 }
 
-function sendEnvelopeOnce(envelope) {
+function sendEnvelopeOnce(envelope, options = {}) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath);
     let settled = false;
@@ -111,7 +111,7 @@ function sendEnvelopeOnce(envelope) {
       if (buffer.includes("\n")) {
         const line = buffer.slice(0, buffer.indexOf("\n")).trim();
         try {
-          finish(resolve, decodeWorkerAck(line));
+          finish(resolve, decodeWorkerAck(line, options));
         } catch (error) {
           finish(reject, error);
         }
@@ -127,14 +127,14 @@ function sendEnvelopeOnce(envelope) {
   });
 }
 
-async function sendEnvelope(envelope) {
+async function sendEnvelope(envelope, options = {}) {
   let nextLogAt = 0;
   for (;;) {
     try {
-      await sendEnvelopeOnce(envelope);
+      await sendEnvelopeOnce(envelope, options);
       return;
     } catch (error) {
-      if (!error?.retryable || shuttingDown) {
+      if (options.retryUnavailable !== true || !error?.retryable || shuttingDown) {
         throw error;
       }
       const now = Date.now();
@@ -155,7 +155,10 @@ async function waitForActiveWorker() {
   let nextLogAt = 0;
   for (;;) {
     try {
-      await sendEnvelopeOnce({ kind: "active_check" });
+      await sendEnvelopeOnce(
+        { kind: "active_check" },
+        { retryLifecycleRejection: true }
+      );
       return;
     } catch (error) {
       if (!error?.retryable || shuttingDown) {
@@ -215,7 +218,10 @@ async function monitorWorkerActive() {
       return;
     }
     try {
-      await sendEnvelopeOnce({ kind: "active_check" });
+      await sendEnvelopeOnce(
+        { kind: "active_check" },
+        { retryLifecycleRejection: true }
+      );
       await startWebexListeners();
     } catch (error) {
       if (!error?.retryable) {
