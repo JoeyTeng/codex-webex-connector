@@ -225,6 +225,7 @@ enum LifecycleCommandResponse {
     AckWithUnquiesceCommit {
         response: PluginLifecycleAckResponse,
         activation: Option<LifecycleTransitionToken>,
+        startup_reconcile_completed: bool,
     },
 }
 
@@ -637,7 +638,7 @@ impl LifecycleControl {
 }
 
 fn sidecar_received_before_cutoff(received_at: DateTime<Utc>, cutoff: DateTime<Utc>) -> bool {
-    received_at.timestamp_millis() < cutoff.timestamp_millis()
+    received_at.timestamp_millis() <= cutoff.timestamp_millis()
 }
 
 impl LifecycleWorkPermit {
@@ -1027,7 +1028,10 @@ async fn run() -> Result<()> {
                             Ok(LifecycleCommandResponse::AckWithUnquiesceCommit {
                                 response,
                                 activation,
-                            }) if response.accepted => *activation,
+                                startup_reconcile_completed,
+                            }) if response.accepted => {
+                                activation.map(|activation| (activation, *startup_reconcile_completed))
+                            }
                             _ => None,
                         };
                         if shutdown_accepted {
@@ -1045,7 +1049,7 @@ async fn run() -> Result<()> {
                             warn!(
                                 "lifecycle shutdown accepted locally but response was not delivered; continuing worker"
                             );
-                        } else if let Some(activation) = unquiesce_activation {
+                        } else if let Some((activation, startup_reconcile_completed)) = unquiesce_activation {
                             let completion_delivered = completion.send(result).is_ok();
                             if completion_delivered
                                 && wait_for_lifecycle_response_flush(response_flushed).await
@@ -1054,6 +1058,8 @@ async fn run() -> Result<()> {
                                     warn!(
                                         "lifecycle unquiesce response flushed but activation was no longer current"
                                     );
+                                } else if startup_reconcile_completed {
+                                    startup_reconcile_pending = false;
                                 }
                             } else {
                                 lifecycle.cancel_unquiesce_activation(activation);
@@ -1067,7 +1073,7 @@ async fn run() -> Result<()> {
                     }
                 }
             }
-            maybe_codex = codex.events().recv() => {
+            maybe_codex = codex.events().recv(), if !startup_reconcile_pending => {
                 let Some(event) = maybe_codex else {
                     break;
                 };
@@ -1093,9 +1099,6 @@ async fn run() -> Result<()> {
     healthy.store(false, Ordering::Relaxed);
     codex.shutdown().await?;
     remove_stale_socket(&ingress_socket_path).await?;
-    if let Some(socket_path) = lifecycle_control_socket_path(&config) {
-        remove_stale_socket(&socket_path).await.ok();
-    }
     Ok(())
 }
 
@@ -3432,10 +3435,11 @@ async fn sidecar_drain_in_flight_count_after(
             Ok(state) => state,
             Err(error) => {
                 warn!(
-                    "failed to parse sidecar drain state {}; treating sidecar as in flight: {error:#}",
+                    "failed to parse sidecar drain state {}; removing corrupt current-scope state: {error:#}",
                     path.display()
                 );
-                return count + 1;
+                remove_sidecar_drain_state_file(&path).await;
+                continue;
             }
         };
         if state.plugin_instance_id == config.bridge.cbth_plugin.plugin_instance_id
@@ -3624,13 +3628,13 @@ async fn handle_lifecycle_unquiesce(
                 accepted: false,
             }));
         }
-        *ctx.startup_reconcile_pending = false;
         let activation = Some(activation_token);
         let accepted = true;
         info!("lifecycle unquiesce completed: {}", request.reason);
         return Ok(LifecycleCommandResponse::AckWithUnquiesceCommit {
             response: PluginLifecycleAckResponse { accepted },
             activation,
+            startup_reconcile_completed: true,
         });
     }
     if Instant::now() >= ctx.response_expires_at {
@@ -3647,6 +3651,7 @@ async fn handle_lifecycle_unquiesce(
     Ok(LifecycleCommandResponse::AckWithUnquiesceCommit {
         response: PluginLifecycleAckResponse { accepted },
         activation,
+        startup_reconcile_completed: false,
     })
 }
 
@@ -5005,11 +5010,21 @@ async fn remove_stale_socket(socket_path: &Path) -> Result<()> {
 async fn remove_stale_lifecycle_socket(socket_path: &Path) -> Result<()> {
     match tokio::fs::symlink_metadata(socket_path).await {
         Ok(metadata) if metadata.file_type().is_socket() => {
-            if UnixStream::connect(socket_path).await.is_ok() {
-                bail!(
-                    "refusing to replace live lifecycle socket {}; set WXCD_CBTH_LIFECYCLE_SOCKET to a release-scoped path",
-                    socket_path.display()
-                );
+            match UnixStream::connect(socket_path).await {
+                Ok(_) => {
+                    bail!(
+                        "refusing to replace live lifecycle socket {}; set WXCD_CBTH_LIFECYCLE_SOCKET to a release-scoped path",
+                        socket_path.display()
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    bail!(
+                        "refusing to replace lifecycle socket {} after non-stale connect error: {error:#}",
+                        socket_path.display()
+                    );
+                }
             }
             tokio::fs::remove_file(socket_path).await.with_context(|| {
                 format!(

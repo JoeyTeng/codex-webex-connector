@@ -32,6 +32,9 @@ const pluginHome = process.env.WXCD_PLUGIN_HOME || process.env.CBTH_PLUGIN_HOME 
 const pluginInstanceId = process.env.WXCD_PLUGIN_INSTANCE_ID || "standalone";
 const pluginReleaseId = process.env.WXCD_PLUGIN_RELEASE_ID || process.env.CBTH_PLUGIN_RELEASE_ID || "unknown";
 const deferredIngressDir = pluginHome ? path.join(pluginHome, "webex-sidecar-deferred-ingress") : "";
+const deferredIngressQuarantineDir = pluginHome
+  ? path.join(pluginHome, "webex-sidecar-deferred-ingress-quarantine")
+  : "";
 const sidecarDrainStatePath = pluginHome
   ? path.join(
       pluginHome,
@@ -251,7 +254,7 @@ function isRetryableWorkerAck(ack) {
   const detail = String(ack?.detail || "");
   return (
     ack?.healthy === false ||
-    /quiescing|shutting down|not accepting new Webex work/i.test(detail)
+    /quiescing|shutting down|not accepting new Webex work|timed out after \d+s processing async notification/i.test(detail)
   );
 }
 
@@ -347,19 +350,63 @@ function replayRecordSortTime(record) {
   return 0;
 }
 
-function deferredIngressRecordMatchesCurrentScope(record) {
+function deferredIngressReplayEligibility(record) {
   if (record?.plugin_instance_id !== pluginInstanceId) {
-    return false;
+    return { eligible: false, reason: "foreign_instance" };
   }
   if (record?.plugin_release_id === pluginReleaseId) {
-    return true;
+    return { eligible: true, reason: "current_release" };
+  }
+  if (!record?.plugin_release_id) {
+    return { eligible: false, reason: "missing_plugin_release_id" };
   }
   const maxAgeMs = finitePositiveDurationMs(deferredIngressReplayMaxAgeMs, 86400000);
   const timestamp = Date.parse(record?.deferred_at || record?.envelope?.created_at || record?.envelope?.created);
   if (!Number.isFinite(timestamp)) {
-    return false;
+    return { eligible: false, reason: "missing_replay_timestamp" };
   }
-  return Date.now() - timestamp <= maxAgeMs;
+  const ageMs = Date.now() - timestamp;
+  if (ageMs <= maxAgeMs) {
+    return { eligible: true, reason: "recent_previous_release", age_ms: ageMs };
+  }
+  return { eligible: false, reason: "stale_previous_release", age_ms: ageMs, max_age_ms: maxAgeMs };
+}
+
+function deferredIngressRecordMatchesCurrentScope(record) {
+  return deferredIngressReplayEligibility(record).eligible;
+}
+
+function quarantineFileName(recordPath, reason) {
+  const safeReason = drainStateComponent(reason).slice(0, 48);
+  const safeBaseName = drainStateComponent(path.basename(recordPath)).slice(0, 120);
+  return `${Date.now()}--${safeReason}--${safeBaseName}`;
+}
+
+async function quarantineDeferredIngressRecord(recordPath, reason, details = {}) {
+  if (!deferredIngressQuarantineDir) {
+    await fs.rm(recordPath, { force: true });
+    return;
+  }
+  await fs.mkdir(deferredIngressQuarantineDir, { recursive: true });
+  const targetPath = path.join(
+    deferredIngressQuarantineDir,
+    quarantineFileName(recordPath, reason)
+  );
+  try {
+    await fs.rename(recordPath, targetPath);
+  } catch (error) {
+    if (error?.code !== "EXDEV") {
+      throw error;
+    }
+    await fs.copyFile(recordPath, targetPath);
+    await fs.rm(recordPath, { force: true });
+  }
+  console.error("quarantined deferred Webex ingress record", {
+    path: recordPath,
+    quarantine_path: targetPath,
+    reason,
+    ...details,
+  });
 }
 
 async function replayDeferredIngress() {
@@ -387,19 +434,27 @@ async function replayDeferredIngress() {
       try {
         record = JSON.parse(await fs.readFile(recordPath, "utf8"));
       } catch (error) {
-        console.error("failed to parse deferred Webex ingress; leaving record for inspection", {
-          path: recordPath,
-          error,
+        await quarantineDeferredIngressRecord(recordPath, "malformed_json", {
+          message: error?.message || String(error),
         });
         continue;
       }
-      if (!deferredIngressRecordMatchesCurrentScope(record)) {
-        console.error("skipping deferred Webex ingress from a different or stale plugin scope", {
-          path: recordPath,
+      const eligibility = deferredIngressReplayEligibility(record);
+      if (!eligibility.eligible) {
+        await quarantineDeferredIngressRecord(recordPath, eligibility.reason, {
           plugin_instance_id: record?.plugin_instance_id,
           plugin_release_id: record?.plugin_release_id,
           current_plugin_instance_id: pluginInstanceId,
           current_plugin_release_id: pluginReleaseId,
+          age_ms: eligibility.age_ms,
+          max_age_ms: eligibility.max_age_ms,
+        });
+        continue;
+      }
+      if (!record?.envelope || typeof record.envelope !== "object") {
+        await quarantineDeferredIngressRecord(recordPath, "missing_envelope", {
+          plugin_instance_id: record?.plugin_instance_id,
+          plugin_release_id: record?.plugin_release_id,
         });
         continue;
       }
@@ -420,13 +475,26 @@ async function replayDeferredIngress() {
 
     for (const { record, recordPath } of records) {
       const replayEnvelope = refreshReplayEnvelope(record.envelope);
-      const replayResult = await withSidecarDrainTracking(() =>
-        sendEnvelope(replayEnvelope, {
-          retryUnavailable: true,
-          retryLifecycleRejection: true,
-          deferOnLifecycleRejection: true,
-        })
-      );
+      let replayResult;
+      try {
+        replayResult = await withSidecarDrainTracking(() =>
+          sendEnvelope(replayEnvelope, {
+            retryUnavailable: true,
+            retryLifecycleRejection: true,
+            deferOnLifecycleRejection: true,
+          })
+        );
+      } catch (error) {
+        if (shuttingDown || exitingForRestart || error?.retryable) {
+          throw error;
+        }
+        await quarantineDeferredIngressRecord(recordPath, "worker_rejected_replay", {
+          message: error?.message || String(error),
+          ack: error?.ack,
+        });
+        await queueSidecarDrainStateWrite();
+        continue;
+      }
       if (replayResult === SEND_DEFERRED) {
         return SEND_DEFERRED;
       }

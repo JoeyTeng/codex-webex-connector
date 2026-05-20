@@ -1875,13 +1875,13 @@ fn lifecycle_accepts_already_received_sidecar_work_while_quiescing() {
 }
 
 #[test]
-fn lifecycle_rejects_same_millisecond_sidecar_work_after_cutoff() {
+fn lifecycle_accepts_same_millisecond_sidecar_work_at_cutoff() {
     let cutoff = Utc.timestamp_millis_opt(1_700_000_000_123).unwrap() + Duration::microseconds(750);
     let previous_millisecond = Utc.timestamp_millis_opt(1_700_000_000_122).unwrap();
     let same_millisecond = Utc.timestamp_millis_opt(1_700_000_000_123).unwrap();
 
     assert!(sidecar_received_before_cutoff(previous_millisecond, cutoff));
-    assert!(!sidecar_received_before_cutoff(same_millisecond, cutoff));
+    assert!(sidecar_received_before_cutoff(same_millisecond, cutoff));
 
     let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
     {
@@ -1893,7 +1893,7 @@ fn lifecycle_rejects_same_millisecond_sidecar_work_after_cutoff() {
     assert!(
         lifecycle
             .try_begin_drainable_external_work(Some(same_millisecond))
-            .is_err()
+            .is_ok()
     );
     assert!(
         lifecycle
@@ -1985,6 +1985,10 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
     )
     .await
     .unwrap();
+    let malformed_current_scope_path = drain_state_dir.join(format!("{matching_prefix}bad.json"));
+    tokio::fs::write(&malformed_current_scope_path, b"not-json")
+        .await
+        .unwrap();
     let stale_current_pid_path =
         drain_state_dir.join(format!("{matching_prefix}stale-current-pid.json"));
     tokio::fs::write(
@@ -2017,6 +2021,11 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
     assert_eq!(sidecar_drain_in_flight_count(&config).await, 2);
     assert!(
         !tokio::fs::try_exists(&stale_current_pid_path)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !tokio::fs::try_exists(&malformed_current_scope_path)
             .await
             .unwrap()
     );
@@ -2305,7 +2314,11 @@ async fn lifecycle_socket_cleanup_refuses_live_socket_path() {
     );
     assert!(tokio::fs::try_exists(&socket_path).await.unwrap());
     drop(listener);
-    tokio::fs::remove_file(&socket_path).await.unwrap();
+
+    remove_stale_lifecycle_socket(&socket_path)
+        .await
+        .expect("refused stale lifecycle socket should be removable");
+    assert!(!tokio::fs::try_exists(&socket_path).await.unwrap());
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 
