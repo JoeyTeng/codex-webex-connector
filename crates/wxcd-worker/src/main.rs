@@ -894,7 +894,9 @@ async fn run() -> Result<()> {
     let healthy = Arc::new(AtomicBool::new(false));
     let lifecycle = Arc::new(LifecycleControl::new(initial_lifecycle_phase));
     if startup_reconcile_pending {
-        info!("pre-active lifecycle mode enabled, deferring startup reconcile until unquiesce");
+        info!(
+            "pre-active lifecycle mode enabled, deferring startup reconcile and Codex event processing until unquiesce"
+        );
     } else {
         reconcile_sessions(
             &config,
@@ -1073,7 +1075,7 @@ async fn run() -> Result<()> {
                     }
                 }
             }
-            maybe_codex = codex.events().recv(), if !startup_reconcile_pending => {
+            maybe_codex = codex.events().recv(), if should_process_codex_events(startup_reconcile_pending) => {
                 let Some(event) = maybe_codex else {
                     break;
                 };
@@ -3445,25 +3447,26 @@ async fn sidecar_drain_in_flight_count_after(
         if state.plugin_instance_id == config.bridge.cbth_plugin.plugin_instance_id
             && state.plugin_release_id == config.bridge.cbth_plugin.plugin_release_id
         {
-            if !sidecar_drain_state_is_fresh(&state, Utc::now()) {
-                warn!(
-                    "ignoring stale sidecar drain state {} updated_at={} pid={:?}",
-                    path.display(),
-                    state.updated_at,
-                    state.pid
-                );
-                remove_sidecar_drain_state_file(&path).await;
-                continue;
-            }
-            if let Some(pid) = state.pid
-                && !process_is_alive(pid)
-            {
-                warn!(
-                    "ignoring stale sidecar drain state {} for exited pid={pid}",
-                    path.display()
-                );
-                remove_sidecar_drain_state_file(&path).await;
-                continue;
+            match sidecar_drain_state_liveness(&state, Utc::now()) {
+                SidecarDrainStateLiveness::Live => {}
+                SidecarDrainStateLiveness::StaleAge => {
+                    warn!(
+                        "ignoring stale sidecar drain state {} updated_at={} pid={:?}",
+                        path.display(),
+                        state.updated_at,
+                        state.pid
+                    );
+                    remove_sidecar_drain_state_file(&path).await;
+                    continue;
+                }
+                SidecarDrainStateLiveness::ExitedPid(pid) => {
+                    warn!(
+                        "ignoring stale sidecar drain state {} for exited pid={pid}",
+                        path.display()
+                    );
+                    remove_sidecar_drain_state_file(&path).await;
+                    continue;
+                }
             }
             if let Some(cutoff) = inactive_observed_after
                 && !state.sidecar_observed_inactive_after(cutoff)
@@ -3522,6 +3525,28 @@ fn sidecar_drain_state_is_fresh(state: &SidecarDrainState, now: DateTime<Utc>) -
         Ok(age) => age <= SIDECAR_DRAIN_STATE_STALE_AFTER,
         Err(_) => true,
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SidecarDrainStateLiveness {
+    Live,
+    StaleAge,
+    ExitedPid(u32),
+}
+
+fn sidecar_drain_state_liveness(
+    state: &SidecarDrainState,
+    now: DateTime<Utc>,
+) -> SidecarDrainStateLiveness {
+    if !sidecar_drain_state_is_fresh(state, now) {
+        return SidecarDrainStateLiveness::StaleAge;
+    }
+    if let Some(pid) = state.pid
+        && !process_is_alive(pid)
+    {
+        return SidecarDrainStateLiveness::ExitedPid(pid);
+    }
+    SidecarDrainStateLiveness::Live
 }
 
 unsafe extern "C" {
@@ -3713,6 +3738,10 @@ fn lifecycle_control_socket_path_from_env(
             .map(PathBuf::from)
             .unwrap_or_else(|| default_lifecycle_control_socket_path(&config.bridge.cbth_plugin)),
     )
+}
+
+fn should_process_codex_events(startup_reconcile_pending: bool) -> bool {
+    !startup_reconcile_pending
 }
 
 fn default_lifecycle_control_socket_path(config: &CbthPluginConfig) -> PathBuf {

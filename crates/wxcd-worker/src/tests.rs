@@ -4,8 +4,9 @@ use super::{
     LifecycleCommand, LifecycleCommandResponse, LifecycleControl, LifecycleTransitionToken,
     ListCommand, ListMode, LocalMirrorClaimScope, PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT,
     PurgeArchivedCommand, QueuedLifecycleCommand, RECENT_EVENT_ID_LIMIT,
-    SIDECAR_DEFERRED_INGRESS_DIR, SIDECAR_DRAIN_STATE_DIR, ThreadProbe, ThreadProbeKind,
-    WorkerQueueItem, WorkerState, abbreviate, apply_thread_probe, attached_session_for_thread,
+    SIDECAR_DEFERRED_INGRESS_DIR, SIDECAR_DRAIN_STATE_DIR, SidecarDrainState,
+    SidecarDrainStateLiveness, ThreadProbe, ThreadProbeKind, WorkerQueueItem, WorkerState,
+    abbreviate, apply_thread_probe, attached_session_for_thread,
     build_async_notification_delivery_request, durable_local_snapshot_path,
     ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
     ensure_session_id_belongs_to_installation, extract_thread_history_turns,
@@ -21,13 +22,13 @@ use super::{
     remove_stale_lifecycle_socket, repo_name_for_cwd, resolve_codex_connection,
     resolve_delivery_broker_connection, session_belongs_to_installation,
     session_requires_codex_archive, sessions_for_diagnostics,
-    should_process_async_notification_event, sidecar_drain_in_flight_count,
-    sidecar_drain_in_flight_count_after, sidecar_drain_state_file_prefix,
-    sidecar_received_before_cutoff, slice_thread_history_page, stable_fnv1a_hex,
-    startup_snapshot_persist_now, validate_purge_archived_session,
-    wait_for_lifecycle_response_flush, webex_delivery_idempotency_key, worker_active_check_ack,
-    worker_ingress_socket_path_for, worker_ingress_socket_path_from_env,
-    write_supervisor_shutdown_marker_at,
+    should_process_async_notification_event, should_process_codex_events,
+    sidecar_drain_in_flight_count, sidecar_drain_in_flight_count_after,
+    sidecar_drain_state_file_prefix, sidecar_drain_state_liveness, sidecar_received_before_cutoff,
+    slice_thread_history_page, stable_fnv1a_hex, startup_snapshot_persist_now,
+    validate_purge_archived_session, wait_for_lifecycle_response_flush,
+    webex_delivery_idempotency_key, worker_active_check_ack, worker_ingress_socket_path_for,
+    worker_ingress_socket_path_from_env, write_supervisor_shutdown_marker_at,
 };
 use chrono::{Duration, TimeZone, Utc};
 use serde_json::json;
@@ -1635,6 +1636,12 @@ fn pre_active_startup_defers_snapshot_persistence() {
     assert!(pending);
 }
 
+#[test]
+fn pre_active_startup_gates_codex_event_processing() {
+    assert!(!should_process_codex_events(true));
+    assert!(should_process_codex_events(false));
+}
+
 #[tokio::test]
 async fn durable_snapshot_loader_falls_back_to_legacy_state_dir_snapshot() {
     let state_dir = std::env::temp_dir().join(format!(
@@ -2047,6 +2054,44 @@ fn sidecar_drain_state_file_prefix_is_bounded() {
     assert!(prefix.starts_with("scope-"));
     assert!(prefix.ends_with("--"));
     assert!(prefix.len() < 64, "{prefix}");
+}
+
+#[test]
+fn sidecar_drain_state_liveness_bounds_pid_reuse_by_age() {
+    let now = Utc::now();
+    let fresh_live = SidecarDrainState {
+        plugin_instance_id: "instance-1".to_string(),
+        plugin_release_id: "0.1.0".to_string(),
+        pid: Some(std::process::id()),
+        in_flight_count: 1,
+        worker_inactive_observed_at: None,
+        updated_at: now,
+    };
+    assert_eq!(
+        sidecar_drain_state_liveness(&fresh_live, now),
+        SidecarDrainStateLiveness::Live
+    );
+    let stale_reused_pid = SidecarDrainState {
+        updated_at: now - Duration::seconds(121),
+        ..fresh_live
+    };
+    let exited_pid = SidecarDrainState {
+        plugin_instance_id: "instance-1".to_string(),
+        plugin_release_id: "0.1.0".to_string(),
+        pid: Some(2_147_483_647_u32),
+        in_flight_count: 1,
+        worker_inactive_observed_at: None,
+        updated_at: now,
+    };
+
+    assert_eq!(
+        sidecar_drain_state_liveness(&stale_reused_pid, now),
+        SidecarDrainStateLiveness::StaleAge
+    );
+    assert_eq!(
+        sidecar_drain_state_liveness(&exited_pid, now),
+        SidecarDrainStateLiveness::ExitedPid(2_147_483_647_u32)
+    );
 }
 
 #[tokio::test]

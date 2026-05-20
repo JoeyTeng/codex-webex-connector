@@ -250,10 +250,18 @@ async function fetchJson(url) {
 
 function isRetryableWorkerAck(ack) {
   const detail = String(ack?.detail || "");
+  return ack?.healthy === false || isLifecycleBackpressureDetail(detail);
+}
+
+function isLifecycleBackpressureDetail(detail) {
   return (
-    ack?.healthy === false ||
-    /quiescing|shutting down|not accepting new Webex work|timed out after \d+s processing async notification/i.test(detail)
+    /quiescing|shutting down|not accepting new Webex work/i.test(detail) ||
+    isReplayAckTimeoutDetail(detail)
   );
+}
+
+function isReplayAckTimeoutDetail(detail) {
+  return /timed out after .*processing async notification/i.test(detail);
 }
 
 function deferredIngressPath(envelope) {
@@ -288,25 +296,16 @@ async function persistDeferredIngressUntilStored(envelope, error) {
   const retryDelayMs = finitePositiveDurationMs(ingressRetryDelayMs, 1000);
   let nextLogAt = 0;
   let attempts = 0;
-  for (;;) {
+  let lastPersistError = error;
+  while (Date.now() - startedAt < timeoutMs) {
     try {
       await persistDeferredIngress(envelope, error);
       return;
     } catch (persistError) {
+      lastPersistError = persistError;
       attempts += 1;
       const now = Date.now();
       const elapsedMs = now - startedAt;
-      if (elapsedMs >= timeoutMs) {
-        exitForSupervisorRestart("deferred_ingress_persist_failed", {
-          message: persistError?.message || String(persistError),
-          code: persistError?.code,
-          event_id: envelope?.event_id || null,
-          attempts,
-          elapsed_ms: elapsedMs,
-          timeout_ms: timeoutMs,
-        });
-        throw persistError;
-      }
       if (now >= nextLogAt) {
         console.error(
           "failed to persist deferred ingress; retrying before releasing sidecar drain",
@@ -314,9 +313,23 @@ async function persistDeferredIngressUntilStored(envelope, error) {
         );
         nextLogAt = now + 10000;
       }
-      await sleep(Math.min(retryDelayMs, timeoutMs - elapsedMs));
+      const remainingMs = timeoutMs - elapsedMs;
+      if (remainingMs <= 0) {
+        break;
+      }
+      await sleep(Math.min(retryDelayMs, remainingMs));
     }
   }
+  const elapsedMs = Date.now() - startedAt;
+  exitForSupervisorRestart("deferred_ingress_persist_failed", {
+    message: lastPersistError?.message || String(lastPersistError),
+    code: lastPersistError?.code,
+    event_id: envelope?.event_id || null,
+    attempts,
+    elapsed_ms: elapsedMs,
+    timeout_ms: timeoutMs,
+  });
+  throw lastPersistError;
 }
 
 function refreshReplayEnvelope(envelope) {
@@ -352,11 +365,12 @@ function deferredIngressReplayEligibility(record) {
   if (record?.plugin_instance_id !== pluginInstanceId) {
     return { eligible: false, reason: "foreign_instance" };
   }
-  if (record?.plugin_release_id === pluginReleaseId) {
-    return { eligible: true, reason: "current_release" };
-  }
-  if (!record?.plugin_release_id) {
+  const releaseId = record?.plugin_release_id;
+  if (!releaseId) {
     return { eligible: false, reason: "missing_plugin_release_id" };
+  }
+  if (releaseId === pluginReleaseId) {
+    return { eligible: true, reason: "current_release" };
   }
   const maxAgeMs = finitePositiveDurationMs(deferredIngressReplayMaxAgeMs, 86400000);
   const timestamp = Date.parse(record?.deferred_at || record?.envelope?.created_at || record?.envelope?.created);
@@ -407,6 +421,12 @@ async function quarantineDeferredIngressRecord(recordPath, reason, details = {})
   });
 }
 
+async function quarantineMalformedDeferredIngressRecord(recordPath, error) {
+  await quarantineDeferredIngressRecord(recordPath, "malformed_json", {
+    message: error?.message || String(error),
+  });
+}
+
 async function replayDeferredIngress() {
   if (!deferredIngressDir) {
     return;
@@ -432,9 +452,7 @@ async function replayDeferredIngress() {
       try {
         record = JSON.parse(await fs.readFile(recordPath, "utf8"));
       } catch (error) {
-        await quarantineDeferredIngressRecord(recordPath, "malformed_json", {
-          message: error?.message || String(error),
-        });
+        await quarantineMalformedDeferredIngressRecord(recordPath, error);
         continue;
       }
       const eligibility = deferredIngressReplayEligibility(record);
