@@ -619,9 +619,7 @@ async function sendEnvelope(envelope, options = {}) {
       return;
     } catch (error) {
       if (options.deferOnLifecycleRejection === true && error?.lifecycleRejected) {
-        await persistDeferredIngressUntilStored(envelope, error);
-        await stopWebexListeners();
-        return SEND_DEFERRED;
+        return await enterDeferredIngressMode(envelope, error);
       }
       if (options.retryUnavailable !== true || !error?.retryable || shuttingDown) {
         throw error;
@@ -639,6 +637,20 @@ async function sendEnvelope(envelope, options = {}) {
       await sleep(Number.isFinite(ingressRetryDelayMs) ? ingressRetryDelayMs : 1000);
     }
   }
+}
+
+async function enterDeferredIngressMode(envelope, error) {
+  await persistDeferredIngressUntilStored(envelope, error);
+  try {
+    await stopWebexListeners();
+  } catch (stopError) {
+    exitForSupervisorRestart("deferred_ingress_listener_stop_failed", {
+      message: stopError?.message || String(stopError),
+      code: stopError?.code,
+      event_id: envelope?.event_id || null,
+    });
+  }
+  return SEND_DEFERRED;
 }
 
 async function waitForActiveWorker() {
