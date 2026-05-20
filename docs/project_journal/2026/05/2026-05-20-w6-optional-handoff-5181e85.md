@@ -5,7 +5,7 @@ status: completed
 created: 2026-05-20
 updated: 2026-05-20
 branch: codex/w6-optional-handoff
-pr:
+pr: https://github.com/JoeyTeng/codex-webex-connector/pull/15
 supersedes: []
 superseded_by:
 ---
