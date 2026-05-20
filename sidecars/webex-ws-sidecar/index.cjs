@@ -215,6 +215,7 @@ function refreshReplayEnvelope(envelope) {
     return {
       ...envelope,
       sidecar_received_at: new Date().toISOString(),
+      processing_ack: true,
     };
   }
   return envelope;

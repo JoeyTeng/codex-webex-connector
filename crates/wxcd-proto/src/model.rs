@@ -177,6 +177,8 @@ pub struct WebexMessageEvent {
     pub created: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_received_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub processing_ack: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +192,12 @@ pub struct WebexAttachmentActionEvent {
     pub created: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_received_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub processing_ack: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

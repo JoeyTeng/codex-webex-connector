@@ -633,6 +633,17 @@ fn normal_user_message_ingress_does_not_use_delivery_enqueue() {
         text: "normal user turn".to_string(),
         created: Utc::now(),
         sidecar_received_at: None,
+        processing_ack: false,
+    });
+    let replayed_message = WebexIngressEnvelope::MessageCreated(WebexMessageEvent {
+        event_id: "event-replayed-message".to_string(),
+        room_id: "room-ses_1".to_string(),
+        message_id: "message-2".to_string(),
+        person_email: "user@example.com".to_string(),
+        text: "replayed user turn".to_string(),
+        created: Utc::now(),
+        sidecar_received_at: None,
+        processing_ack: true,
     });
     let async_notification = WebexIngressEnvelope::AsyncNotification(WebexAsyncNotificationEvent {
         event_id: "event-async".to_string(),
@@ -644,8 +655,10 @@ fn normal_user_message_ingress_does_not_use_delivery_enqueue() {
     });
 
     assert!(!ingress_uses_delivery_enqueue(&message));
+    assert!(!ingress_uses_delivery_enqueue(&replayed_message));
     assert!(ingress_uses_delivery_enqueue(&async_notification));
     assert!(!ingress_requires_processing_ack(&message));
+    assert!(ingress_requires_processing_ack(&replayed_message));
     assert!(ingress_requires_processing_ack(&async_notification));
 }
 

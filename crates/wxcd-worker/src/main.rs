@@ -1459,7 +1459,18 @@ fn should_process_async_notification_event(state: &WorkerState, event_id: &str) 
 }
 
 fn ingress_requires_processing_ack(event: &WebexIngressEnvelope) -> bool {
-    matches!(event, WebexIngressEnvelope::AsyncNotification(_))
+    matches!(
+        event,
+        WebexIngressEnvelope::AsyncNotification(_)
+            | WebexIngressEnvelope::MessageCreated(WebexMessageEvent {
+                processing_ack: true,
+                ..
+            })
+            | WebexIngressEnvelope::AttachmentActionCreated(WebexAttachmentActionEvent {
+                processing_ack: true,
+                ..
+            })
+    )
 }
 
 #[cfg(test)]
