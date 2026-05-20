@@ -18,6 +18,15 @@ pub const PLUGIN_RPC_APP_SERVER_STOP_METHOD: &str = "app_server.stop";
 pub const PLUGIN_RPC_DELIVERY_ENQUEUE_METHOD: &str = "delivery.enqueue";
 pub const PLUGIN_RPC_DELIVERY_INSPECT_METHOD: &str = "delivery.inspect";
 pub const PLUGIN_RPC_DELIVERY_MANUALIZE_METHOD: &str = "delivery.manualize";
+pub const PLUGIN_RPC_PLUGIN_HEALTH_CHECK_METHOD: &str = "plugin.health_check";
+pub const PLUGIN_RPC_PLUGIN_QUIESCE_METHOD: &str = "plugin.quiesce";
+pub const PLUGIN_RPC_PLUGIN_DRAIN_METHOD: &str = "plugin.drain";
+pub const PLUGIN_RPC_PLUGIN_SHUTDOWN_METHOD: &str = "plugin.shutdown";
+pub const PLUGIN_RPC_PLUGIN_HANDOFF_EXPORT_METHOD: &str = "plugin.handoff_export";
+pub const PLUGIN_RPC_PLUGIN_HANDOFF_IMPORT_METHOD: &str = "plugin.handoff_import";
+pub const PLUGIN_RPC_PLUGIN_UNQUIESCE_METHOD: &str = "plugin.unquiesce";
+pub const PLUGIN_RPC_PLUGIN_LIFECYCLE_CAPABILITY: &str = "plugin-lifecycle-v1";
+pub const PLUGIN_RPC_PLUGIN_HANDOFF_CAPABILITY: &str = "plugin-handoff-v1";
 pub const SERVICE_CAPABILITY_DELIVERY_OWNED_CODEX_APP_SERVER_TARGET_V1: &str =
     "delivery-owned-codex-app-server-target-v1";
 
@@ -267,6 +276,115 @@ pub struct PluginDeliveryManualizeRequest {
     pub idempotency_key: Option<String>,
     pub manualize_key: String,
     pub reason: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginLifecycleMode {
+    PreActive,
+    Active,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginHealthCheckRequest {
+    pub mode: PluginLifecycleMode,
+    pub allow_external_side_effects: bool,
+    pub allow_cursor_advance: bool,
+    pub allow_delivery_commit: bool,
+}
+
+impl PluginHealthCheckRequest {
+    pub fn pre_active() -> Self {
+        Self {
+            mode: PluginLifecycleMode::PreActive,
+            allow_external_side_effects: false,
+            allow_cursor_advance: false,
+            allow_delivery_commit: false,
+        }
+    }
+
+    pub fn active() -> Self {
+        Self {
+            mode: PluginLifecycleMode::Active,
+            allow_external_side_effects: true,
+            allow_cursor_advance: true,
+            allow_delivery_commit: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginHealthCheckResponse {
+    pub healthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginQuiesceRequest {
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDrainRequest {
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginDrainResponse {
+    pub drained: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_flight_count: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginShutdownRequest {
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginUnquiesceRequest {
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginHandoffSnapshot {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginHandoffExportRequest {
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginHandoffExportResponse {
+    pub snapshot: PluginHandoffSnapshot,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginHandoffImportRequest {
+    pub reason: String,
+    pub snapshot: PluginHandoffSnapshot,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PluginLifecycleAckResponse {
+    pub accepted: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1047,6 +1165,42 @@ mod tests {
         assert!(rpc_error.retryable);
         server.await.expect("server");
         std::fs::remove_file(socket_path).ok();
+    }
+
+    #[test]
+    fn lifecycle_pre_active_health_check_serializes_c7_contract() {
+        let frame = PluginRpcRequestFrame::new(
+            "lifecycle-1",
+            PLUGIN_RPC_PLUGIN_HEALTH_CHECK_METHOD,
+            serde_json::to_value(PluginHealthCheckRequest::pre_active()).unwrap(),
+        );
+
+        assert_eq!(frame.method, PLUGIN_RPC_PLUGIN_HEALTH_CHECK_METHOD);
+        assert_eq!(
+            frame.params,
+            json!({
+                "mode": "pre_active",
+                "allow_external_side_effects": false,
+                "allow_cursor_advance": false,
+                "allow_delivery_commit": false,
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_drain_response_serializes_incomplete_count() {
+        let response = PluginDrainResponse {
+            drained: false,
+            in_flight_count: Some(2),
+        };
+
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "drained": false,
+                "in_flight_count": 2,
+            })
+        );
     }
 
     fn delivery_enqueue_request() -> PluginDeliveryEnqueueRequest {

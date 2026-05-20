@@ -1,24 +1,34 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsStr;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Duration, timeout};
+use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use wxcd_cbth_rpc::{
-    PLUGIN_RPC_PROTOCOL_VERSION_V1, PluginCapability, PluginDeliveryEnqueueRequest,
-    PluginDeliveryTarget, PluginHelloRequest, PluginRpcClient,
+    PLUGIN_RPC_MAX_FRAME_BYTES, PLUGIN_RPC_PLUGIN_DRAIN_METHOD,
+    PLUGIN_RPC_PLUGIN_HANDOFF_EXPORT_METHOD, PLUGIN_RPC_PLUGIN_HANDOFF_IMPORT_METHOD,
+    PLUGIN_RPC_PLUGIN_HEALTH_CHECK_METHOD, PLUGIN_RPC_PLUGIN_LIFECYCLE_CAPABILITY,
+    PLUGIN_RPC_PLUGIN_QUIESCE_METHOD, PLUGIN_RPC_PLUGIN_SHUTDOWN_METHOD,
+    PLUGIN_RPC_PLUGIN_UNQUIESCE_METHOD, PLUGIN_RPC_PROTOCOL_VERSION_V1, PluginCapability,
+    PluginDeliveryEnqueueRequest, PluginDeliveryTarget, PluginDrainRequest, PluginDrainResponse,
+    PluginHealthCheckRequest, PluginHealthCheckResponse, PluginHelloRequest,
+    PluginLifecycleAckResponse, PluginLifecycleMode, PluginQuiesceRequest, PluginRpcClient,
+    PluginRpcError, PluginRpcErrorKind, PluginRpcRequestFrame, PluginRpcResponseFrame,
+    PluginShutdownRequest, PluginUnquiesceRequest, read_plugin_rpc_frame, write_plugin_rpc_frame,
 };
 use wxcd_codex::{CodexClient, CodexEvent, CodexThreadSummary};
 use wxcd_eventlog::{EventLog, ReplayState};
@@ -48,8 +58,28 @@ const PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT: Duration =
     Duration::from_secs(C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS + 30);
 const ASYNC_NOTIFICATION_INGRESS_ACK_TIMEOUT: Duration =
     Duration::from_secs(C5_DELIVERY_ACCEPTANCE_WINDOW_SECONDS + 45);
+const PLUGIN_LIFECYCLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
+const PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(65);
+#[cfg(test)]
+const PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_millis(75);
+const PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+const PLUGIN_LIFECYCLE_CODEX_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PLUGIN_WORKER_INGRESS_SOCKET_DIR: &str = "/tmp";
+const PLUGIN_LIFECYCLE_SOCKET_DIR: &str = "/tmp";
+const WXCD_SOCKET_PATH_ENV: &str = "WXCD_SOCKET_PATH";
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
+const WXCD_CBTH_LIFECYCLE_SOCKET_ENV: &str = "WXCD_CBTH_LIFECYCLE_SOCKET";
+const WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV: &str = "WXCD_SUPERVISOR_SHUTDOWN_MARKER";
+const SIDECAR_DRAIN_STATE_DIR: &str = "webex-sidecar-drain-state";
+#[cfg(test)]
+const SIDECAR_DEFERRED_INGRESS_DIR: &str = "webex-sidecar-deferred-ingress";
+const SIDECAR_DRAIN_STATE_STALE_AFTER: Duration = Duration::from_secs(120);
 const WEBEX_DELIVERY_MAX_ATTEMPTS: i64 = 3;
 const WEBEX_DELIVERY_REDELIVERY_WINDOW_SECONDS: i64 = 3600;
 
@@ -158,6 +188,477 @@ struct ImportedThreadHistory {
 struct QueuedIngress {
     event: WebexIngressEnvelope,
     completion: Option<oneshot::Sender<std::result::Result<(), String>>>,
+    work_permit: Option<LifecycleWorkPermit>,
+}
+
+enum WorkerQueueItem {
+    Ingress(QueuedIngress),
+    Lifecycle(QueuedLifecycleCommand),
+}
+
+struct QueuedLifecycleCommand {
+    command: LifecycleCommand,
+    completion: oneshot::Sender<std::result::Result<LifecycleCommandResponse, PluginRpcError>>,
+    response_flushed: Option<oneshot::Receiver<()>>,
+    expires_at: Instant,
+    response_expires_at: Instant,
+}
+
+enum LifecycleCommand {
+    Drain {
+        request: PluginDrainRequest,
+        token: LifecycleTransitionToken,
+    },
+    Shutdown {
+        request: PluginShutdownRequest,
+        previous_phase: LifecyclePhaseState,
+    },
+    Unquiesce {
+        request: PluginUnquiesceRequest,
+        token: LifecycleTransitionToken,
+    },
+}
+
+enum LifecycleCommandResponse {
+    Drain(PluginDrainResponse),
+    Ack(PluginLifecycleAckResponse),
+    AckWithUnquiesceCommit {
+        response: PluginLifecycleAckResponse,
+        activation: Option<LifecycleTransitionToken>,
+        startup_reconcile_completed: bool,
+    },
+}
+
+struct LifecycleCommandContext<'a, 'event_log> {
+    config: &'a AppConfig,
+    webex: &'a WebexClient,
+    event_log: &'a EventLog<'event_log>,
+    state: &'a mut WorkerState,
+    codex: &'a mut CodexClient,
+    lifecycle: &'a LifecycleControl,
+    startup_reconcile_pending: bool,
+}
+
+struct LifecycleUnquiesceContext<'a, 'event_log> {
+    config: &'a AppConfig,
+    webex: &'a WebexClient,
+    event_log: &'a EventLog<'event_log>,
+    state: &'a mut WorkerState,
+    codex: &'a mut CodexClient,
+    installation: &'a InstallationIdentity,
+    lifecycle: &'a LifecycleControl,
+    startup_reconcile_pending: &'a mut bool,
+    startup_reconcile_completed: &'a mut bool,
+    startup_snapshot_persist_pending: &'a mut bool,
+    response_expires_at: Instant,
+}
+
+struct LifecycleRpcResponse {
+    frame: PluginRpcResponseFrame,
+    response_flushed: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleAdmissionPhase {
+    Active,
+    Quiescing,
+    Activating,
+    ShuttingDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LifecyclePhaseState {
+    phase: LifecycleAdmissionPhase,
+    generation: u64,
+    phase_started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LifecycleTransitionToken {
+    generation: u64,
+    restore_phase_started_at: Option<DateTime<Utc>>,
+}
+
+impl LifecycleTransitionToken {
+    fn for_generation(generation: u64) -> Self {
+        Self {
+            generation,
+            restore_phase_started_at: None,
+        }
+    }
+
+    fn for_activation(generation: u64, restore_phase_started_at: DateTime<Utc>) -> Self {
+        Self {
+            generation,
+            restore_phase_started_at: Some(restore_phase_started_at),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LifecycleControl {
+    phase: Mutex<LifecyclePhaseState>,
+    in_flight: AtomicU64,
+    drained: Notify,
+}
+
+struct LifecycleWorkPermit {
+    lifecycle: Arc<LifecycleControl>,
+    finished: bool,
+}
+
+impl LifecycleControl {
+    fn new(initial_phase: LifecycleAdmissionPhase) -> Self {
+        Self {
+            phase: Mutex::new(LifecyclePhaseState {
+                phase: initial_phase,
+                generation: 0,
+                phase_started_at: Utc::now(),
+            }),
+            in_flight: AtomicU64::new(0),
+            drained: Notify::new(),
+        }
+    }
+
+    fn phase(&self) -> LifecycleAdmissionPhase {
+        self.phase.lock().expect("lifecycle phase poisoned").phase
+    }
+
+    fn sidecar_drain_barrier_started_at(&self) -> Option<DateTime<Utc>> {
+        let state = self.phase.lock().expect("lifecycle phase poisoned");
+        match state.phase {
+            LifecycleAdmissionPhase::Quiescing | LifecycleAdmissionPhase::ShuttingDown => {
+                Some(state.phase_started_at)
+            }
+            LifecycleAdmissionPhase::Active | LifecycleAdmissionPhase::Activating => None,
+        }
+    }
+
+    fn begin_quiesce(&self) -> Option<LifecycleTransitionToken> {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        match state.phase {
+            LifecycleAdmissionPhase::Active => {
+                state.phase = LifecycleAdmissionPhase::Quiescing;
+                state.generation = state.generation.wrapping_add(1);
+                state.phase_started_at = Utc::now();
+                Some(LifecycleTransitionToken::for_generation(state.generation))
+            }
+            LifecycleAdmissionPhase::Quiescing => {
+                state.generation = state.generation.wrapping_add(1);
+                Some(LifecycleTransitionToken::for_generation(state.generation))
+            }
+            LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown => None,
+        }
+    }
+
+    fn quiesce(&self) -> bool {
+        self.begin_quiesce().is_some()
+    }
+
+    fn quiesce_for_drain(&self) -> Option<LifecycleTransitionToken> {
+        self.begin_quiesce()
+    }
+
+    fn is_current_quiesce(&self, token: LifecycleTransitionToken) -> bool {
+        let state = self.phase.lock().expect("lifecycle phase poisoned");
+        state.phase == LifecycleAdmissionPhase::Quiescing && state.generation == token.generation
+    }
+
+    fn begin_unquiesce_activation(
+        &self,
+        token: LifecycleTransitionToken,
+    ) -> Option<LifecycleTransitionToken> {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        if state.phase != LifecycleAdmissionPhase::Quiescing || state.generation != token.generation
+        {
+            return None;
+        }
+        let quiesce_started_at = state.phase_started_at;
+        state.phase = LifecycleAdmissionPhase::Activating;
+        state.generation = state.generation.wrapping_add(1);
+        Some(LifecycleTransitionToken::for_activation(
+            state.generation,
+            quiesce_started_at,
+        ))
+    }
+
+    fn complete_unquiesce_activation(&self, token: LifecycleTransitionToken) -> bool {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        if state.phase != LifecycleAdmissionPhase::Activating
+            || state.generation != token.generation
+        {
+            return false;
+        }
+        state.phase = LifecycleAdmissionPhase::Active;
+        state.generation = state.generation.wrapping_add(1);
+        state.phase_started_at = Utc::now();
+        true
+    }
+
+    fn cancel_unquiesce_activation(&self, token: LifecycleTransitionToken) {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        if state.phase == LifecycleAdmissionPhase::Activating
+            && state.generation == token.generation
+        {
+            state.phase = LifecycleAdmissionPhase::Quiescing;
+            state.generation = state.generation.wrapping_add(1);
+            if let Some(phase_started_at) = token.restore_phase_started_at {
+                state.phase_started_at = phase_started_at;
+            }
+        }
+    }
+
+    fn prepare_unquiesce(&self) -> Option<LifecycleTransitionToken> {
+        let state = self.phase.lock().expect("lifecycle phase poisoned");
+        match state.phase {
+            LifecycleAdmissionPhase::Active => {
+                Some(LifecycleTransitionToken::for_generation(state.generation))
+            }
+            LifecycleAdmissionPhase::Quiescing => Some(LifecycleTransitionToken::for_activation(
+                state.generation,
+                state.phase_started_at,
+            )),
+            LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn unquiesce_if_current(&self, token: LifecycleTransitionToken) -> bool {
+        let (accepted, activation) = self.begin_unquiesce_if_current(token);
+        if let Some(activation) = activation {
+            return self.complete_unquiesce_activation(activation);
+        }
+        accepted
+    }
+
+    fn begin_unquiesce_if_current(
+        &self,
+        token: LifecycleTransitionToken,
+    ) -> (bool, Option<LifecycleTransitionToken>) {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        if matches!(
+            state.phase,
+            LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown
+        ) || state.generation != token.generation
+        {
+            return (false, None);
+        }
+        match state.phase {
+            LifecycleAdmissionPhase::Active => (true, None),
+            LifecycleAdmissionPhase::Quiescing => {
+                let quiesce_started_at = state.phase_started_at;
+                state.phase = LifecycleAdmissionPhase::Activating;
+                state.generation = state.generation.wrapping_add(1);
+                (
+                    true,
+                    Some(LifecycleTransitionToken::for_activation(
+                        state.generation,
+                        quiesce_started_at,
+                    )),
+                )
+            }
+            LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown => {
+                unreachable!("activating and shutdown phases returned before match")
+            }
+        }
+    }
+
+    fn begin_shutdown(&self) -> Option<LifecyclePhaseState> {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        match state.phase {
+            LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown => None,
+            LifecycleAdmissionPhase::Active | LifecycleAdmissionPhase::Quiescing => {
+                let previous = *state;
+                state.phase = LifecycleAdmissionPhase::ShuttingDown;
+                state.generation = state.generation.wrapping_add(1);
+                if previous.phase == LifecycleAdmissionPhase::Active {
+                    state.phase_started_at = Utc::now();
+                }
+                Some(previous)
+            }
+        }
+    }
+
+    fn restore_shutdown_phase(&self, previous: LifecyclePhaseState) {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        if state.phase == LifecycleAdmissionPhase::ShuttingDown {
+            state.phase = previous.phase;
+            state.generation = state.generation.wrapping_add(1);
+            state.phase_started_at = previous.phase_started_at;
+        }
+    }
+
+    #[cfg(test)]
+    fn try_begin_external_work(
+        self: &Arc<Self>,
+    ) -> std::result::Result<LifecycleWorkPermit, String> {
+        let state = self.phase.lock().expect("lifecycle phase poisoned");
+        match state.phase {
+            LifecycleAdmissionPhase::Active => {
+                self.in_flight.fetch_add(1, Ordering::SeqCst);
+                Ok(LifecycleWorkPermit {
+                    lifecycle: Arc::clone(self),
+                    finished: false,
+                })
+            }
+            LifecycleAdmissionPhase::Quiescing => {
+                Err("plugin is quiescing and is not accepting new Webex work".to_string())
+            }
+            LifecycleAdmissionPhase::Activating => {
+                Err("plugin is activating and is not accepting new Webex work".to_string())
+            }
+            LifecycleAdmissionPhase::ShuttingDown => {
+                Err("plugin is shutting down and is not accepting new Webex work".to_string())
+            }
+        }
+    }
+
+    fn try_begin_drainable_external_work(
+        self: &Arc<Self>,
+        sidecar_received_at: Option<DateTime<Utc>>,
+    ) -> std::result::Result<LifecycleWorkPermit, String> {
+        let state = self.phase.lock().expect("lifecycle phase poisoned");
+        match state.phase {
+            LifecycleAdmissionPhase::Active => {
+                self.in_flight.fetch_add(1, Ordering::SeqCst);
+                Ok(LifecycleWorkPermit {
+                    lifecycle: Arc::clone(self),
+                    finished: false,
+                })
+            }
+            LifecycleAdmissionPhase::Quiescing => {
+                if sidecar_received_at.is_some_and(|received_at| {
+                    sidecar_received_before_cutoff(received_at, state.phase_started_at)
+                }) {
+                    self.in_flight.fetch_add(1, Ordering::SeqCst);
+                    Ok(LifecycleWorkPermit {
+                        lifecycle: Arc::clone(self),
+                        finished: false,
+                    })
+                } else {
+                    Err("plugin is quiescing and is not accepting new Webex work".to_string())
+                }
+            }
+            LifecycleAdmissionPhase::Activating => {
+                Err("plugin is activating and is not accepting new Webex work".to_string())
+            }
+            LifecycleAdmissionPhase::ShuttingDown => {
+                if sidecar_received_at.is_some_and(|received_at| {
+                    sidecar_received_before_cutoff(received_at, state.phase_started_at)
+                }) {
+                    self.in_flight.fetch_add(1, Ordering::SeqCst);
+                    Ok(LifecycleWorkPermit {
+                        lifecycle: Arc::clone(self),
+                        finished: false,
+                    })
+                } else {
+                    Err("plugin is shutting down and is not accepting new Webex work".to_string())
+                }
+            }
+        }
+    }
+
+    fn in_flight_count(&self) -> u64 {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    async fn wait_until_drained(&self, timeout_after: Duration) -> bool {
+        timeout(timeout_after, async {
+            loop {
+                let notified = self.drained.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.in_flight_count() == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    fn health_check(
+        &self,
+        request: &PluginHealthCheckRequest,
+        process_healthy: bool,
+    ) -> PluginHealthCheckResponse {
+        if !process_healthy {
+            return PluginHealthCheckResponse {
+                healthy: false,
+                message: Some("worker has not completed startup health checks".to_string()),
+            };
+        }
+
+        if matches!(request.mode, PluginLifecycleMode::PreActive)
+            && (request.allow_external_side_effects
+                || request.allow_cursor_advance
+                || request.allow_delivery_commit)
+        {
+            return PluginHealthCheckResponse {
+                healthy: false,
+                message: Some(
+                    "pre-active health check must fence side effects, cursor advance, and delivery commit"
+                        .to_string(),
+                ),
+            };
+        }
+
+        let phase = self.phase();
+        if phase == LifecycleAdmissionPhase::ShuttingDown {
+            return PluginHealthCheckResponse {
+                healthy: false,
+                message: Some("worker is shutting down".to_string()),
+            };
+        }
+
+        if matches!(request.mode, PluginLifecycleMode::PreActive)
+            && phase != LifecycleAdmissionPhase::Quiescing
+        {
+            return PluginHealthCheckResponse {
+                healthy: false,
+                message: Some(
+                    "pre-active health check requires quiesced Webex work admission".to_string(),
+                ),
+            };
+        }
+
+        if matches!(request.mode, PluginLifecycleMode::Active)
+            && phase != LifecycleAdmissionPhase::Active
+        {
+            return PluginHealthCheckResponse {
+                healthy: false,
+                message: Some("worker is quiesced and not accepting Webex work".to_string()),
+            };
+        }
+
+        PluginHealthCheckResponse {
+            healthy: true,
+            message: None,
+        }
+    }
+}
+
+fn sidecar_received_before_cutoff(received_at: DateTime<Utc>, cutoff: DateTime<Utc>) -> bool {
+    received_at.timestamp_millis() <= cutoff.timestamp_millis()
+}
+
+impl LifecycleWorkPermit {
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if self.lifecycle.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.lifecycle.drained.notify_waiters();
+        }
+    }
+}
+
+impl Drop for LifecycleWorkPermit {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 struct CreateBridgeSessionInput<'a> {
@@ -215,9 +716,17 @@ async fn run() -> Result<()> {
                 config.bridge.state_dir.display()
             )
         })?;
-    let installation = load_or_create_installation_identity(&config.bridge.state_dir).await?;
-
-    remove_stale_socket(&config.bridge.socket_path).await?;
+    if config.bridge.cbth_plugin.enabled {
+        tokio::fs::create_dir_all(&config.bridge.cbth_plugin.plugin_home)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create plugin home {}",
+                    config.bridge.cbth_plugin.plugin_home.display()
+                )
+            })?;
+    }
+    let installation = load_or_create_installation_identity(&config).await?;
 
     let webex = WebexClient::new(&config.webex.bot_token)?;
     if config.webex.bot_display_name.is_none() {
@@ -248,9 +757,14 @@ async fn run() -> Result<()> {
         &config,
         std::env::var(WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV).ok(),
     )?;
+    let initial_lifecycle_phase = initial_lifecycle_phase(&config.bridge.cbth_plugin);
+    let mut startup_reconcile_pending =
+        initial_lifecycle_phase == LifecycleAdmissionPhase::Quiescing;
+    let mut startup_reconcile_completed = !startup_reconcile_pending;
+    let mut startup_snapshot_persist_pending = false;
 
     let event_log = EventLog::new(&webex, &data_room.id);
-    let local_snapshot_path = config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE);
+    let local_snapshot_path = durable_local_snapshot_path(&config);
     let remote_replay = match event_log.replay().await {
         Ok(replay) => Some(replay),
         Err(error) => {
@@ -262,14 +776,14 @@ async fn run() -> Result<()> {
     let (replay, local_snapshot_metadata) = match remote_replay {
         Some(replay) => (replay, None),
         None => {
-            let local_snapshot = load_local_snapshot_with_metadata(&local_snapshot_path).await?;
+            let local_snapshot = load_durable_local_snapshot_with_metadata(&config).await?;
             (local_snapshot.replay, Some(local_snapshot.metadata))
         }
     };
     let mut state = WorkerState::from_replay(replay);
     state.set_executable_installation(&installation.installation_id);
     if replayed_data_space {
-        match load_local_snapshot_with_metadata(&local_snapshot_path).await {
+        match load_durable_local_snapshot_with_metadata(&config).await {
             Ok(local_snapshot) => {
                 let LocalSnapshotReplay {
                     replay: local_replay,
@@ -338,7 +852,11 @@ async fn run() -> Result<()> {
                         }
                     },
                 };
-                if changed {
+                if startup_snapshot_persist_now(
+                    changed,
+                    startup_reconcile_pending,
+                    &mut startup_snapshot_persist_pending,
+                ) {
                     persist_snapshot(&event_log, &mut state, &config).await?;
                 }
             }
@@ -359,7 +877,11 @@ async fn run() -> Result<()> {
                         Utc::now(),
                         &local_thread_ids,
                     );
-                    if changed {
+                    if startup_snapshot_persist_now(
+                        changed,
+                        startup_reconcile_pending,
+                        &mut startup_snapshot_persist_pending,
+                    ) {
                         persist_local_snapshot(&local_snapshot_path, &state.to_snapshot()).await?;
                     }
                 }
@@ -372,53 +894,194 @@ async fn run() -> Result<()> {
         }
         state.rebuild_session_indexes();
     }
-    reconcile_sessions(
-        &config,
-        &webex,
-        &event_log,
-        &mut state,
-        &mut codex,
-        &installation,
-    )
-    .await?;
-
     let healthy = Arc::new(AtomicBool::new(false));
-    let (webex_tx, mut webex_rx) = mpsc::channel(256);
-    let listener = UnixListener::bind(&config.bridge.socket_path).with_context(|| {
+    let lifecycle = Arc::new(LifecycleControl::new(initial_lifecycle_phase));
+    if startup_reconcile_pending {
+        info!(
+            "pre-active lifecycle mode enabled, deferring startup reconcile and Codex event processing until unquiesce"
+        );
+    }
+    if !startup_reconcile_pending {
+        reconcile_sessions(
+            &config,
+            &webex,
+            &event_log,
+            &mut state,
+            &mut codex,
+            &installation,
+        )
+        .await?;
+    }
+    let (work_tx, mut work_rx) = mpsc::channel(256);
+    let ingress_socket_path = worker_ingress_socket_path(&config);
+    if let Some(socket_path) = lifecycle_control_socket_path(&config) {
+        start_lifecycle_control_server(
+            &socket_path,
+            work_tx.clone(),
+            Arc::clone(&healthy),
+            Arc::clone(&lifecycle),
+        )
+        .await?;
+    }
+    remove_stale_socket(&ingress_socket_path).await?;
+    let listener = UnixListener::bind(&ingress_socket_path).with_context(|| {
         format!(
             "failed to bind unix socket {}",
-            config.bridge.socket_path.display()
+            ingress_socket_path.display()
         )
     })?;
-    tokio::spawn(run_ingress_server(listener, webex_tx, Arc::clone(&healthy)));
+    tokio::spawn(run_ingress_server(
+        listener,
+        work_tx.clone(),
+        Arc::clone(&healthy),
+        Arc::clone(&lifecycle),
+    ));
     healthy.store(true, Ordering::Relaxed);
     info!("wxcd worker is healthy");
 
     loop {
         tokio::select! {
-            maybe_ingress = webex_rx.recv() => {
-                let Some(event) = maybe_ingress else {
+            maybe_work = work_rx.recv() => {
+                let Some(work) = maybe_work else {
                     break;
                 };
-                let result = handle_webex_ingress(
-                    &config,
-                    &webex,
-                    &event_log,
-                    &mut state,
-                    &mut codex,
-                    delivery_broker.as_ref(),
-                    &control_room.id,
-                    &installation,
-                    event.event,
-                ).await.map_err(|error| format!("{error:#}"));
-                if let Some(completion) = event.completion {
-                    let _ = completion.send(result.clone());
-                }
-                if let Err(error) = result {
-                    error!("failed to handle Webex ingress: {error}");
+                match work {
+                    WorkerQueueItem::Ingress(mut event) => {
+                        let result = handle_webex_ingress(
+                            &config,
+                            &webex,
+                            &event_log,
+                            &mut state,
+                            &mut codex,
+                            delivery_broker.as_ref(),
+                            &control_room.id,
+                            &installation,
+                            event.event,
+                        ).await.map_err(|error| format!("{error:#}"));
+                        drop(event.work_permit.take());
+                        if let Some(completion) = event.completion {
+                            let _ = completion.send(result.clone());
+                        }
+                        if let Err(error) = result {
+                            error!("failed to handle Webex ingress: {error}");
+                        }
+                    }
+                    WorkerQueueItem::Lifecycle(command) => {
+                        let QueuedLifecycleCommand {
+                            command,
+                            completion,
+                            response_flushed,
+                            expires_at,
+                            response_expires_at,
+                        } = command;
+                        if Instant::now() >= expires_at {
+                            let _ = completion.send(Err(PluginRpcError::new(
+                                PluginRpcErrorKind::TransientDaemonUnavailable,
+                                format!(
+                                    "lifecycle command expired after {}s before worker loop handled it",
+                                    PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT.as_secs()
+                                ),
+                            )));
+                            continue;
+                        }
+                        let shutdown_previous_phase = match &command {
+                            LifecycleCommand::Shutdown { previous_phase, .. } => Some(*previous_phase),
+                            _ => None,
+                        };
+                        let result = match command {
+                            LifecycleCommand::Unquiesce { request, token } => {
+                                handle_lifecycle_unquiesce(
+                                    LifecycleUnquiesceContext {
+                                        config: &config,
+                                        webex: &webex,
+                                        event_log: &event_log,
+                                        state: &mut state,
+                                        codex: &mut codex,
+                                        installation: &installation,
+                                        lifecycle: lifecycle.as_ref(),
+                                        startup_reconcile_pending: &mut startup_reconcile_pending,
+                                        startup_reconcile_completed: &mut startup_reconcile_completed,
+                                        startup_snapshot_persist_pending: &mut startup_snapshot_persist_pending,
+                                        response_expires_at,
+                                    },
+                                    request,
+                                    token,
+                                )
+                                .await
+                            }
+                            command => {
+                                handle_lifecycle_command_with_runtime_drain(
+                                    LifecycleCommandContext {
+                                        config: &config,
+                                        webex: &webex,
+                                        event_log: &event_log,
+                                        state: &mut state,
+                                        codex: &mut codex,
+                                        lifecycle: lifecycle.as_ref(),
+                                        startup_reconcile_pending,
+                                    },
+                                    command,
+                                )
+                                .await
+                            }
+                        }.map_err(|error| {
+                            PluginRpcError::new(PluginRpcErrorKind::Internal, format!("{error:#}"))
+                        });
+                        let shutdown_accepted = shutdown_previous_phase.is_some()
+                            && matches!(
+                                result.as_ref(),
+                                Ok(LifecycleCommandResponse::Ack(response)) if response.accepted
+                            );
+                        let unquiesce_activation = match result.as_ref() {
+                            Ok(LifecycleCommandResponse::AckWithUnquiesceCommit {
+                                response,
+                                activation,
+                                startup_reconcile_completed,
+                            }) if response.accepted => {
+                                activation.map(|activation| (activation, *startup_reconcile_completed))
+                            }
+                            _ => None,
+                        };
+                        if shutdown_accepted {
+                            let completion_delivered = completion.send(result).is_ok();
+                            if completion_delivered
+                                && wait_for_lifecycle_response_flush(response_flushed).await
+                            {
+                                info!("lifecycle shutdown requested, stopping worker");
+                                break;
+                            }
+                            if let Some(previous_phase) = shutdown_previous_phase {
+                                lifecycle.restore_shutdown_phase(previous_phase);
+                            }
+                            clear_supervisor_shutdown_marker().await;
+                            warn!(
+                                "lifecycle shutdown accepted locally but response was not delivered; continuing worker"
+                            );
+                        } else if let Some((activation, startup_reconcile_completed)) = unquiesce_activation {
+                            let completion_delivered = completion.send(result).is_ok();
+                            if completion_delivered
+                                && wait_for_lifecycle_response_flush(response_flushed).await
+                            {
+                                if !lifecycle.complete_unquiesce_activation(activation) {
+                                    warn!(
+                                        "lifecycle unquiesce response flushed but activation was no longer current"
+                                    );
+                                } else if startup_reconcile_completed {
+                                    startup_reconcile_pending = false;
+                                }
+                            } else {
+                                lifecycle.cancel_unquiesce_activation(activation);
+                                warn!(
+                                    "lifecycle unquiesce accepted locally but response was not delivered; staying in quiesced admission"
+                                );
+                            }
+                        } else {
+                            let _ = completion.send(result);
+                        }
+                    }
                 }
             }
-            maybe_codex = codex.events().recv() => {
+            maybe_codex = codex.events().recv(), if should_process_codex_events(startup_reconcile_pending) => {
                 let Some(event) = maybe_codex else {
                     break;
                 };
@@ -443,7 +1106,7 @@ async fn run() -> Result<()> {
 
     healthy.store(false, Ordering::Relaxed);
     codex.shutdown().await?;
-    remove_stale_socket(&config.bridge.socket_path).await?;
+    remove_stale_socket(&ingress_socket_path).await?;
     Ok(())
 }
 
@@ -549,6 +1212,7 @@ async fn diagnose_plugin_rpc(config: &CbthPluginConfig) -> RpcStatus {
         capabilities: vec![
             PluginCapability::new("diagnostics"),
             PluginCapability::new("standalone-compatible"),
+            PluginCapability::new(PLUGIN_RPC_PLUGIN_LIFECYCLE_CAPABILITY),
         ],
         plugin_home: config.plugin_home.display().to_string(),
         pid: std::process::id(),
@@ -640,7 +1304,9 @@ async fn handle_webex_ingress(
             {
                 return Ok(());
             }
-            if message.room_id == control_room_id {
+            let event_id = message.event_id.clone();
+            let processing_ack = message.processing_ack;
+            let result = if message.room_id == control_room_id {
                 handle_control_message(
                     config,
                     webex,
@@ -650,7 +1316,7 @@ async fn handle_webex_ingress(
                     installation,
                     &message,
                 )
-                .await?;
+                .await
             } else if let Some(session_id) = state.room_to_session.get(&message.room_id).cloned() {
                 handle_session_message(
                     config,
@@ -661,8 +1327,14 @@ async fn handle_webex_ingress(
                     &session_id,
                     &message.text,
                 )
-                .await?;
+                .await
+            } else {
+                Ok(())
+            };
+            if result.is_err() && processing_ack {
+                state.forget_event(&event_id);
             }
+            result?;
         }
         WebexIngressEnvelope::AttachmentActionCreated(action) => {
             if is_ignored_sender(config, &action.person_email)
@@ -670,8 +1342,22 @@ async fn handle_webex_ingress(
             {
                 return Ok(());
             }
-            handle_attachment_action(config, webex, event_log, state, codex, installation, action)
-                .await?;
+            let event_id = action.event_id.clone();
+            let processing_ack = action.processing_ack;
+            let result = handle_attachment_action(
+                config,
+                webex,
+                event_log,
+                state,
+                codex,
+                installation,
+                action,
+            )
+            .await;
+            if result.is_err() && processing_ack {
+                state.forget_event(&event_id);
+            }
+            result?;
         }
         WebexIngressEnvelope::AsyncNotification(notification) => {
             if !should_process_async_notification_event(state, &notification.event_id) {
@@ -680,7 +1366,7 @@ async fn handle_webex_ingress(
             enqueue_async_notification(delivery_broker, state, &notification).await?;
             state.remember_event(&notification.event_id);
         }
-        WebexIngressEnvelope::HealthCheck => {}
+        WebexIngressEnvelope::HealthCheck | WebexIngressEnvelope::ActiveCheck => {}
     }
 
     Ok(())
@@ -828,6 +1514,43 @@ fn webex_delivery_idempotency_key(event_id: &str) -> String {
     format!("webex-delivery-{}", stable_fnv1a_hex(event_id))
 }
 
+fn worker_ingress_socket_path(config: &AppConfig) -> PathBuf {
+    let socket_env = std::env::var_os(WXCD_SOCKET_PATH_ENV);
+    worker_ingress_socket_path_from_env(config, socket_env.as_deref())
+}
+
+fn worker_ingress_socket_path_from_env(config: &AppConfig, socket_env: Option<&OsStr>) -> PathBuf {
+    if let Some(value) = socket_env
+        && !value.is_empty()
+    {
+        return PathBuf::from(value);
+    }
+    worker_ingress_socket_path_for(
+        &config.bridge.socket_path,
+        &config.bridge.state_dir,
+        &config.bridge.cbth_plugin,
+    )
+}
+
+fn worker_ingress_socket_path_for(
+    bridge_socket_path: &Path,
+    state_dir: &Path,
+    config: &CbthPluginConfig,
+) -> PathBuf {
+    if !config.enabled {
+        return bridge_socket_path.to_path_buf();
+    }
+    Path::new(PLUGIN_WORKER_INGRESS_SOCKET_DIR).join(format!(
+        "wxcd-ingress-{}.sock",
+        stable_fnv1a_hex(&format!(
+            "{}\n{}\n{}",
+            config.plugin_instance_id,
+            config.plugin_release_id,
+            state_dir.display()
+        ))
+    ))
+}
+
 fn stable_fnv1a_hex(value: &str) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in value.as_bytes() {
@@ -842,7 +1565,18 @@ fn should_process_async_notification_event(state: &WorkerState, event_id: &str) 
 }
 
 fn ingress_requires_processing_ack(event: &WebexIngressEnvelope) -> bool {
-    matches!(event, WebexIngressEnvelope::AsyncNotification(_))
+    matches!(
+        event,
+        WebexIngressEnvelope::AsyncNotification(_)
+            | WebexIngressEnvelope::MessageCreated(WebexMessageEvent {
+                processing_ack: true,
+                ..
+            })
+            | WebexIngressEnvelope::AttachmentActionCreated(WebexAttachmentActionEvent {
+                processing_ack: true,
+                ..
+            })
+    )
 }
 
 #[cfg(test)]
@@ -2403,11 +3137,7 @@ async fn persist_event(
         persist_snapshot(event_log, state, config).await?;
         return Ok(());
     }
-    persist_local_snapshot(
-        &config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE),
-        &state.to_snapshot(),
-    )
-    .await?;
+    persist_local_snapshot(&durable_local_snapshot_path(config), &state.to_snapshot()).await?;
     Ok(())
 }
 
@@ -2421,26 +3151,1154 @@ async fn persist_snapshot(
         warn!("failed to append Data Space snapshot: {error:#}");
     }
     state.events_since_snapshot = 0;
-    persist_local_snapshot(
-        &config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE),
-        &snapshot,
-    )
-    .await?;
+    persist_local_snapshot(&durable_local_snapshot_path(config), &snapshot).await?;
     Ok(())
 }
 
-async fn run_ingress_server(
-    listener: UnixListener,
-    events_tx: mpsc::Sender<QueuedIngress>,
+#[cfg(test)]
+async fn handle_lifecycle_command(
+    config: &AppConfig,
+    state: &mut WorkerState,
+    command: LifecycleCommand,
+) -> Result<LifecycleCommandResponse> {
+    persist_durable_lifecycle_mirror(config, state).await?;
+    match command {
+        LifecycleCommand::Drain { request, .. } => {
+            info!("lifecycle drain completed: {}", request.reason);
+            Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                drained: true,
+                in_flight_count: Some(0),
+            }))
+        }
+        LifecycleCommand::Shutdown { request, .. } => {
+            write_supervisor_shutdown_marker(config, &request).await?;
+            info!("lifecycle shutdown accepted: {}", request.reason);
+            Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                accepted: true,
+            }))
+        }
+        LifecycleCommand::Unquiesce { .. } => {
+            bail!("unquiesce must be handled by the worker loop")
+        }
+    }
+}
+
+async fn handle_lifecycle_command_with_runtime_drain(
+    ctx: LifecycleCommandContext<'_, '_>,
+    command: LifecycleCommand,
+) -> Result<LifecycleCommandResponse> {
+    let mut ctx = ctx;
+    match command {
+        LifecycleCommand::Drain { request, token } => {
+            if !ctx.lifecycle.is_current_quiesce(token) {
+                persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
+                warn!(
+                    "lifecycle drain cancelled because the quiesce generation changed: {}",
+                    request.reason
+                );
+                return Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                    drained: false,
+                    in_flight_count: Some(in_flight_count),
+                }));
+            }
+            let ingress_in_flight_count = ctx.lifecycle.in_flight_count();
+            if ingress_in_flight_count > 0 {
+                persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
+                warn!(
+                    "lifecycle drain incomplete: {in_flight_count} Webex ingress, Codex events, or sessions remain in flight"
+                );
+                return Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                    drained: false,
+                    in_flight_count: Some(in_flight_count),
+                }));
+            }
+            let _ = drain_codex_runtime(&mut ctx).await?;
+            if !ctx.lifecycle.is_current_quiesce(token) {
+                persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
+                warn!(
+                    "lifecycle drain cancelled after Codex runtime drain because the quiesce generation changed: {}",
+                    request.reason
+                );
+                return Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                    drained: false,
+                    in_flight_count: Some(in_flight_count),
+                }));
+            }
+            let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
+            persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+            if !ctx.lifecycle.is_current_quiesce(token) {
+                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
+                warn!(
+                    "lifecycle drain cancelled before completion because the quiesce generation changed: {}",
+                    request.reason
+                );
+                return Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                    drained: false,
+                    in_flight_count: Some(in_flight_count),
+                }));
+            }
+            if in_flight_count > 0 {
+                warn!(
+                    "lifecycle drain incomplete: {in_flight_count} Webex ingress, Codex events, or sessions remain in flight"
+                );
+                return Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                    drained: false,
+                    in_flight_count: Some(in_flight_count),
+                }));
+            }
+            info!("lifecycle drain completed: {}", request.reason);
+            Ok(LifecycleCommandResponse::Drain(PluginDrainResponse {
+                drained: true,
+                in_flight_count: Some(0),
+            }))
+        }
+        LifecycleCommand::Shutdown { request, .. } => {
+            let ingress_in_flight_count = ctx.lifecycle.in_flight_count();
+            if ingress_in_flight_count > 0 {
+                persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
+                warn!(
+                    "lifecycle shutdown rejected: {in_flight_count} Webex ingress, Codex events, or sessions remain in flight"
+                );
+                return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                    accepted: false,
+                }));
+            }
+            let _ = drain_codex_runtime(&mut ctx).await?;
+            let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
+            persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
+            if in_flight_count > 0 {
+                warn!(
+                    "lifecycle shutdown rejected: {in_flight_count} Webex ingress, Codex events, or sessions remain in flight"
+                );
+                return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                    accepted: false,
+                }));
+            }
+            write_supervisor_shutdown_marker(ctx.config, &request).await?;
+            info!("lifecycle shutdown accepted: {}", request.reason);
+            Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                accepted: true,
+            }))
+        }
+        LifecycleCommand::Unquiesce { .. } => {
+            bail!("unquiesce must be handled by the worker loop")
+        }
+    }
+}
+
+async fn drain_codex_runtime(ctx: &mut LifecycleCommandContext<'_, '_>) -> Result<u64> {
+    if !should_drain_codex_runtime(ctx.startup_reconcile_pending) {
+        return Ok(lifecycle_codex_runtime_in_flight_count(ctx));
+    }
+    let deadline = Instant::now() + PLUGIN_LIFECYCLE_DRAIN_TIMEOUT;
+    loop {
+        process_pending_codex_events(ctx).await?;
+        let in_flight_count = lifecycle_codex_runtime_in_flight_count(ctx);
+        if in_flight_count == 0 {
+            return Ok(0);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(in_flight_count);
+        }
+        let wait_interval = lifecycle_runtime_wait_interval(remaining);
+        match timeout(wait_interval, ctx.codex.events().recv()).await {
+            Ok(Some(event)) => {
+                handle_codex_event(
+                    ctx.config,
+                    ctx.webex,
+                    ctx.event_log,
+                    ctx.state,
+                    ctx.codex,
+                    event,
+                )
+                .await?;
+            }
+            Ok(None) => return Ok(lifecycle_codex_runtime_in_flight_count(ctx)),
+            Err(_) => {}
+        }
+    }
+}
+
+fn should_drain_codex_runtime(startup_reconcile_pending: bool) -> bool {
+    !startup_reconcile_pending
+}
+
+async fn process_pending_codex_events(ctx: &mut LifecycleCommandContext<'_, '_>) -> Result<()> {
+    loop {
+        let event = match ctx.codex.events().try_recv() {
+            Ok(event) => event,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(()),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+        };
+        handle_codex_event(
+            ctx.config,
+            ctx.webex,
+            ctx.event_log,
+            ctx.state,
+            ctx.codex,
+            event,
+        )
+        .await?;
+    }
+}
+
+async fn lifecycle_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_, '_>) -> u64 {
+    let sidecar_in_flight_count = lifecycle_sidecar_in_flight_count(
+        ctx.config,
+        ctx.lifecycle.sidecar_drain_barrier_started_at(),
+    )
+    .await;
+    lifecycle_runtime_in_flight_total(
+        ctx.lifecycle.in_flight_count(),
+        ctx.state.lifecycle_codex_in_flight_count(),
+        ctx.codex.events().len(),
+        sidecar_in_flight_count,
+    )
+}
+
+fn lifecycle_codex_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_, '_>) -> u64 {
+    lifecycle_runtime_in_flight_total(
+        0,
+        ctx.state.lifecycle_codex_in_flight_count(),
+        ctx.codex.events().len(),
+        0,
+    )
+}
+
+fn lifecycle_runtime_in_flight_total(
+    ingress_in_flight_count: u64,
+    codex_in_flight_count: u64,
+    queued_codex_event_count: usize,
+    sidecar_in_flight_count: u64,
+) -> u64 {
+    ingress_in_flight_count
+        + codex_in_flight_count
+        + queued_codex_event_count as u64
+        + sidecar_in_flight_count
+}
+
+#[cfg(test)]
+async fn sidecar_drain_in_flight_count(config: &AppConfig) -> u64 {
+    sidecar_drain_in_flight_count_after(config, None).await
+}
+
+async fn lifecycle_sidecar_in_flight_count(
+    config: &AppConfig,
+    inactive_observed_after: Option<DateTime<Utc>>,
+) -> u64 {
+    sidecar_drain_in_flight_count_after(config, inactive_observed_after).await
+}
+
+async fn sidecar_drain_in_flight_count_after(
+    config: &AppConfig,
+    inactive_observed_after: Option<DateTime<Utc>>,
+) -> u64 {
+    if !config.bridge.cbth_plugin.enabled {
+        return 0;
+    }
+    let dir = config
+        .bridge
+        .cbth_plugin
+        .plugin_home
+        .join(SIDECAR_DRAIN_STATE_DIR);
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => {
+            warn!(
+                "failed to read sidecar drain state dir {}; treating sidecar as in flight: {error:#}",
+                dir.display()
+            );
+            return 1;
+        }
+    };
+    let mut count = 0;
+    let matching_file_prefix = sidecar_drain_state_file_prefix(config);
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return count,
+            Err(error) => {
+                warn!(
+                    "failed to iterate sidecar drain state dir {}; treating sidecar as in flight: {error:#}",
+                    dir.display()
+                );
+                return count + 1;
+            }
+        };
+        let path = entry.path();
+        if !sidecar_drain_state_file_matches(&path, &matching_file_prefix) {
+            continue;
+        }
+        let contents = match tokio::fs::read(&path).await {
+            Ok(contents) => contents,
+            Err(error) => {
+                warn!(
+                    "failed to read sidecar drain state {}; treating sidecar as in flight: {error:#}",
+                    path.display()
+                );
+                return count + 1;
+            }
+        };
+        let state: SidecarDrainState = match serde_json::from_slice(&contents) {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(
+                    "failed to parse sidecar drain state {}; removing corrupt current-scope state: {error:#}",
+                    path.display()
+                );
+                remove_sidecar_drain_state_file(&path).await;
+                continue;
+            }
+        };
+        if state.plugin_instance_id == config.bridge.cbth_plugin.plugin_instance_id
+            && state.plugin_release_id == config.bridge.cbth_plugin.plugin_release_id
+        {
+            match sidecar_drain_state_liveness(&state, Utc::now()) {
+                SidecarDrainStateLiveness::Live => {}
+                SidecarDrainStateLiveness::StaleAge => {
+                    warn!(
+                        "ignoring stale sidecar drain state {} updated_at={} pid={:?}",
+                        path.display(),
+                        state.updated_at,
+                        state.pid
+                    );
+                    remove_sidecar_drain_state_file(&path).await;
+                    continue;
+                }
+                SidecarDrainStateLiveness::ExitedPid(pid) => {
+                    warn!(
+                        "ignoring stale sidecar drain state {} for exited pid={pid}",
+                        path.display()
+                    );
+                    remove_sidecar_drain_state_file(&path).await;
+                    continue;
+                }
+            }
+            if let Some(cutoff) = inactive_observed_after
+                && !state.sidecar_observed_inactive_after(cutoff)
+            {
+                warn!(
+                    "sidecar drain state {} has not observed the lifecycle admission fence; treating sidecar as in flight",
+                    path.display()
+                );
+                count += state.in_flight_count.max(1);
+                continue;
+            }
+            count += state.in_flight_count;
+        }
+    }
+}
+
+fn sidecar_drain_state_file_prefix(config: &AppConfig) -> String {
+    format!(
+        "scope-{}--",
+        stable_fnv1a_hex(&format!(
+            "{}\n{}",
+            config.bridge.cbth_plugin.plugin_instance_id,
+            config.bridge.cbth_plugin.plugin_release_id
+        ))
+    )
+}
+
+fn sidecar_drain_state_file_matches(path: &Path, matching_file_prefix: &str) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with(matching_file_prefix) && name.ends_with(".json"))
+}
+
+#[derive(Debug, Deserialize)]
+struct SidecarDrainState {
+    plugin_instance_id: String,
+    plugin_release_id: String,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    in_flight_count: u64,
+    #[serde(default)]
+    worker_inactive_observed_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+}
+
+impl SidecarDrainState {
+    fn sidecar_observed_inactive_after(&self, cutoff: DateTime<Utc>) -> bool {
+        self.worker_inactive_observed_at
+            .is_some_and(|observed_at| observed_at.timestamp_millis() > cutoff.timestamp_millis())
+    }
+}
+
+fn sidecar_drain_state_is_fresh(state: &SidecarDrainState, now: DateTime<Utc>) -> bool {
+    match now.signed_duration_since(state.updated_at).to_std() {
+        Ok(age) => age <= SIDECAR_DRAIN_STATE_STALE_AFTER,
+        Err(_) => true,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SidecarDrainStateLiveness {
+    Live,
+    StaleAge,
+    ExitedPid(u32),
+}
+
+fn sidecar_drain_state_liveness(
+    state: &SidecarDrainState,
+    now: DateTime<Utc>,
+) -> SidecarDrainStateLiveness {
+    if !sidecar_drain_state_is_fresh(state, now) {
+        return SidecarDrainStateLiveness::StaleAge;
+    }
+    if let Some(pid) = state.pid
+        && !process_is_alive(pid)
+    {
+        return SidecarDrainStateLiveness::ExitedPid(pid);
+    }
+    SidecarDrainStateLiveness::Live
+}
+
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    let result = unsafe { kill(pid, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
+async fn remove_sidecar_drain_state_file(path: &Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(
+                "failed to remove stale sidecar drain state {}; ignoring stale state: {error:#}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn lifecycle_runtime_wait_interval(remaining: Duration) -> Duration {
+    if remaining < PLUGIN_LIFECYCLE_CODEX_DRAIN_POLL_INTERVAL {
+        remaining
+    } else {
+        PLUGIN_LIFECYCLE_CODEX_DRAIN_POLL_INTERVAL
+    }
+}
+
+async fn handle_lifecycle_unquiesce(
+    ctx: LifecycleUnquiesceContext<'_, '_>,
+    request: PluginUnquiesceRequest,
+    token: LifecycleTransitionToken,
+) -> Result<LifecycleCommandResponse> {
+    if ctx.lifecycle.phase() == LifecycleAdmissionPhase::ShuttingDown {
+        return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+            accepted: false,
+        }));
+    }
+    if Instant::now() >= ctx.response_expires_at {
+        warn!(
+            "lifecycle unquiesce expired before activation: {}",
+            request.reason
+        );
+        return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+            accepted: false,
+        }));
+    }
+    if *ctx.startup_reconcile_pending {
+        let Some(activation_token) = ctx.lifecycle.begin_unquiesce_activation(token) else {
+            return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                accepted: false,
+            }));
+        };
+        if startup_reconcile_required(
+            *ctx.startup_reconcile_pending,
+            *ctx.startup_reconcile_completed,
+        ) && Instant::now() >= ctx.response_expires_at
+        {
+            ctx.lifecycle.cancel_unquiesce_activation(activation_token);
+            warn!(
+                "lifecycle unquiesce expired before startup reconcile: {}",
+                request.reason
+            );
+            return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                accepted: false,
+            }));
+        }
+        if startup_reconcile_required(
+            *ctx.startup_reconcile_pending,
+            *ctx.startup_reconcile_completed,
+        ) {
+            if let Err(error) = reconcile_sessions(
+                ctx.config,
+                ctx.webex,
+                ctx.event_log,
+                ctx.state,
+                ctx.codex,
+                ctx.installation,
+            )
+            .await
+            {
+                ctx.lifecycle.cancel_unquiesce_activation(activation_token);
+                return Err(error);
+            }
+            *ctx.startup_reconcile_completed = true;
+        }
+        if *ctx.startup_snapshot_persist_pending {
+            if let Err(error) = persist_snapshot(ctx.event_log, ctx.state, ctx.config).await {
+                ctx.lifecycle.cancel_unquiesce_activation(activation_token);
+                return Err(error);
+            }
+            *ctx.startup_snapshot_persist_pending = false;
+        }
+        if Instant::now() >= ctx.response_expires_at {
+            ctx.lifecycle.cancel_unquiesce_activation(activation_token);
+            warn!(
+                "lifecycle unquiesce expired after startup reconcile: {}",
+                request.reason
+            );
+            return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+                accepted: false,
+            }));
+        }
+        let activation = Some(activation_token);
+        let accepted = true;
+        info!("lifecycle unquiesce completed: {}", request.reason);
+        return Ok(LifecycleCommandResponse::AckWithUnquiesceCommit {
+            response: PluginLifecycleAckResponse { accepted },
+            activation,
+            startup_reconcile_completed: true,
+        });
+    }
+    if Instant::now() >= ctx.response_expires_at {
+        warn!(
+            "lifecycle unquiesce expired after startup reconcile: {}",
+            request.reason
+        );
+        return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+            accepted: false,
+        }));
+    }
+    let (accepted, activation) = ctx.lifecycle.begin_unquiesce_if_current(token);
+    info!("lifecycle unquiesce completed: {}", request.reason);
+    Ok(LifecycleCommandResponse::AckWithUnquiesceCommit {
+        response: PluginLifecycleAckResponse { accepted },
+        activation,
+        startup_reconcile_completed: false,
+    })
+}
+
+async fn wait_for_lifecycle_response_flush(
+    response_flushed: Option<oneshot::Receiver<()>>,
+) -> bool {
+    let Some(response_flushed) = response_flushed else {
+        return true;
+    };
+    match timeout(PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT, response_flushed).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => {
+            warn!("lifecycle shutdown response writer dropped before flush confirmation");
+            false
+        }
+        Err(_) => {
+            warn!(
+                "timed out after {}s waiting for lifecycle shutdown response flush",
+                PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT.as_secs()
+            );
+            false
+        }
+    }
+}
+
+async fn persist_durable_lifecycle_mirror(config: &AppConfig, state: &WorkerState) -> Result<()> {
+    persist_local_snapshot(&durable_local_snapshot_path(config), &state.to_snapshot()).await
+}
+
+fn durable_local_snapshot_path(config: &AppConfig) -> PathBuf {
+    if config.bridge.cbth_plugin.enabled {
+        config
+            .bridge
+            .cbth_plugin
+            .plugin_home
+            .join(LOCAL_SNAPSHOT_FILE)
+    } else {
+        config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE)
+    }
+}
+
+fn lifecycle_control_socket_path(config: &AppConfig) -> Option<PathBuf> {
+    lifecycle_control_socket_path_from_env(
+        config,
+        std::env::var_os(WXCD_CBTH_LIFECYCLE_SOCKET_ENV).as_deref(),
+    )
+}
+
+fn lifecycle_control_socket_path_from_env(
+    config: &AppConfig,
+    socket_env: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if !config.bridge.cbth_plugin.enabled {
+        return None;
+    }
+    Some(
+        socket_env
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_lifecycle_control_socket_path(&config.bridge.cbth_plugin)),
+    )
+}
+
+fn should_process_codex_events(startup_reconcile_pending: bool) -> bool {
+    !startup_reconcile_pending
+}
+
+fn startup_reconcile_required(
+    startup_reconcile_pending: bool,
+    startup_reconcile_completed: bool,
+) -> bool {
+    startup_reconcile_pending && !startup_reconcile_completed
+}
+
+fn default_lifecycle_control_socket_path(config: &CbthPluginConfig) -> PathBuf {
+    Path::new(PLUGIN_LIFECYCLE_SOCKET_DIR).join(format!(
+        "wxcd-lifecycle-{}.sock",
+        stable_fnv1a_hex(&format!(
+            "{}\n{}\n{}",
+            config.plugin_instance_id,
+            config.plugin_release_id,
+            config.plugin_home.display()
+        ))
+    ))
+}
+
+fn startup_snapshot_persist_now(
+    changed: bool,
+    startup_reconcile_pending: bool,
+    startup_snapshot_persist_pending: &mut bool,
+) -> bool {
+    if !changed {
+        return false;
+    }
+    if startup_reconcile_pending {
+        *startup_snapshot_persist_pending = true;
+        return false;
+    }
+    true
+}
+
+async fn write_supervisor_shutdown_marker(
+    config: &AppConfig,
+    request: &PluginShutdownRequest,
+) -> Result<()> {
+    let Some(path) = supervisor_shutdown_marker_path() else {
+        return Ok(());
+    };
+    write_supervisor_shutdown_marker_at(&path, config, request).await
+}
+
+async fn write_supervisor_shutdown_marker_at(
+    path: &Path,
+    config: &AppConfig,
+    request: &PluginShutdownRequest,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "failed to create shutdown marker directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let marker = SupervisorShutdownMarker {
+        plugin_instance_id: config.bridge.cbth_plugin.plugin_instance_id.clone(),
+        plugin_release_id: config.bridge.cbth_plugin.plugin_release_id.clone(),
+        reason: request.reason.clone(),
+        created_at: Utc::now().to_rfc3339(),
+    };
+    tokio::fs::write(&path, serde_json::to_vec_pretty(&marker)?)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to write supervisor shutdown marker {}",
+                path.display()
+            )
+        })
+}
+
+fn supervisor_shutdown_marker_path() -> Option<PathBuf> {
+    let path = std::env::var_os(WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV)?;
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+async fn clear_supervisor_shutdown_marker() {
+    let Some(path) = supervisor_shutdown_marker_path() else {
+        return;
+    };
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            "failed to clear supervisor shutdown marker {} after undelivered shutdown response: {error:#}",
+            path.display()
+        ),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SupervisorShutdownMarker {
+    plugin_instance_id: String,
+    plugin_release_id: String,
+    reason: String,
+    created_at: String,
+}
+
+fn initial_lifecycle_phase(config: &CbthPluginConfig) -> LifecycleAdmissionPhase {
+    initial_lifecycle_phase_from_env(
+        config.enabled,
+        std::env::var("WXCD_CBTH_PRE_ACTIVE").ok().as_deref(),
+    )
+}
+
+fn initial_lifecycle_phase_from_env(
+    plugin_enabled: bool,
+    pre_active_env: Option<&str>,
+) -> LifecycleAdmissionPhase {
+    let normalized = pre_active_env.map(|value| value.trim().to_ascii_lowercase());
+    match (plugin_enabled, normalized.as_deref()) {
+        (true, Some("1" | "true" | "yes" | "on")) => LifecycleAdmissionPhase::Quiescing,
+        _ => LifecycleAdmissionPhase::Active,
+    }
+}
+
+async fn start_lifecycle_control_server(
+    socket_path: &Path,
+    events_tx: mpsc::Sender<WorkerQueueItem>,
     healthy: Arc<AtomicBool>,
+    lifecycle: Arc<LifecycleControl>,
+) -> Result<()> {
+    if let Some(parent) = socket_path.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!("failed to create lifecycle socket dir {}", parent.display())
+        })?;
+    }
+    remove_stale_lifecycle_socket(socket_path).await?;
+    let listener = UnixListener::bind(socket_path).with_context(|| {
+        format!(
+            "failed to bind cbth lifecycle control socket {}",
+            socket_path.display()
+        )
+    })?;
+    set_owner_only_socket_permissions(socket_path).await?;
+    info!(
+        "cbth lifecycle control socket ready at {}",
+        socket_path.display()
+    );
+    tokio::spawn(run_lifecycle_control_server(
+        listener, events_tx, healthy, lifecycle,
+    ));
+    Ok(())
+}
+
+async fn run_lifecycle_control_server(
+    listener: UnixListener,
+    events_tx: mpsc::Sender<WorkerQueueItem>,
+    healthy: Arc<AtomicBool>,
+    lifecycle: Arc<LifecycleControl>,
 ) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let tx = events_tx.clone();
                 let healthy = Arc::clone(&healthy);
+                let lifecycle = Arc::clone(&lifecycle);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_ingress_connection(stream, tx, healthy).await {
+                    if let Err(error) =
+                        handle_lifecycle_control_connection(stream, tx, healthy, lifecycle).await
+                    {
+                        warn!("lifecycle control connection failed: {error:#}");
+                    }
+                });
+            }
+            Err(error) => warn!("failed to accept lifecycle control connection: {error:#}"),
+        }
+    }
+}
+
+async fn handle_lifecycle_control_connection(
+    mut stream: UnixStream,
+    events_tx: mpsc::Sender<WorkerQueueItem>,
+    healthy: Arc<AtomicBool>,
+    lifecycle: Arc<LifecycleControl>,
+) -> Result<()> {
+    loop {
+        let frame: PluginRpcRequestFrame =
+            match read_plugin_rpc_frame(&mut stream, PLUGIN_RPC_MAX_FRAME_BYTES).await {
+                Ok(frame) => frame,
+                Err(error)
+                    if error.kind == PluginRpcErrorKind::Io
+                        && error.message.contains("early eof") =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(anyhow!(error)),
+            };
+        let response = handle_lifecycle_rpc_frame(frame, &events_tx, &healthy, &lifecycle).await;
+        write_plugin_rpc_frame(&mut stream, &response.frame, PLUGIN_RPC_MAX_FRAME_BYTES)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if let Some(response_flushed) = response.response_flushed {
+            let _ = response_flushed.send(());
+        }
+    }
+}
+
+async fn handle_lifecycle_rpc_frame(
+    frame: PluginRpcRequestFrame,
+    events_tx: &mpsc::Sender<WorkerQueueItem>,
+    healthy: &Arc<AtomicBool>,
+    lifecycle: &Arc<LifecycleControl>,
+) -> LifecycleRpcResponse {
+    let mut response_flushed = None;
+    let result = match frame.method.as_str() {
+        PLUGIN_RPC_PLUGIN_HEALTH_CHECK_METHOD => {
+            decode_lifecycle_params::<PluginHealthCheckRequest>(&frame).map(|request| {
+                serde_json::to_value(
+                    lifecycle.health_check(&request, healthy.load(Ordering::Relaxed)),
+                )
+                .expect("health response serializes")
+            })
+        }
+        PLUGIN_RPC_PLUGIN_QUIESCE_METHOD => decode_lifecycle_params::<PluginQuiesceRequest>(&frame)
+            .map(|_| {
+                serde_json::to_value(PluginLifecycleAckResponse {
+                    accepted: lifecycle.quiesce(),
+                })
+                .expect("quiesce response serializes")
+            }),
+        PLUGIN_RPC_PLUGIN_DRAIN_METHOD => {
+            match decode_lifecycle_params::<PluginDrainRequest>(&frame) {
+                Ok(request) => {
+                    let Some(token) = lifecycle.quiesce_for_drain() else {
+                        return LifecycleRpcResponse {
+                            frame: PluginRpcResponseFrame::success(
+                                frame.id,
+                                serde_json::to_value(PluginDrainResponse {
+                                    drained: false,
+                                    in_flight_count: Some(lifecycle.in_flight_count()),
+                                })
+                                .expect("drain response serializes"),
+                            ),
+                            response_flushed: None,
+                        };
+                    };
+                    let incomplete_drain_response = || {
+                        Ok(serde_json::to_value(PluginDrainResponse {
+                            drained: false,
+                            in_flight_count: Some(lifecycle.in_flight_count()),
+                        })
+                        .expect("drain response serializes"))
+                    };
+                    if !lifecycle
+                        .wait_until_drained(PLUGIN_LIFECYCLE_DRAIN_TIMEOUT)
+                        .await
+                        || !lifecycle.is_current_quiesce(token)
+                    {
+                        incomplete_drain_response()
+                    } else {
+                        lifecycle_command_response(
+                            events_tx,
+                            LifecycleCommand::Drain { request, token },
+                            None,
+                        )
+                        .await
+                        .and_then(|response| match response {
+                            LifecycleCommandResponse::Drain(response) => {
+                                serde_json::to_value(response).map_err(|error| {
+                                    PluginRpcError::new(
+                                        PluginRpcErrorKind::Internal,
+                                        error.to_string(),
+                                    )
+                                })
+                            }
+                            LifecycleCommandResponse::Ack(_) => Err(PluginRpcError::new(
+                                PluginRpcErrorKind::Internal,
+                                "drain command returned ack response",
+                            )),
+                            LifecycleCommandResponse::AckWithUnquiesceCommit { .. } => {
+                                Err(PluginRpcError::new(
+                                    PluginRpcErrorKind::Internal,
+                                    "drain command returned unquiesce response",
+                                ))
+                            }
+                        })
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        }
+        PLUGIN_RPC_PLUGIN_SHUTDOWN_METHOD => {
+            match decode_lifecycle_params::<PluginShutdownRequest>(&frame) {
+                Ok(request) => {
+                    let previous_phase = match lifecycle.begin_shutdown() {
+                        Some(previous_phase) => previous_phase,
+                        None => {
+                            return LifecycleRpcResponse {
+                                frame: PluginRpcResponseFrame::success(
+                                    frame.id,
+                                    serde_json::to_value(PluginLifecycleAckResponse {
+                                        accepted: false,
+                                    })
+                                    .expect("shutdown response serializes"),
+                                ),
+                                response_flushed: None,
+                            };
+                        }
+                    };
+                    if !lifecycle
+                        .wait_until_drained(PLUGIN_LIFECYCLE_DRAIN_TIMEOUT)
+                        .await
+                    {
+                        lifecycle.restore_shutdown_phase(previous_phase);
+                        Ok(
+                            serde_json::to_value(PluginLifecycleAckResponse { accepted: false })
+                                .expect("shutdown response serializes"),
+                        )
+                    } else {
+                        let (flushed_tx, flushed_rx) = oneshot::channel();
+                        response_flushed = Some(flushed_tx);
+                        match lifecycle_command_response(
+                            events_tx,
+                            LifecycleCommand::Shutdown {
+                                request,
+                                previous_phase,
+                            },
+                            Some(flushed_rx),
+                        )
+                        .await
+                        {
+                            Ok(response) => match response {
+                                LifecycleCommandResponse::Ack(response) => {
+                                    if !response.accepted {
+                                        lifecycle.restore_shutdown_phase(previous_phase);
+                                    }
+                                    serde_json::to_value(response).map_err(|error| {
+                                        PluginRpcError::new(
+                                            PluginRpcErrorKind::Internal,
+                                            error.to_string(),
+                                        )
+                                    })
+                                }
+                                LifecycleCommandResponse::Drain(_) => {
+                                    lifecycle.restore_shutdown_phase(previous_phase);
+                                    Err(PluginRpcError::new(
+                                        PluginRpcErrorKind::Internal,
+                                        "shutdown command returned drain response",
+                                    ))
+                                }
+                                LifecycleCommandResponse::AckWithUnquiesceCommit { .. } => {
+                                    lifecycle.restore_shutdown_phase(previous_phase);
+                                    Err(PluginRpcError::new(
+                                        PluginRpcErrorKind::Internal,
+                                        "shutdown command returned unquiesce response",
+                                    ))
+                                }
+                            },
+                            Err(error) => {
+                                lifecycle.restore_shutdown_phase(previous_phase);
+                                Err(error)
+                            }
+                        }
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        }
+        PLUGIN_RPC_PLUGIN_UNQUIESCE_METHOD => {
+            match decode_lifecycle_params::<PluginUnquiesceRequest>(&frame) {
+                Ok(request) => {
+                    let Some(token) = lifecycle.prepare_unquiesce() else {
+                        return LifecycleRpcResponse {
+                            frame: PluginRpcResponseFrame::success(
+                                frame.id,
+                                serde_json::to_value(PluginLifecycleAckResponse {
+                                    accepted: false,
+                                })
+                                .expect("unquiesce response serializes"),
+                            ),
+                            response_flushed: None,
+                        };
+                    };
+                    let (flushed_tx, flushed_rx) = oneshot::channel();
+                    response_flushed = Some(flushed_tx);
+                    lifecycle_command_response(
+                        events_tx,
+                        LifecycleCommand::Unquiesce { request, token },
+                        Some(flushed_rx),
+                    )
+                    .await
+                    .and_then(|response| match response {
+                        LifecycleCommandResponse::Ack(response) => serde_json::to_value(response)
+                            .map_err(|error| {
+                                PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
+                            }),
+                        LifecycleCommandResponse::AckWithUnquiesceCommit { response, .. } => {
+                            serde_json::to_value(response).map_err(|error| {
+                                PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
+                            })
+                        }
+                        LifecycleCommandResponse::Drain(_) => Err(PluginRpcError::new(
+                            PluginRpcErrorKind::Internal,
+                            "unquiesce command returned drain response",
+                        )),
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+        PLUGIN_RPC_PLUGIN_HANDOFF_EXPORT_METHOD | PLUGIN_RPC_PLUGIN_HANDOFF_IMPORT_METHOD => {
+            Err(PluginRpcError::new(
+                PluginRpcErrorKind::MethodNotFound,
+                "webex-connector W5 does not implement optional plugin handoff",
+            ))
+        }
+        _ => Err(PluginRpcError::new(
+            PluginRpcErrorKind::MethodNotFound,
+            format!("unsupported lifecycle method `{}`", frame.method),
+        )),
+    };
+
+    match result {
+        Ok(value) => LifecycleRpcResponse {
+            frame: PluginRpcResponseFrame::success(frame.id, value),
+            response_flushed,
+        },
+        Err(error) => LifecycleRpcResponse {
+            frame: PluginRpcResponseFrame::failure(frame.id, error),
+            response_flushed,
+        },
+    }
+}
+
+async fn lifecycle_command_response(
+    events_tx: &mpsc::Sender<WorkerQueueItem>,
+    command: LifecycleCommand,
+    response_flushed: Option<oneshot::Receiver<()>>,
+) -> std::result::Result<LifecycleCommandResponse, PluginRpcError> {
+    let (completion, response) = oneshot::channel();
+    let requested_at = Instant::now();
+    let expires_at = requested_at + PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT;
+    let response_expires_at = requested_at + PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT;
+    timeout_at(
+        expires_at,
+        events_tx.send(WorkerQueueItem::Lifecycle(QueuedLifecycleCommand {
+            command,
+            completion,
+            response_flushed,
+            expires_at,
+            response_expires_at,
+        })),
+    )
+    .await
+    .map_err(|_| {
+        PluginRpcError::new(
+            PluginRpcErrorKind::TransientDaemonUnavailable,
+            format!(
+                "timed out after {}s enqueueing worker lifecycle command",
+                PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT.as_secs()
+            ),
+        )
+    })?
+    .map_err(|_| {
+        PluginRpcError::new(
+            PluginRpcErrorKind::TransientDaemonUnavailable,
+            "worker lifecycle command queue is closed",
+        )
+    })?;
+    timeout_at(response_expires_at, response)
+        .await
+        .map_err(|_| {
+            PluginRpcError::new(
+                PluginRpcErrorKind::TransientDaemonUnavailable,
+                format!(
+                    "timed out after {}s waiting for worker lifecycle command response",
+                    PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT.as_secs()
+                ),
+            )
+        })?
+        .map_err(|_| {
+            PluginRpcError::new(
+                PluginRpcErrorKind::TransientDaemonUnavailable,
+                "worker stopped before completing lifecycle command",
+            )
+        })?
+}
+
+fn decode_lifecycle_params<T>(
+    frame: &PluginRpcRequestFrame,
+) -> std::result::Result<T, PluginRpcError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_value(frame.params.clone()).map_err(|error| {
+        PluginRpcError::new(
+            PluginRpcErrorKind::InvalidRequest,
+            format!("invalid {} params: {error}", frame.method),
+        )
+    })
+}
+
+async fn set_owner_only_socket_permissions(socket_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        tokio::fs::set_permissions(socket_path, permissions)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to set lifecycle control socket permissions on {}",
+                    socket_path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+async fn run_ingress_server(
+    listener: UnixListener,
+    events_tx: mpsc::Sender<WorkerQueueItem>,
+    healthy: Arc<AtomicBool>,
+    lifecycle: Arc<LifecycleControl>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let tx = events_tx.clone();
+                let healthy = Arc::clone(&healthy);
+                let lifecycle = Arc::clone(&lifecycle);
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        handle_ingress_connection(stream, tx, healthy, lifecycle).await
+                    {
                         warn!("ingress connection failed: {error:#}");
                     }
                 });
@@ -2454,8 +4312,9 @@ async fn run_ingress_server(
 
 async fn handle_ingress_connection(
     stream: UnixStream,
-    events_tx: mpsc::Sender<QueuedIngress>,
+    events_tx: mpsc::Sender<WorkerQueueItem>,
     healthy: Arc<AtomicBool>,
+    lifecycle: Arc<LifecycleControl>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -2472,14 +4331,34 @@ async fn handle_ingress_connection(
             healthy: healthy.load(Ordering::Relaxed),
             detail: None,
         },
+        WebexIngressEnvelope::ActiveCheck => {
+            worker_active_check_ack(healthy.load(Ordering::Relaxed), lifecycle.phase())
+        }
         event if ingress_requires_processing_ack(&event) => {
+            let sidecar_received_at = ingress_sidecar_received_at(&event);
+            let work_permit = match lifecycle.try_begin_drainable_external_work(sidecar_received_at)
+            {
+                Ok(work_permit) => work_permit,
+                Err(detail) => {
+                    return write_ingress_ack(
+                        &mut writer,
+                        WebexIngressAck {
+                            ok: false,
+                            healthy: healthy.load(Ordering::Relaxed),
+                            detail: Some(detail),
+                        },
+                    )
+                    .await;
+                }
+            };
             let (completion_tx, completion_rx) = oneshot::channel();
             match timeout(ASYNC_NOTIFICATION_INGRESS_ACK_TIMEOUT, async {
                 events_tx
-                    .send(QueuedIngress {
+                    .send(WorkerQueueItem::Ingress(QueuedIngress {
                         event,
                         completion: Some(completion_tx),
-                    })
+                        work_permit: Some(work_permit),
+                    }))
                     .await
                     .context("failed to enqueue ingress event")?;
                 completion_rx
@@ -2514,11 +4393,28 @@ async fn handle_ingress_connection(
             }
         }
         event => {
+            let sidecar_received_at = ingress_sidecar_received_at(&event);
+            let work_permit = match lifecycle.try_begin_drainable_external_work(sidecar_received_at)
+            {
+                Ok(work_permit) => work_permit,
+                Err(detail) => {
+                    return write_ingress_ack(
+                        &mut writer,
+                        WebexIngressAck {
+                            ok: false,
+                            healthy: healthy.load(Ordering::Relaxed),
+                            detail: Some(detail),
+                        },
+                    )
+                    .await;
+                }
+            };
             events_tx
-                .send(QueuedIngress {
+                .send(WorkerQueueItem::Ingress(QueuedIngress {
                     event,
                     completion: None,
-                })
+                    work_permit: Some(work_permit),
+                }))
                 .await
                 .context("failed to enqueue ingress event")?;
             WebexIngressAck {
@@ -2528,6 +4424,55 @@ async fn handle_ingress_connection(
             }
         }
     };
+    write_ingress_ack(&mut writer, ack).await
+}
+
+fn ingress_sidecar_received_at(event: &WebexIngressEnvelope) -> Option<DateTime<Utc>> {
+    match event {
+        WebexIngressEnvelope::MessageCreated(event) => event.sidecar_received_at,
+        WebexIngressEnvelope::AttachmentActionCreated(event) => event.sidecar_received_at,
+        _ => None,
+    }
+}
+
+fn worker_active_check_ack(
+    process_healthy: bool,
+    phase: LifecycleAdmissionPhase,
+) -> WebexIngressAck {
+    if !process_healthy {
+        return WebexIngressAck {
+            ok: false,
+            healthy: false,
+            detail: Some("worker has not completed startup health checks".to_string()),
+        };
+    }
+    if phase == LifecycleAdmissionPhase::Active {
+        return WebexIngressAck {
+            ok: true,
+            healthy: true,
+            detail: None,
+        };
+    }
+    WebexIngressAck {
+        ok: false,
+        healthy: true,
+        detail: Some(match phase {
+            LifecycleAdmissionPhase::Quiescing => {
+                "worker is quiescing and not accepting new Webex work".to_string()
+            }
+            LifecycleAdmissionPhase::Activating => {
+                "worker is activating and not accepting new Webex work".to_string()
+            }
+            LifecycleAdmissionPhase::ShuttingDown => "worker is shutting down".to_string(),
+            LifecycleAdmissionPhase::Active => unreachable!("active phase handled above"),
+        }),
+    }
+}
+
+async fn write_ingress_ack(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ack: WebexIngressAck,
+) -> Result<()> {
     let encoded = serde_json::to_vec(&ack)?;
     writer.write_all(&encoded).await?;
     writer.write_all(b"\n").await?;
@@ -3121,6 +5066,49 @@ async fn remove_stale_socket(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn remove_stale_lifecycle_socket(socket_path: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(socket_path).await {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            match UnixStream::connect(socket_path).await {
+                Ok(_) => {
+                    bail!(
+                        "refusing to replace live lifecycle socket {}; set WXCD_CBTH_LIFECYCLE_SOCKET to a release-scoped path",
+                        socket_path.display()
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    bail!(
+                        "refusing to replace lifecycle socket {} after non-stale connect error: {error:#}",
+                        socket_path.display()
+                    );
+                }
+            }
+            tokio::fs::remove_file(socket_path).await.with_context(|| {
+                format!(
+                    "failed to remove stale lifecycle socket {}",
+                    socket_path.display()
+                )
+            })?;
+        }
+        Ok(_) => bail!(
+            "refusing to replace non-socket lifecycle socket path {}",
+            socket_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect lifecycle socket {}",
+                    socket_path.display()
+                )
+            });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct LocalSnapshotMetadata {
     existed: bool,
@@ -3158,15 +5146,38 @@ async fn load_local_snapshot_with_metadata(path: &Path) -> Result<LocalSnapshotR
     })
 }
 
+async fn load_durable_local_snapshot_with_metadata(
+    config: &AppConfig,
+) -> Result<LocalSnapshotReplay> {
+    let primary_path = durable_local_snapshot_path(config);
+    let primary = load_local_snapshot_with_metadata(&primary_path).await?;
+    if primary.metadata.existed {
+        return Ok(primary);
+    }
+
+    let legacy_path = config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE);
+    if legacy_path == primary_path {
+        return Ok(primary);
+    }
+
+    load_local_snapshot_with_metadata(&legacy_path).await
+}
+
 async fn persist_local_snapshot(path: &Path, snapshot: &wxcd_proto::BridgeSnapshot) -> Result<()> {
     let encoded = serde_json::to_string_pretty(snapshot)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create local snapshot dir {}", parent.display()))?;
+    }
     tokio::fs::write(path, encoded)
         .await
         .with_context(|| format!("failed to write local snapshot {}", path.display()))?;
     Ok(())
 }
 
-async fn load_or_create_installation_identity(state_dir: &Path) -> Result<InstallationIdentity> {
+async fn load_or_create_installation_identity(config: &AppConfig) -> Result<InstallationIdentity> {
+    let state_dir = &config.bridge.state_dir;
     let path = state_dir.join(INSTALLATION_IDENTITY_FILE);
     if tokio::fs::try_exists(&path)
         .await
@@ -3186,7 +5197,7 @@ async fn load_or_create_installation_identity(state_dir: &Path) -> Result<Instal
         return Ok(identity);
     }
 
-    let identity = match recover_installation_identity_from_snapshot(state_dir).await? {
+    let identity = match recover_installation_identity_from_snapshot(config).await? {
         Some(identity) => identity,
         None => InstallationIdentity {
             installation_id: generate_installation_id(Utc::now()),
@@ -3198,14 +5209,34 @@ async fn load_or_create_installation_identity(state_dir: &Path) -> Result<Instal
 }
 
 async fn recover_installation_identity_from_snapshot(
-    state_dir: &Path,
+    config: &AppConfig,
 ) -> Result<Option<InstallationIdentity>> {
-    let snapshot_path = state_dir.join(LOCAL_SNAPSHOT_FILE);
-    if !tokio::fs::try_exists(&snapshot_path).await.unwrap_or(false) {
+    let durable_path = durable_local_snapshot_path(config);
+    let legacy_path = config.bridge.state_dir.join(LOCAL_SNAPSHOT_FILE);
+    let paths = if durable_path == legacy_path {
+        vec![durable_path]
+    } else {
+        vec![durable_path, legacy_path]
+    };
+
+    for snapshot_path in paths {
+        if let Some(identity) =
+            recover_installation_identity_from_snapshot_path(&snapshot_path).await?
+        {
+            return Ok(Some(identity));
+        }
+    }
+    Ok(None)
+}
+
+async fn recover_installation_identity_from_snapshot_path(
+    snapshot_path: &Path,
+) -> Result<Option<InstallationIdentity>> {
+    if !tokio::fs::try_exists(snapshot_path).await.unwrap_or(false) {
         return Ok(None);
     }
 
-    let content = match tokio::fs::read_to_string(&snapshot_path).await {
+    let content = match tokio::fs::read_to_string(snapshot_path).await {
         Ok(content) => content,
         Err(error) => {
             warn!(
@@ -3493,6 +5524,22 @@ impl WorkerState {
         session.state != SessionState::Failed && self.should_route_session_room(session)
     }
 
+    fn lifecycle_codex_in_flight_count(&self) -> u64 {
+        self.sessions
+            .values()
+            .filter(|session| self.should_route_session_room(session))
+            .filter(|session| {
+                session.active_turn_id.is_some()
+                    || matches!(
+                        session.state,
+                        SessionState::Creating
+                            | SessionState::Running
+                            | SessionState::WaitingApproval
+                    )
+            })
+            .count() as u64
+    }
+
     fn remember_event(&mut self, event_id: &str) -> bool {
         if self.recent_event_ids.contains(event_id) {
             return false;
@@ -3507,6 +5554,12 @@ impl WorkerState {
             }
         }
         true
+    }
+
+    fn forget_event(&mut self, event_id: &str) {
+        if self.recent_event_ids.remove(event_id) {
+            self.recent_event_queue.retain(|queued| queued != event_id);
+        }
     }
 
     fn to_replay_state(&self) -> ReplayState {

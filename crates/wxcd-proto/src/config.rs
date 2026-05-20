@@ -254,9 +254,9 @@ fn build_cbth_plugin_config(
         .transpose()?
         .unwrap_or_else(|| state_dir.join("plugin"));
     let plugin_instance_id = optional_env("WXCD_PLUGIN_INSTANCE_ID")
-        .or_else(|| optional_env("CBTH_PLUGIN_STARTED_AT").map(|value| format!("cbth-{value}")))
-        .or_else(|| file_config.and_then(|config| config.plugin_instance_id.clone()))
-        .unwrap_or_else(|| "standalone".to_string());
+        .or_else(|| optional_env("CBTH_PLUGIN_INSTANCE_ID"))
+        .or_else(|| file_plugin_instance_id(enabled, file_config))
+        .unwrap_or_else(|| default_plugin_instance_id(enabled, &plugin_home));
     let plugin_release_id = optional_env("CBTH_PLUGIN_RELEASE_ID")
         .or_else(|| optional_env("WXCD_PLUGIN_RELEASE_ID"))
         .or_else(|| file_config.and_then(|config| config.plugin_release_id.clone()))
@@ -280,6 +280,38 @@ fn build_cbth_plugin_config(
         plugin_release_id,
         manifest_path,
     })
+}
+
+fn file_plugin_instance_id(
+    enabled: bool,
+    file_config: Option<&FileCbthPluginConfig>,
+) -> Option<String> {
+    file_config
+        .and_then(|config| config.plugin_instance_id.clone())
+        .filter(|value| {
+            let trimmed = value.trim();
+            !(trimmed.is_empty() || enabled && trimmed == "standalone")
+        })
+}
+
+fn default_plugin_instance_id(enabled: bool, plugin_home: &Path) -> String {
+    if enabled {
+        format!(
+            "plugin-home-{}",
+            stable_fnv1a_hex(&plugin_home.to_string_lossy())
+        )
+    } else {
+        "standalone".to_string()
+    }
+}
+
+fn stable_fnv1a_hex(value: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn build_repos(repos: Option<Vec<RepoConfig>>) -> Result<Vec<RepoConfig>> {
@@ -376,7 +408,7 @@ fn expand_tilde(value: String) -> Result<PathBuf> {
 mod tests {
     use std::sync::{Mutex, MutexGuard};
 
-    use super::{FileConfig, build_bridge_config};
+    use super::{FileConfig, build_bridge_config, stable_fnv1a_hex};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -484,19 +516,24 @@ manifest_path = "plugin/manifest.json"
             "/tmp/cbth-plugin-home"
         );
         assert_eq!(config.cbth_plugin.plugin_release_id, "release-1");
-        assert_eq!(config.cbth_plugin.plugin_instance_id, "cbth-123");
+        assert_eq!(
+            config.cbth_plugin.plugin_instance_id,
+            format!("plugin-home-{}", stable_fnv1a_hex("/tmp/cbth-plugin-home"))
+        );
 
         remove_env("CBTH_PLUGIN_RPC_SOCKET");
         remove_env("CBTH_PLUGIN_HOME");
+        remove_env("CBTH_PLUGIN_INSTANCE_ID");
         remove_env("CBTH_PLUGIN_RELEASE_ID");
         remove_env("CBTH_PLUGIN_STARTED_AT");
     }
 
     #[test]
-    fn cbth_environment_instance_id_overrides_installed_config() {
+    fn legacy_standalone_instance_id_uses_plugin_home_identity_in_plugin_mode() {
         let _guard = env_guard();
         clear_cbth_env();
         set_env("CBTH_PLUGIN_RPC_SOCKET", "/tmp/cbth.sock");
+        set_env("CBTH_PLUGIN_HOME", "/tmp/cbth-plugin-home");
         set_env("CBTH_PLUGIN_STARTED_AT", "456");
         let file_config: FileConfig = toml::from_str(
             r#"
@@ -509,10 +546,37 @@ plugin_instance_id = "standalone"
         let config = build_bridge_config(&file_config, None).unwrap();
 
         assert!(config.cbth_plugin.enabled);
-        assert_eq!(config.cbth_plugin.plugin_instance_id, "cbth-456");
+        assert_eq!(
+            config.cbth_plugin.plugin_instance_id,
+            format!("plugin-home-{}", stable_fnv1a_hex("/tmp/cbth-plugin-home"))
+        );
 
         remove_env("CBTH_PLUGIN_RPC_SOCKET");
+        remove_env("CBTH_PLUGIN_HOME");
         remove_env("CBTH_PLUGIN_STARTED_AT");
+    }
+
+    #[test]
+    fn explicit_environment_instance_id_overrides_installed_config() {
+        let _guard = env_guard();
+        clear_cbth_env();
+        set_env("CBTH_PLUGIN_RPC_SOCKET", "/tmp/cbth.sock");
+        set_env("WXCD_PLUGIN_INSTANCE_ID", "instance-env");
+        let file_config: FileConfig = toml::from_str(
+            r#"
+[cbth_plugin]
+plugin_instance_id = "instance-file"
+"#,
+        )
+        .unwrap();
+
+        let config = build_bridge_config(&file_config, None).unwrap();
+
+        assert!(config.cbth_plugin.enabled);
+        assert_eq!(config.cbth_plugin.plugin_instance_id, "instance-env");
+
+        remove_env("CBTH_PLUGIN_RPC_SOCKET");
+        remove_env("WXCD_PLUGIN_INSTANCE_ID");
     }
 
     fn env_guard() -> MutexGuard<'static, ()> {
@@ -530,6 +594,7 @@ plugin_instance_id = "standalone"
     fn clear_cbth_env() {
         remove_env("CBTH_PLUGIN_RPC_SOCKET");
         remove_env("CBTH_PLUGIN_HOME");
+        remove_env("CBTH_PLUGIN_INSTANCE_ID");
         remove_env("CBTH_PLUGIN_RELEASE_ID");
         remove_env("CBTH_PLUGIN_STARTED_AT");
         remove_env("WXCD_CBTH_PLUGIN");
