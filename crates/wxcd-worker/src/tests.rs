@@ -1860,10 +1860,11 @@ fn handoff_export_rejects_payload_over_rpc_frame_budget() {
         },
     };
 
-    let error = ensure_handoff_export_response_fits_rpc_frame(&response).unwrap_err();
+    let error =
+        ensure_handoff_export_response_fits_rpc_frame("oversized-export", &response).unwrap_err();
 
     assert!(
-        format!("{error:#}").contains("exceeds safe plugin RPC payload budget"),
+        format!("{error:#}").contains("exceeds safe plugin RPC frame budget"),
         "{error:#}"
     );
 }
@@ -1922,6 +1923,22 @@ async fn handoff_import_applies_snapshot_cursor_and_deferred_ingress_without_ext
             "plugin_release_id": "0.1.0",
             "pid": std::process::id(),
             "in_flight_count": 2,
+            "updated_at": Utc::now().to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        source_drain_state_dir.join(format!(
+            "{}handoff-source-idle.json",
+            sidecar_drain_state_file_prefix(&source_config)
+        )),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "pid": std::process::id(),
+            "in_flight_count": 0,
             "updated_at": Utc::now().to_rfc3339()
         }))
         .unwrap(),
@@ -2006,6 +2023,10 @@ async fn handoff_import_applies_snapshot_cursor_and_deferred_ingress_without_ext
     assert_eq!(foreign_instance_event_records, 1);
     assert_eq!(
         lifecycle_sidecar_in_flight_count(&target_config, None).await,
+        2
+    );
+    assert_eq!(
+        lifecycle_sidecar_in_flight_count(&target_config, Some(Utc::now())).await,
         2
     );
     assert!(
@@ -2299,6 +2320,114 @@ async fn handoff_import_io_failure_does_not_mutate_worker_state() {
     assert!(!target_state.sessions.contains_key("ses_rollback"));
     assert!(!target_state.pending_approvals.contains_key("apr_rollback"));
     assert!(!target_state.recent_event_ids.contains("event-rollback"));
+
+    tokio::fs::remove_dir_all(&source_dir).await.unwrap();
+    tokio::fs::remove_dir_all(&target_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn handoff_import_io_failure_rolls_back_sidecar_artifacts() {
+    let source_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-artifact-rollback-source-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let target_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-artifact-rollback-target-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let source_config = app_config_with_state_dir(&source_dir, true);
+    let mut target_config = app_config_with_state_dir(&target_dir, true);
+    target_config.bridge.cbth_plugin.plugin_release_id = "0.2.0".to_string();
+    let source_deferred_dir = source_config
+        .bridge
+        .cbth_plugin
+        .plugin_home
+        .join(SIDECAR_DEFERRED_INGRESS_DIR);
+    let source_drain_state_dir = source_config
+        .bridge
+        .cbth_plugin
+        .plugin_home
+        .join(SIDECAR_DRAIN_STATE_DIR);
+    tokio::fs::create_dir_all(&source_deferred_dir)
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(&source_drain_state_dir)
+        .await
+        .unwrap();
+    tokio::fs::write(
+        source_deferred_dir.join("event-artifact-rollback.json"),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "event_id": "event-artifact-rollback"
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        source_drain_state_dir.join(format!(
+            "{}artifact-rollback.json",
+            sidecar_drain_state_file_prefix(&source_config)
+        )),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "pid": std::process::id(),
+            "in_flight_count": 3,
+            "updated_at": Utc::now().to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut source_state = WorkerState::default();
+    source_state.set_executable_installation("ins_current");
+    source_state.upsert_session(managed_session_record(
+        "ses_artifact_rollback",
+        SessionState::Idle,
+        false,
+        "ins_current",
+    ));
+    let snapshot = export_handoff_snapshot(&source_config, &source_state)
+        .await
+        .unwrap()
+        .snapshot;
+
+    let plugin_home = target_config.bridge.cbth_plugin.plugin_home.clone();
+    tokio::fs::create_dir_all(&plugin_home).await.unwrap();
+    tokio::fs::create_dir_all(plugin_home.join("webex-handoff-state.json"))
+        .await
+        .unwrap();
+    let mut target_state = WorkerState::default();
+    target_state.set_executable_installation("ins_current");
+
+    let error = import_handoff_snapshot(&target_config, &mut target_state, snapshot)
+        .await
+        .expect_err("import should fail after sidecar artifacts are staged");
+
+    assert!(
+        format!("{error:#}").contains("failed to publish JSON"),
+        "{error:#}"
+    );
+    assert!(!target_state.sessions.contains_key("ses_artifact_rollback"));
+    assert_eq!(
+        lifecycle_sidecar_in_flight_count(&target_config, None).await,
+        0
+    );
+    let target_deferred_dir = plugin_home.join(SIDECAR_DEFERRED_INGRESS_DIR);
+    if tokio::fs::try_exists(&target_deferred_dir).await.unwrap() {
+        let mut entries = tokio::fs::read_dir(&target_deferred_dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let record: serde_json::Value =
+                serde_json::from_slice(&tokio::fs::read(entry.path()).await.unwrap()).unwrap();
+            assert_ne!(
+                record.get("event_id").and_then(serde_json::Value::as_str),
+                Some("event-artifact-rollback")
+            );
+        }
+    }
 
     tokio::fs::remove_dir_all(&source_dir).await.unwrap();
     tokio::fs::remove_dir_all(&target_dir).await.unwrap();

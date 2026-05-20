@@ -3411,7 +3411,6 @@ async fn export_handoff_snapshot(
             payload: serde_json::to_value(&payload)?,
         },
     };
-    ensure_handoff_export_response_fits_rpc_frame(&response)?;
     persist_webex_handoff_state(config, &payload).await?;
     Ok(response)
 }
@@ -3428,22 +3427,60 @@ async fn import_handoff_snapshot(
     validate_webex_handoff_payload(config, state, &payload)?;
     let mut imported_state = state.clone();
     apply_webex_handoff_payload(&mut imported_state, &payload)?;
-    materialize_handoff_deferred_ingress_records(
-        &config
-            .bridge
-            .cbth_plugin
-            .plugin_home
-            .join(SIDECAR_DEFERRED_INGRESS_DIR),
-        &payload.sidecar.deferred_ingress_records,
-        &config.bridge.cbth_plugin.plugin_instance_id,
-    )
-    .await?;
-    materialize_handoff_sidecar_drain_state_records(config, &payload.sidecar.drain_state_records)
+    let mut rollback = HandoffImportRollback::default();
+    let import_result: Result<()> = async {
+        materialize_handoff_deferred_ingress_records(
+            &config
+                .bridge
+                .cbth_plugin
+                .plugin_home
+                .join(SIDECAR_DEFERRED_INGRESS_DIR),
+            &payload.sidecar.deferred_ingress_records,
+            &config.bridge.cbth_plugin.plugin_instance_id,
+            &mut rollback,
+        )
         .await?;
-    persist_webex_handoff_state(config, &payload).await?;
-    persist_durable_lifecycle_mirror(config, &imported_state).await?;
+        materialize_handoff_sidecar_drain_state_records(
+            config,
+            &payload.sidecar.drain_state_records,
+            &mut rollback,
+        )
+        .await?;
+        persist_webex_handoff_state(config, &payload).await?;
+        persist_durable_lifecycle_mirror(config, &imported_state).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = import_result {
+        rollback.rollback().await;
+        return Err(error);
+    }
     *state = imported_state;
     Ok(PluginLifecycleAckResponse { accepted: true })
+}
+
+#[derive(Default)]
+struct HandoffImportRollback {
+    created_paths: Vec<PathBuf>,
+}
+
+impl HandoffImportRollback {
+    fn record_created(&mut self, path: PathBuf) {
+        self.created_paths.push(path);
+    }
+
+    async fn rollback(self) {
+        for path in self.created_paths.into_iter().rev() {
+            if let Err(error) = tokio::fs::remove_file(&path).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    "failed to roll back handoff import sidecar artifact {}: {error:#}",
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 fn decode_webex_handoff_payload(snapshot: PluginHandoffSnapshot) -> Result<WebexHandoffPayload> {
@@ -3632,17 +3669,21 @@ fn build_handoff_in_flight_state(state: &WorkerState) -> WebexHandoffInFlightSta
 }
 
 fn ensure_handoff_export_response_fits_rpc_frame(
+    response_id: &str,
     response: &PluginHandoffExportResponse,
 ) -> Result<()> {
-    let safe_payload_budget = PLUGIN_RPC_MAX_FRAME_BYTES
+    let safe_frame_budget = PLUGIN_RPC_MAX_FRAME_BYTES
         .checked_sub(WEBEX_HANDOFF_RPC_FRAME_RESERVE_BYTES)
         .ok_or_else(|| anyhow!("plugin RPC frame budget is smaller than handoff reserve"))?;
-    let response_bytes = serde_json::to_vec(response)
-        .context("failed to encode Webex handoff export response for size check")?
+    let result = serde_json::to_value(response)
+        .context("failed to encode Webex handoff export response for frame size check")?;
+    let frame = PluginRpcResponseFrame::success(response_id, result);
+    let frame_bytes = serde_json::to_vec(&frame)
+        .context("failed to encode Webex handoff export response frame for size check")?
         .len();
-    if response_bytes > safe_payload_budget {
+    if frame_bytes > safe_frame_budget {
         bail!(
-            "Webex handoff snapshot is {response_bytes} bytes, exceeds safe plugin RPC payload budget {safe_payload_budget} bytes"
+            "Webex handoff response frame is {frame_bytes} bytes, exceeds safe plugin RPC frame budget {safe_frame_budget} bytes"
         );
     }
     Ok(())
@@ -3737,6 +3778,7 @@ async fn materialize_handoff_deferred_ingress_records(
     dir: &Path,
     records: &[WebexHandoffSidecarFileRecord],
     plugin_instance_id: &str,
+    rollback: &mut HandoffImportRollback,
 ) -> Result<usize> {
     if records.is_empty() {
         return Ok(0);
@@ -3767,6 +3809,7 @@ async fn materialize_handoff_deferred_ingress_records(
             continue;
         }
         write_json_pretty_atomic(&target_path, &record.record).await?;
+        rollback.record_created(target_path);
         if let Some(event_id) = event_id {
             existing_event_ids.insert(event_id);
         }
@@ -3778,6 +3821,7 @@ async fn materialize_handoff_deferred_ingress_records(
 async fn materialize_handoff_sidecar_drain_state_records(
     config: &AppConfig,
     records: &[WebexHandoffSidecarFileRecord],
+    rollback: &mut HandoffImportRollback,
 ) -> Result<usize> {
     if records.is_empty() {
         return Ok(0);
@@ -3797,6 +3841,15 @@ async fn materialize_handoff_sidecar_drain_state_records(
         {
             continue;
         }
+        if record
+            .record
+            .pointer("/in_flight_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            == 0
+        {
+            continue;
+        }
         let mut drain_record = record.record.clone();
         if let Some(object) = drain_record.as_object_mut() {
             object.insert(
@@ -3811,7 +3864,12 @@ async fn materialize_handoff_sidecar_drain_state_records(
             continue;
         }
         let file_name = sidecar_drain_state_handoff_file_name(config, record, index);
-        write_json_pretty_atomic(&dir.join(file_name), &drain_record).await?;
+        let target_path = dir.join(file_name);
+        if tokio::fs::try_exists(&target_path).await.unwrap_or(false) {
+            continue;
+        }
+        write_json_pretty_atomic(&target_path, &drain_record).await?;
+        rollback.record_created(target_path);
         imported += 1;
     }
     Ok(imported)
@@ -4905,6 +4963,13 @@ async fn handle_lifecycle_rpc_frame(
                 .await
                 .and_then(|response| match response {
                     LifecycleCommandResponse::HandoffExport(response) => {
+                        ensure_handoff_export_response_fits_rpc_frame(&frame.id, &response)
+                            .map_err(|error| {
+                                PluginRpcError::new(
+                                    PluginRpcErrorKind::Internal,
+                                    format!("{error:#}"),
+                                )
+                            })?;
                         serde_json::to_value(response).map_err(|error| {
                             PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
                         })

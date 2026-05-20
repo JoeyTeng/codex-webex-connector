@@ -56,3 +56,7 @@ superseded_by:
   - `plugin.handoff_export` now rejects snapshots that would exceed the safe RPC frame budget, import waits without the generic fixed lifecycle response timeout, deferred-ingress dedupe is scoped to the current plugin instance, and sidecar drain-state records are materialized for the target release.
 - The follow-up frozen-diff pass found and W6 fixed two import consistency issues:
   - Approval reconcile is authoritative only for source sessions actually adopted by import, and the import path keeps memory/durable state commit together instead of splitting it across response flush.
+- The PR thread cleanup pass found and W6 fixed the remaining current review-gate items:
+  - Handoff export size validation now checks the complete JSON-RPC response frame, and handoff import rolls back newly materialized sidecar files when later persistence fails.
+- A stale frozen-diff review result found and W6 fixed a synthetic drain-state edge case:
+  - Handoff import skips zero-in-flight sidecar drain records so target cutoff accounting cannot turn idle synthetic records into blocking work.
