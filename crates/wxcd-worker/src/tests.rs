@@ -51,7 +51,7 @@ fn lifecycle_drain_command(reason: &str) -> LifecycleCommand {
         request: PluginDrainRequest {
             reason: reason.to_string(),
         },
-        token: LifecycleTransitionToken { generation: 0 },
+        token: LifecycleTransitionToken::for_generation(0),
     }
 }
 
@@ -2378,6 +2378,41 @@ fn lifecycle_cancelled_activation_rejects_stale_completion() {
     assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Quiescing);
     assert!(!lifecycle.complete_unquiesce_activation(activation));
     assert!(lifecycle.prepare_unquiesce().is_some());
+}
+
+#[test]
+fn lifecycle_cancelled_activation_preserves_quiesce_cutoff() {
+    let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Active));
+    let received_before_quiesce = Utc::now();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert!(lifecycle.quiesce());
+    let original_cutoff = lifecycle
+        .sidecar_drain_barrier_started_at()
+        .expect("quiesce records a sidecar drain barrier");
+    let received_after_quiesce = Utc::now() + Duration::seconds(1);
+
+    let token = lifecycle
+        .prepare_unquiesce()
+        .expect("quiesced lifecycle prepares unquiesce");
+    let activation = lifecycle
+        .begin_unquiesce_activation(token)
+        .expect("current unquiesce token is claimed");
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    lifecycle.cancel_unquiesce_activation(activation);
+
+    assert_eq!(
+        lifecycle.sidecar_drain_barrier_started_at(),
+        Some(original_cutoff)
+    );
+    assert!(
+        lifecycle
+            .try_begin_drainable_external_work(Some(received_after_quiesce))
+            .is_err()
+    );
+    let work_permit = lifecycle
+        .try_begin_drainable_external_work(Some(received_before_quiesce))
+        .expect("work received before the original quiesce remains drainable");
+    drop(work_permit);
 }
 
 #[test]

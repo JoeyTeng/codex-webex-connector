@@ -267,6 +267,23 @@ struct LifecyclePhaseState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LifecycleTransitionToken {
     generation: u64,
+    restore_phase_started_at: Option<DateTime<Utc>>,
+}
+
+impl LifecycleTransitionToken {
+    fn for_generation(generation: u64) -> Self {
+        Self {
+            generation,
+            restore_phase_started_at: None,
+        }
+    }
+
+    fn for_activation(generation: u64, restore_phase_started_at: DateTime<Utc>) -> Self {
+        Self {
+            generation,
+            restore_phase_started_at: Some(restore_phase_started_at),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -315,15 +332,11 @@ impl LifecycleControl {
                 state.phase = LifecycleAdmissionPhase::Quiescing;
                 state.generation = state.generation.wrapping_add(1);
                 state.phase_started_at = Utc::now();
-                Some(LifecycleTransitionToken {
-                    generation: state.generation,
-                })
+                Some(LifecycleTransitionToken::for_generation(state.generation))
             }
             LifecycleAdmissionPhase::Quiescing => {
                 state.generation = state.generation.wrapping_add(1);
-                Some(LifecycleTransitionToken {
-                    generation: state.generation,
-                })
+                Some(LifecycleTransitionToken::for_generation(state.generation))
             }
             LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown => None,
         }
@@ -351,11 +364,13 @@ impl LifecycleControl {
         {
             return None;
         }
+        let quiesce_started_at = state.phase_started_at;
         state.phase = LifecycleAdmissionPhase::Activating;
         state.generation = state.generation.wrapping_add(1);
-        Some(LifecycleTransitionToken {
-            generation: state.generation,
-        })
+        Some(LifecycleTransitionToken::for_activation(
+            state.generation,
+            quiesce_started_at,
+        ))
     }
 
     fn complete_unquiesce_activation(&self, token: LifecycleTransitionToken) -> bool {
@@ -378,7 +393,9 @@ impl LifecycleControl {
         {
             state.phase = LifecycleAdmissionPhase::Quiescing;
             state.generation = state.generation.wrapping_add(1);
-            state.phase_started_at = Utc::now();
+            if let Some(phase_started_at) = token.restore_phase_started_at {
+                state.phase_started_at = phase_started_at;
+            }
         }
     }
 
@@ -386,9 +403,7 @@ impl LifecycleControl {
         let state = self.phase.lock().expect("lifecycle phase poisoned");
         match state.phase {
             LifecycleAdmissionPhase::Active | LifecycleAdmissionPhase::Quiescing => {
-                Some(LifecycleTransitionToken {
-                    generation: state.generation,
-                })
+                Some(LifecycleTransitionToken::for_generation(state.generation))
             }
             LifecycleAdmissionPhase::Activating | LifecycleAdmissionPhase::ShuttingDown => None,
         }
