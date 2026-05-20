@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -193,12 +194,16 @@ struct QueuedLifecycleCommand {
     completion: oneshot::Sender<std::result::Result<LifecycleCommandResponse, String>>,
     response_flushed: Option<oneshot::Receiver<()>>,
     expires_at: Instant,
+    response_expires_at: Instant,
 }
 
 enum LifecycleCommand {
     Drain(PluginDrainRequest),
     Shutdown(PluginShutdownRequest),
-    Unquiesce(PluginUnquiesceRequest),
+    Unquiesce {
+        request: PluginUnquiesceRequest,
+        token: LifecycleTransitionToken,
+    },
 }
 
 enum LifecycleCommandResponse {
@@ -224,6 +229,7 @@ struct LifecycleUnquiesceContext<'a, 'event_log> {
     installation: &'a InstallationIdentity,
     lifecycle: &'a LifecycleControl,
     startup_reconcile_pending: &'a mut bool,
+    response_expires_at: Instant,
 }
 
 struct LifecycleRpcResponse {
@@ -238,9 +244,20 @@ enum LifecycleAdmissionPhase {
     ShuttingDown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LifecyclePhaseState {
+    phase: LifecycleAdmissionPhase,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LifecycleTransitionToken {
+    generation: u64,
+}
+
 #[derive(Debug)]
 struct LifecycleControl {
-    phase: Mutex<LifecycleAdmissionPhase>,
+    phase: Mutex<LifecyclePhaseState>,
     in_flight: AtomicU64,
     drained: Notify,
 }
@@ -253,54 +270,73 @@ struct LifecycleWorkPermit {
 impl LifecycleControl {
     fn new(initial_phase: LifecycleAdmissionPhase) -> Self {
         Self {
-            phase: Mutex::new(initial_phase),
+            phase: Mutex::new(LifecyclePhaseState {
+                phase: initial_phase,
+                generation: 0,
+            }),
             in_flight: AtomicU64::new(0),
             drained: Notify::new(),
         }
     }
 
     fn phase(&self) -> LifecycleAdmissionPhase {
-        *self.phase.lock().expect("lifecycle phase poisoned")
+        self.phase.lock().expect("lifecycle phase poisoned").phase
     }
 
     fn quiesce(&self) -> bool {
-        let mut phase = self.phase.lock().expect("lifecycle phase poisoned");
-        match *phase {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        match state.phase {
             LifecycleAdmissionPhase::Active | LifecycleAdmissionPhase::Quiescing => {
-                *phase = LifecycleAdmissionPhase::Quiescing;
+                state.phase = LifecycleAdmissionPhase::Quiescing;
+                state.generation = state.generation.wrapping_add(1);
                 true
             }
             LifecycleAdmissionPhase::ShuttingDown => false,
         }
     }
 
-    fn unquiesce(&self) -> bool {
-        let mut phase = self.phase.lock().expect("lifecycle phase poisoned");
-        match *phase {
+    fn prepare_unquiesce(&self) -> Option<LifecycleTransitionToken> {
+        let state = self.phase.lock().expect("lifecycle phase poisoned");
+        match state.phase {
             LifecycleAdmissionPhase::Active | LifecycleAdmissionPhase::Quiescing => {
-                *phase = LifecycleAdmissionPhase::Active;
-                true
+                Some(LifecycleTransitionToken {
+                    generation: state.generation,
+                })
             }
-            LifecycleAdmissionPhase::ShuttingDown => false,
+            LifecycleAdmissionPhase::ShuttingDown => None,
         }
+    }
+
+    fn unquiesce_if_current(&self, token: LifecycleTransitionToken) -> bool {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        if state.phase == LifecycleAdmissionPhase::ShuttingDown
+            || state.generation != token.generation
+        {
+            return false;
+        }
+        state.phase = LifecycleAdmissionPhase::Active;
+        state.generation = state.generation.wrapping_add(1);
+        true
     }
 
     fn begin_shutdown(&self) -> Option<LifecycleAdmissionPhase> {
-        let mut phase = self.phase.lock().expect("lifecycle phase poisoned");
-        match *phase {
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        match state.phase {
             LifecycleAdmissionPhase::ShuttingDown => None,
             LifecycleAdmissionPhase::Active | LifecycleAdmissionPhase::Quiescing => {
-                let previous = *phase;
-                *phase = LifecycleAdmissionPhase::ShuttingDown;
+                let previous = state.phase;
+                state.phase = LifecycleAdmissionPhase::ShuttingDown;
+                state.generation = state.generation.wrapping_add(1);
                 Some(previous)
             }
         }
     }
 
     fn restore_shutdown_phase(&self, previous: LifecycleAdmissionPhase) {
-        let mut phase = self.phase.lock().expect("lifecycle phase poisoned");
-        if *phase == LifecycleAdmissionPhase::ShuttingDown {
-            *phase = previous;
+        let mut state = self.phase.lock().expect("lifecycle phase poisoned");
+        if state.phase == LifecycleAdmissionPhase::ShuttingDown {
+            state.phase = previous;
+            state.generation = state.generation.wrapping_add(1);
         }
     }
 
@@ -308,8 +344,8 @@ impl LifecycleControl {
     fn try_begin_external_work(
         self: &Arc<Self>,
     ) -> std::result::Result<LifecycleWorkPermit, String> {
-        let phase = self.phase.lock().expect("lifecycle phase poisoned");
-        match *phase {
+        let state = self.phase.lock().expect("lifecycle phase poisoned");
+        match state.phase {
             LifecycleAdmissionPhase::Active => {
                 self.in_flight.fetch_add(1, Ordering::SeqCst);
                 Ok(LifecycleWorkPermit {
@@ -329,8 +365,8 @@ impl LifecycleControl {
     fn try_begin_drainable_external_work(
         self: &Arc<Self>,
     ) -> std::result::Result<LifecycleWorkPermit, String> {
-        let phase = self.phase.lock().expect("lifecycle phase poisoned");
-        match *phase {
+        let state = self.phase.lock().expect("lifecycle phase poisoned");
+        match state.phase {
             LifecycleAdmissionPhase::Active => {
                 self.in_flight.fetch_add(1, Ordering::SeqCst);
                 Ok(LifecycleWorkPermit {
@@ -744,6 +780,7 @@ async fn run() -> Result<()> {
                             completion,
                             response_flushed,
                             expires_at,
+                            response_expires_at,
                         } = command;
                         if Instant::now() >= expires_at {
                             let _ = completion.send(Err(format!(
@@ -754,7 +791,7 @@ async fn run() -> Result<()> {
                         }
                         let should_shutdown = matches!(&command, LifecycleCommand::Shutdown(_));
                         let result = match command {
-                            LifecycleCommand::Unquiesce(request) => {
+                            LifecycleCommand::Unquiesce { request, token } => {
                                 handle_lifecycle_unquiesce(
                                     LifecycleUnquiesceContext {
                                         config: &config,
@@ -765,8 +802,10 @@ async fn run() -> Result<()> {
                                         installation: &installation,
                                         lifecycle: lifecycle.as_ref(),
                                         startup_reconcile_pending: &mut startup_reconcile_pending,
+                                        response_expires_at,
                                     },
                                     request,
+                                    token,
                                 )
                                 .await
                             }
@@ -2828,7 +2867,9 @@ async fn handle_lifecycle_command(
                 accepted: true,
             }))
         }
-        LifecycleCommand::Unquiesce(_) => bail!("unquiesce must be handled by the worker loop"),
+        LifecycleCommand::Unquiesce { .. } => {
+            bail!("unquiesce must be handled by the worker loop")
+        }
     }
 }
 
@@ -2898,7 +2939,9 @@ async fn handle_lifecycle_command_with_runtime_drain(
                 accepted: true,
             }))
         }
-        LifecycleCommand::Unquiesce(_) => bail!("unquiesce must be handled by the worker loop"),
+        LifecycleCommand::Unquiesce { .. } => {
+            bail!("unquiesce must be handled by the worker loop")
+        }
     }
 }
 
@@ -2988,8 +3031,18 @@ fn lifecycle_runtime_wait_interval(remaining: Duration) -> Duration {
 async fn handle_lifecycle_unquiesce(
     ctx: LifecycleUnquiesceContext<'_, '_>,
     request: PluginUnquiesceRequest,
+    token: LifecycleTransitionToken,
 ) -> Result<LifecycleCommandResponse> {
     if ctx.lifecycle.phase() == LifecycleAdmissionPhase::ShuttingDown {
+        return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+            accepted: false,
+        }));
+    }
+    if Instant::now() >= ctx.response_expires_at {
+        warn!(
+            "lifecycle unquiesce expired before activation: {}",
+            request.reason
+        );
         return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
             accepted: false,
         }));
@@ -3006,7 +3059,16 @@ async fn handle_lifecycle_unquiesce(
         .await?;
         *ctx.startup_reconcile_pending = false;
     }
-    let accepted = ctx.lifecycle.unquiesce();
+    if Instant::now() >= ctx.response_expires_at {
+        warn!(
+            "lifecycle unquiesce expired after startup reconcile: {}",
+            request.reason
+        );
+        return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
+            accepted: false,
+        }));
+    }
+    let accepted = ctx.lifecycle.unquiesce_if_current(token);
     info!("lifecycle unquiesce completed: {}", request.reason);
     Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
         accepted,
@@ -3150,7 +3212,7 @@ async fn start_lifecycle_control_server(
             format!("failed to create lifecycle socket dir {}", parent.display())
         })?;
     }
-    remove_stale_socket(socket_path).await?;
+    remove_stale_lifecycle_socket(socket_path).await?;
     let listener = UnixListener::bind(socket_path).with_context(|| {
         format!(
             "failed to bind cbth lifecycle control socket {}",
@@ -3352,22 +3414,36 @@ async fn handle_lifecycle_rpc_frame(
         }
         PLUGIN_RPC_PLUGIN_UNQUIESCE_METHOD => {
             match decode_lifecycle_params::<PluginUnquiesceRequest>(&frame) {
-                Ok(request) => lifecycle_command_response(
-                    events_tx,
-                    LifecycleCommand::Unquiesce(request),
-                    None,
-                )
-                .await
-                .and_then(|response| match response {
-                    LifecycleCommandResponse::Ack(response) => serde_json::to_value(response)
-                        .map_err(|error| {
-                            PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
-                        }),
-                    LifecycleCommandResponse::Drain(_) => Err(PluginRpcError::new(
-                        PluginRpcErrorKind::Internal,
-                        "unquiesce command returned drain response",
-                    )),
-                }),
+                Ok(request) => {
+                    let Some(token) = lifecycle.prepare_unquiesce() else {
+                        return LifecycleRpcResponse {
+                            frame: PluginRpcResponseFrame::success(
+                                frame.id,
+                                serde_json::to_value(PluginLifecycleAckResponse {
+                                    accepted: false,
+                                })
+                                .expect("unquiesce response serializes"),
+                            ),
+                            response_flushed: None,
+                        };
+                    };
+                    lifecycle_command_response(
+                        events_tx,
+                        LifecycleCommand::Unquiesce { request, token },
+                        None,
+                    )
+                    .await
+                    .and_then(|response| match response {
+                        LifecycleCommandResponse::Ack(response) => serde_json::to_value(response)
+                            .map_err(|error| {
+                                PluginRpcError::new(PluginRpcErrorKind::Internal, error.to_string())
+                            }),
+                        LifecycleCommandResponse::Drain(_) => Err(PluginRpcError::new(
+                            PluginRpcErrorKind::Internal,
+                            "unquiesce command returned drain response",
+                        )),
+                    })
+                }
                 Err(error) => Err(error),
             }
         }
@@ -3401,7 +3477,9 @@ async fn lifecycle_command_response(
     response_flushed: Option<oneshot::Receiver<()>>,
 ) -> std::result::Result<LifecycleCommandResponse, PluginRpcError> {
     let (completion, response) = oneshot::channel();
-    let expires_at = Instant::now() + PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT;
+    let requested_at = Instant::now();
+    let expires_at = requested_at + PLUGIN_LIFECYCLE_COMMAND_QUEUE_TIMEOUT;
+    let response_expires_at = requested_at + PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT;
     timeout_at(
         expires_at,
         events_tx.send(WorkerQueueItem::Lifecycle(QueuedLifecycleCommand {
@@ -3409,6 +3487,7 @@ async fn lifecycle_command_response(
             completion,
             response_flushed,
             expires_at,
+            response_expires_at,
         })),
     )
     .await
@@ -3427,7 +3506,7 @@ async fn lifecycle_command_response(
             "worker lifecycle command queue is closed",
         )
     })?;
-    let response = timeout(PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT, response)
+    let response = timeout_at(response_expires_at, response)
         .await
         .map_err(|_| {
             PluginRpcError::new(
@@ -4242,6 +4321,33 @@ async fn remove_stale_socket(socket_path: &Path) -> Result<()> {
         tokio::fs::remove_file(socket_path)
             .await
             .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))?;
+    }
+    Ok(())
+}
+
+async fn remove_stale_lifecycle_socket(socket_path: &Path) -> Result<()> {
+    match tokio::fs::symlink_metadata(socket_path).await {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            tokio::fs::remove_file(socket_path).await.with_context(|| {
+                format!(
+                    "failed to remove stale lifecycle socket {}",
+                    socket_path.display()
+                )
+            })?;
+        }
+        Ok(_) => bail!(
+            "refusing to replace non-socket lifecycle socket path {}",
+            socket_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect lifecycle socket {}",
+                    socket_path.display()
+                )
+            });
+        }
     }
     Ok(())
 }

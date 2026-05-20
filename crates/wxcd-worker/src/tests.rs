@@ -16,9 +16,9 @@ use super::{
     load_or_create_installation_identity, normalize_control_command_text,
     normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
     parse_diagnose_command, parse_list_command, parse_purge_archived_command,
-    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
-    resolve_codex_connection, resolve_delivery_broker_connection, session_belongs_to_installation,
-    session_requires_codex_archive, sessions_for_diagnostics,
+    parse_resume_local_thread_id, parse_session_history_page, remove_stale_lifecycle_socket,
+    repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
+    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
     should_process_async_notification_event, slice_thread_history_page,
     validate_purge_archived_session, webex_delivery_idempotency_key, worker_active_check_ack,
     write_supervisor_shutdown_marker_at,
@@ -1674,8 +1674,29 @@ async fn lifecycle_quiesce_blocks_new_external_work_until_unquiesce() {
             .wait_until_drained(std::time::Duration::from_secs(1))
             .await
     );
-    assert!(lifecycle.unquiesce());
+    let token = lifecycle
+        .prepare_unquiesce()
+        .expect("quiesced lifecycle prepares unquiesce");
+    assert!(lifecycle.unquiesce_if_current(token));
     assert!(lifecycle.try_begin_external_work().is_ok());
+}
+
+#[test]
+fn lifecycle_unquiesce_token_is_invalidated_by_later_quiesce() {
+    let lifecycle = Arc::new(LifecycleControl::new(LifecycleAdmissionPhase::Quiescing));
+    let token = lifecycle
+        .prepare_unquiesce()
+        .expect("quiesced lifecycle prepares unquiesce");
+
+    assert!(lifecycle.quiesce());
+    assert!(!lifecycle.unquiesce_if_current(token));
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Quiescing);
+
+    let current_token = lifecycle
+        .prepare_unquiesce()
+        .expect("current lifecycle prepares unquiesce");
+    assert!(lifecycle.unquiesce_if_current(current_token));
+    assert_eq!(lifecycle.phase(), LifecycleAdmissionPhase::Active);
 }
 
 #[test]
@@ -1715,6 +1736,7 @@ async fn lifecycle_command_response_times_out_when_queue_is_full() {
             completion,
             response_flushed: None,
             expires_at: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            response_expires_at: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         }))
         .await
         .unwrap();
@@ -1740,6 +1762,32 @@ async fn lifecycle_command_response_times_out_when_queue_is_full() {
         "{}",
         error.message
     );
+}
+
+#[tokio::test]
+async fn lifecycle_socket_cleanup_refuses_non_socket_path() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-lifecycle-socket-cleanup-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let socket_path = state_dir.join("lifecycle.sock");
+    tokio::fs::create_dir_all(&state_dir).await.unwrap();
+    tokio::fs::write(&socket_path, b"not a socket")
+        .await
+        .unwrap();
+
+    let error = remove_stale_lifecycle_socket(&socket_path)
+        .await
+        .expect_err("non-socket lifecycle path should be refused");
+
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to replace non-socket lifecycle socket path"),
+        "{error:#}"
+    );
+    assert!(tokio::fs::try_exists(&socket_path).await.unwrap());
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 
 #[tokio::test]
