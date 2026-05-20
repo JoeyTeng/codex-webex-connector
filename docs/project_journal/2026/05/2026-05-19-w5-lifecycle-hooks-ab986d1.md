@@ -20,7 +20,7 @@ superseded_by:
 
 ## Current State
 - `wxcd-cbth-rpc` 已镜像 C7 lifecycle method constants、`plugin-lifecycle-v1` capability，以及 typed request/response shapes。W5 只保留 optional `plugin-handoff-v1` 类型用于协议兼容，不 advertise handoff capability，也不实现 handoff RPC 行为。
-- `wxcd-worker` 在 plugin mode 下优先绑定 `WXCD_CBTH_LIFECYCLE_SOCKET`，否则使用 `CBTH_PLUGIN_HOME/lifecycle.sock`；默认 fallback 只会清理不可连接的 stale socket，遇到仍可连接的 live socket 会拒绝启动并要求提供 release-scoped socket path。
+- `wxcd-worker` 在 plugin mode 下优先绑定 `WXCD_CBTH_LIFECYCLE_SOCKET`，否则使用 `/tmp/wxcd-lifecycle-<hash>.sock` 形式的 plugin instance/release/plugin-home scoped 短路径；默认 fallback 只会清理不可连接的 stale socket，遇到仍可连接的 live socket 会拒绝启动并要求提供 release-scoped socket path。
 - Supervisor/worker/sidecar 在 plugin mode 下使用按 plugin instance、release 和 state dir hash scoped 的 main ingress socket，避免 pre-active shadow worker 绑定或清理旧 active worker 的默认 `/tmp/wxcd.sock`。
 - `WXCD_CBTH_PRE_ACTIVE=1` 会让 worker 以 quiesced admission 启动，便于 pre-active health checks 验证外部 Webex work 已被 fence；unquiesce 会先 claim 当前 lifecycle token，并在 startup reconcile 期间保持 activating/fenced 状态，避免已取消的 activation 产生 replay/reconcile side effect。
 - Plugin-mode durable mirror snapshot 位于 `CBTH_PLUGIN_HOME/bridge-state.json`；如果 plugin-home mirror 还不存在，启动时会 fallback 到 legacy `state_dir/bridge-state.json`。

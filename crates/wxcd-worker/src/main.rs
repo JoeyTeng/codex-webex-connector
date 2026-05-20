@@ -70,6 +70,7 @@ const PLUGIN_LIFECYCLE_COMMAND_RESPONSE_TIMEOUT: Duration = Duration::from_milli
 const PLUGIN_LIFECYCLE_RESPONSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PLUGIN_LIFECYCLE_CODEX_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PLUGIN_WORKER_INGRESS_SOCKET_DIR: &str = "/tmp";
+const PLUGIN_LIFECYCLE_SOCKET_DIR: &str = "/tmp";
 const WXCD_SOCKET_PATH_ENV: &str = "WXCD_SOCKET_PATH";
 const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
@@ -3498,16 +3499,6 @@ async fn handle_lifecycle_unquiesce(
             *ctx.startup_snapshot_persist_pending = false;
         }
         *ctx.startup_reconcile_pending = false;
-        if Instant::now() >= ctx.response_expires_at {
-            ctx.lifecycle.cancel_unquiesce_activation(activation_token);
-            warn!(
-                "lifecycle unquiesce expired after startup reconcile: {}",
-                request.reason
-            );
-            return Ok(LifecycleCommandResponse::Ack(PluginLifecycleAckResponse {
-                accepted: false,
-            }));
-        }
         let accepted = ctx
             .lifecycle
             .complete_unquiesce_activation(activation_token);
@@ -3593,11 +3584,13 @@ fn lifecycle_control_socket_path_from_env(
 }
 
 fn default_lifecycle_control_socket_path(config: &CbthPluginConfig) -> PathBuf {
-    config.plugin_home.join("lifecycle").join(format!(
+    Path::new(PLUGIN_LIFECYCLE_SOCKET_DIR).join(format!(
         "wxcd-lifecycle-{}.sock",
         stable_fnv1a_hex(&format!(
-            "{}\n{}",
-            config.plugin_instance_id, config.plugin_release_id
+            "{}\n{}\n{}",
+            config.plugin_instance_id,
+            config.plugin_release_id,
+            config.plugin_home.display()
         ))
     ))
 }

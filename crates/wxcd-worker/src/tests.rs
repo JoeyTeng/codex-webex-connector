@@ -1594,12 +1594,13 @@ fn lifecycle_socket_empty_env_falls_back_to_release_scoped_path() {
 
     assert_eq!(
         socket_path,
-        std::path::PathBuf::from("/tmp/wxcd-plugin-home/lifecycle").join(format!(
+        std::path::PathBuf::from("/tmp").join(format!(
             "wxcd-lifecycle-{}.sock",
-            stable_fnv1a_hex("instance-1\n0.1.0")
+            stable_fnv1a_hex("instance-1\n0.1.0\n/tmp/wxcd-plugin-home")
         ))
     );
     assert_ne!(socket_path, next_socket_path);
+    assert!(socket_path.as_os_str().len() < 108);
 }
 
 #[test]
