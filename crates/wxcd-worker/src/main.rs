@@ -3374,6 +3374,7 @@ async fn sidecar_drain_in_flight_count_after(
                 remove_sidecar_drain_state_file(&path).await;
                 continue;
             }
+            let state_in_flight_count = state.lifecycle_in_flight_count();
             if let Some(cutoff) = inactive_observed_after
                 && !state.sidecar_observed_inactive_after(cutoff)
             {
@@ -3381,10 +3382,10 @@ async fn sidecar_drain_in_flight_count_after(
                     "sidecar drain state {} has not observed the lifecycle admission fence; treating sidecar as in flight",
                     path.display()
                 );
-                count += state.in_flight_count.max(1);
+                count += state_in_flight_count.max(1);
                 continue;
             }
-            count += state.in_flight_count;
+            count += state_in_flight_count;
         }
     }
 }
@@ -3431,11 +3432,18 @@ struct SidecarDrainState {
     #[serde(default)]
     in_flight_count: u64,
     #[serde(default)]
+    deferred_ingress_count: u64,
+    #[serde(default)]
     worker_inactive_observed_at: Option<DateTime<Utc>>,
     updated_at: DateTime<Utc>,
 }
 
 impl SidecarDrainState {
+    fn lifecycle_in_flight_count(&self) -> u64 {
+        self.in_flight_count
+            .saturating_add(self.deferred_ingress_count)
+    }
+
     fn sidecar_observed_inactive_after(&self, cutoff: DateTime<Utc>) -> bool {
         self.worker_inactive_observed_at
             .is_some_and(|observed_at| observed_at.timestamp_millis() > cutoff.timestamp_millis())

@@ -1954,6 +1954,7 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
             "plugin_release_id": "0.1.0",
             "pid": std::process::id(),
             "in_flight_count": 2,
+            "deferred_ingress_count": 3,
             "updated_at": Utc::now().to_rfc3339()
         }))
         .unwrap(),
@@ -2007,7 +2008,7 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
     .await
     .unwrap();
 
-    assert_eq!(sidecar_drain_in_flight_count(&config).await, 2);
+    assert_eq!(sidecar_drain_in_flight_count(&config).await, 5);
     assert!(
         !tokio::fs::try_exists(&stale_current_pid_path)
             .await
@@ -2077,6 +2078,27 @@ async fn sidecar_drain_requires_post_cutoff_inactive_observation() {
             "pid": std::process::id(),
             "in_flight_count": 0,
             "worker_inactive_observed_at": Utc.timestamp_millis_opt(1_700_000_000_124).unwrap().to_rfc3339(),
+            "deferred_ingress_count": 4,
+            "updated_at": Utc::now().to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sidecar_drain_in_flight_count_after(&config, Some(cutoff)).await,
+        4
+    );
+
+    tokio::fs::write(
+        &state_path,
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "pid": std::process::id(),
+            "in_flight_count": 0,
+            "worker_inactive_observed_at": Utc.timestamp_millis_opt(1_700_000_000_124).unwrap().to_rfc3339(),
+            "deferred_ingress_count": 0,
             "updated_at": Utc::now().to_rfc3339()
         }))
         .unwrap(),

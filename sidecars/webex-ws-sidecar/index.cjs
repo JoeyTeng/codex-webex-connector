@@ -63,21 +63,59 @@ function drainStateComponent(value) {
   return normalized.slice(0, 128) || "unknown";
 }
 
+async function deferredIngressCountForDrainState() {
+  if (!deferredIngressDir) {
+    return 0;
+  }
+  let entries;
+  try {
+    entries = await fs.readdir(deferredIngressDir);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return 0;
+    }
+    console.error("failed to read deferred Webex ingress dir for drain state", error);
+    return 1;
+  }
+
+  let count = 0;
+  for (const entry of entries.filter((name) => name.endsWith(".json"))) {
+    const recordPath = path.join(deferredIngressDir, entry);
+    let record;
+    try {
+      record = JSON.parse(await fs.readFile(recordPath, "utf8"));
+    } catch (error) {
+      console.error("failed to parse deferred Webex ingress for drain state", {
+        path: recordPath,
+        error,
+      });
+      count += 1;
+      continue;
+    }
+    if (deferredIngressRecordMatchesCurrentScope(record)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
 function queueSidecarDrainStateWrite() {
   if (!sidecarDrainStatePath) {
     return Promise.resolve();
   }
-  const snapshot = {
-    plugin_instance_id: pluginInstanceId,
-    plugin_release_id: pluginReleaseId,
-    pid: process.pid,
-    in_flight_count: sidecarInFlightCount,
-    worker_inactive_observed_at: workerInactiveObservedAt,
-    updated_at: new Date().toISOString(),
-  };
   sidecarDrainStateWrite = sidecarDrainStateWrite
     .catch(() => {})
     .then(async () => {
+      const deferredIngressCount = await deferredIngressCountForDrainState();
+      const snapshot = {
+        plugin_instance_id: pluginInstanceId,
+        plugin_release_id: pluginReleaseId,
+        pid: process.pid,
+        in_flight_count: sidecarInFlightCount,
+        deferred_ingress_count: deferredIngressCount,
+        worker_inactive_observed_at: workerInactiveObservedAt,
+        updated_at: new Date().toISOString(),
+      };
       await fs.mkdir(path.dirname(sidecarDrainStatePath), { recursive: true });
       await fs.writeFile(
         sidecarDrainStatePath,
@@ -339,6 +377,7 @@ async function replayDeferredIngress() {
         return SEND_DEFERRED;
       }
       await fs.rm(recordPath, { force: true });
+      await queueSidecarDrainStateWrite();
     }
   })();
   try {
