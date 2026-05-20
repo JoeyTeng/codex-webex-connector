@@ -151,6 +151,7 @@ pub enum WebexIngressEnvelope {
     AttachmentActionCreated(WebexAttachmentActionEvent),
     AsyncNotification(WebexAsyncNotificationEvent),
     HealthCheck,
+    ActiveCheck,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

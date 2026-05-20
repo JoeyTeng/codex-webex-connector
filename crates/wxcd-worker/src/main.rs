@@ -637,7 +637,9 @@ async fn run() -> Result<()> {
         state.rebuild_session_indexes();
     }
     let healthy = Arc::new(AtomicBool::new(false));
-    let lifecycle = Arc::new(LifecycleControl::new(initial_lifecycle_phase()));
+    let lifecycle = Arc::new(LifecycleControl::new(initial_lifecycle_phase(
+        &config.bridge.cbth_plugin,
+    )));
     let mut startup_reconcile_pending = lifecycle.phase() == LifecycleAdmissionPhase::Quiescing;
     if startup_reconcile_pending {
         info!("pre-active lifecycle mode enabled, deferring startup reconcile until unquiesce");
@@ -1022,7 +1024,7 @@ async fn handle_webex_ingress(
             enqueue_async_notification(delivery_broker, state, &notification).await?;
             state.remember_event(&notification.event_id);
         }
-        WebexIngressEnvelope::HealthCheck => {}
+        WebexIngressEnvelope::HealthCheck | WebexIngressEnvelope::ActiveCheck => {}
     }
 
     Ok(())
@@ -3033,13 +3035,20 @@ struct SupervisorShutdownMarker {
     created_at: String,
 }
 
-fn initial_lifecycle_phase() -> LifecycleAdmissionPhase {
-    match std::env::var("WXCD_CBTH_PRE_ACTIVE")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("1" | "true" | "yes" | "on") => LifecycleAdmissionPhase::Quiescing,
+fn initial_lifecycle_phase(config: &CbthPluginConfig) -> LifecycleAdmissionPhase {
+    initial_lifecycle_phase_from_env(
+        config.enabled,
+        std::env::var("WXCD_CBTH_PRE_ACTIVE").ok().as_deref(),
+    )
+}
+
+fn initial_lifecycle_phase_from_env(
+    plugin_enabled: bool,
+    pre_active_env: Option<&str>,
+) -> LifecycleAdmissionPhase {
+    let normalized = pre_active_env.map(|value| value.trim().to_ascii_lowercase());
+    match (plugin_enabled, normalized.as_deref()) {
+        (true, Some("1" | "true" | "yes" | "on")) => LifecycleAdmissionPhase::Quiescing,
         _ => LifecycleAdmissionPhase::Active,
     }
 }
@@ -3409,6 +3418,9 @@ async fn handle_ingress_connection(
             healthy: healthy.load(Ordering::Relaxed),
             detail: None,
         },
+        WebexIngressEnvelope::ActiveCheck => {
+            worker_active_check_ack(healthy.load(Ordering::Relaxed), lifecycle.phase())
+        }
         event if ingress_requires_processing_ack(&event) => {
             let work_permit = match lifecycle.try_begin_external_work() {
                 Ok(work_permit) => work_permit,
@@ -3496,6 +3508,37 @@ async fn handle_ingress_connection(
         }
     };
     write_ingress_ack(&mut writer, ack).await
+}
+
+fn worker_active_check_ack(
+    process_healthy: bool,
+    phase: LifecycleAdmissionPhase,
+) -> WebexIngressAck {
+    if !process_healthy {
+        return WebexIngressAck {
+            ok: false,
+            healthy: false,
+            detail: Some("worker has not completed startup health checks".to_string()),
+        };
+    }
+    if phase == LifecycleAdmissionPhase::Active {
+        return WebexIngressAck {
+            ok: true,
+            healthy: true,
+            detail: None,
+        };
+    }
+    WebexIngressAck {
+        ok: false,
+        healthy: true,
+        detail: Some(match phase {
+            LifecycleAdmissionPhase::Quiescing => {
+                "worker is quiescing and not accepting new Webex work".to_string()
+            }
+            LifecycleAdmissionPhase::ShuttingDown => "worker is shutting down".to_string(),
+            LifecycleAdmissionPhase::Active => unreachable!("active phase handled above"),
+        }),
+    }
 }
 
 async fn write_ingress_ack(

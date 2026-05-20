@@ -150,6 +150,30 @@ async function sendEnvelope(envelope) {
   }
 }
 
+async function waitForActiveWorker() {
+  let nextLogAt = 0;
+  for (;;) {
+    try {
+      await sendEnvelopeOnce({ kind: "active_check" });
+      return;
+    } catch (error) {
+      if (!error?.retryable || shuttingDown) {
+        throw error;
+      }
+      const now = Date.now();
+      if (now >= nextLogAt) {
+        console.error("worker is not active yet; delaying Webex listener startup", {
+          message: error.message,
+          code: error.code,
+          ack: error.ack,
+        });
+        nextLogAt = now + 10000;
+      }
+      await sleep(Number.isFinite(ingressRetryDelayMs) ? ingressRetryDelayMs : 1000);
+    }
+  }
+}
+
 function ingressEventId(payload) {
   return (
     payload?.id ||
@@ -234,6 +258,7 @@ async function forwardAttachmentAction(payload) {
 }
 
 async function main() {
+  await waitForActiveWorker();
   await webex.people.get("me");
   installMercuryWatchdog();
   await webex.messages.listen();

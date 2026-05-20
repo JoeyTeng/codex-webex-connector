@@ -8,17 +8,18 @@ use super::{
     durable_local_snapshot_path, ensure_approval_belongs_to_installation,
     ensure_failed_cleanup_target, ensure_session_id_belongs_to_installation,
     extract_thread_history_turns, generate_installation_id, handle_lifecycle_command,
-    ingress_requires_processing_ack, ingress_uses_delivery_enqueue, is_control_list_session,
-    is_default_list_session, is_failed_session_room_command,
-    lifecycle_control_socket_path_from_env, load_durable_local_snapshot_with_metadata,
-    load_local_snapshot_with_metadata, load_or_create_installation_identity,
-    normalize_control_command_text, normalize_session_command_text, parse_attach_session_id,
-    parse_cleanup_failed_command, parse_diagnose_command, parse_list_command,
-    parse_purge_archived_command, parse_resume_local_thread_id, parse_session_history_page,
-    repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
-    session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
+    ingress_requires_processing_ack, ingress_uses_delivery_enqueue,
+    initial_lifecycle_phase_from_env, is_control_list_session, is_default_list_session,
+    is_failed_session_room_command, lifecycle_control_socket_path_from_env,
+    load_durable_local_snapshot_with_metadata, load_local_snapshot_with_metadata,
+    load_or_create_installation_identity, normalize_control_command_text,
+    normalize_session_command_text, parse_attach_session_id, parse_cleanup_failed_command,
+    parse_diagnose_command, parse_list_command, parse_purge_archived_command,
+    parse_resume_local_thread_id, parse_session_history_page, repo_name_for_cwd,
+    resolve_codex_connection, resolve_delivery_broker_connection, session_belongs_to_installation,
+    session_requires_codex_archive, sessions_for_diagnostics,
     should_process_async_notification_event, slice_thread_history_page,
-    validate_purge_archived_session, webex_delivery_idempotency_key,
+    validate_purge_archived_session, webex_delivery_idempotency_key, worker_active_check_ack,
     write_supervisor_shutdown_marker_at,
 };
 use chrono::{Duration, Utc};
@@ -1750,6 +1751,44 @@ fn pre_active_health_requires_quiesced_admission_fence() {
     assert!(!quiesced.health_check(&active_request, true).healthy);
     assert!(!shutting_down.health_check(&request, true).healthy);
     assert!(!shutting_down.health_check(&active_request, true).healthy);
+}
+
+#[test]
+fn pre_active_startup_is_plugin_mode_only() {
+    assert_eq!(
+        initial_lifecycle_phase_from_env(true, Some("1")),
+        LifecycleAdmissionPhase::Quiescing
+    );
+    assert_eq!(
+        initial_lifecycle_phase_from_env(true, Some("true")),
+        LifecycleAdmissionPhase::Quiescing
+    );
+    assert_eq!(
+        initial_lifecycle_phase_from_env(false, Some("1")),
+        LifecycleAdmissionPhase::Active
+    );
+    assert_eq!(
+        initial_lifecycle_phase_from_env(true, None),
+        LifecycleAdmissionPhase::Active
+    );
+}
+
+#[test]
+fn sidecar_active_check_waits_for_unquiesce() {
+    let quiesced = worker_active_check_ack(true, LifecycleAdmissionPhase::Quiescing);
+    assert!(!quiesced.ok);
+    assert!(quiesced.healthy);
+    assert!(
+        quiesced
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("not accepting new Webex work"))
+    );
+
+    let active = worker_active_check_ack(true, LifecycleAdmissionPhase::Active);
+    assert!(active.ok);
+    assert!(active.healthy);
+    assert!(active.detail.is_none());
 }
 
 #[test]
