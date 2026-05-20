@@ -9,10 +9,11 @@ use super::{
     abbreviate, apply_thread_probe, attached_session_for_thread,
     build_async_notification_delivery_request, durable_local_snapshot_path,
     ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
-    ensure_session_id_belongs_to_installation, extract_thread_history_turns,
-    generate_installation_id, handle_lifecycle_command, ingress_requires_processing_ack,
-    ingress_uses_delivery_enqueue, initial_lifecycle_phase_from_env, is_control_list_session,
-    is_default_list_session, is_failed_session_room_command, lifecycle_command_response,
+    ensure_session_id_belongs_to_installation, export_handoff_snapshot,
+    extract_thread_history_turns, generate_installation_id, handle_lifecycle_command,
+    import_handoff_snapshot, ingress_requires_processing_ack, ingress_uses_delivery_enqueue,
+    initial_lifecycle_phase_from_env, is_control_list_session, is_default_list_session,
+    is_failed_session_room_command, lifecycle_accepts_handoff_import, lifecycle_command_response,
     lifecycle_control_socket_path_from_env, lifecycle_runtime_in_flight_total,
     lifecycle_sidecar_in_flight_count, load_durable_local_snapshot_with_metadata,
     load_local_snapshot_with_metadata, load_or_create_installation_identity,
@@ -36,8 +37,8 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wxcd_cbth_rpc::{
-    PluginDrainRequest, PluginHealthCheckRequest, PluginRpcError, PluginRpcErrorKind,
-    PluginShutdownRequest,
+    PluginDrainRequest, PluginHandoffSnapshot, PluginHealthCheckRequest, PluginRpcError,
+    PluginRpcErrorKind, PluginShutdownRequest,
 };
 use wxcd_proto::{
     AppConfig, BridgeConfig, BridgeSnapshot, CbthPluginConfig, DiagnosticsConfig,
@@ -1728,6 +1729,319 @@ async fn lifecycle_drain_persists_plugin_home_snapshot_before_reporting_complete
         Some("ins_current")
     );
     tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn handoff_export_includes_cursor_in_flight_and_sidecar_restart_state() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-export-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let config = app_config_with_state_dir(&state_dir, true);
+    let plugin_home = config.bridge.cbth_plugin.plugin_home.clone();
+    let deferred_ingress_dir = plugin_home.join(SIDECAR_DEFERRED_INGRESS_DIR);
+    let drain_state_dir = plugin_home.join(SIDECAR_DRAIN_STATE_DIR);
+    tokio::fs::create_dir_all(&deferred_ingress_dir)
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(&drain_state_dir).await.unwrap();
+    tokio::fs::write(
+        deferred_ingress_dir.join("event-current.json"),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "event_id": "event-current",
+            "envelope": {
+                "kind": "message_created",
+                "event_id": "event-current"
+            }
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        deferred_ingress_dir.join("foreign.json"),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-other",
+            "plugin_release_id": "0.1.0",
+            "event_id": "event-foreign"
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        drain_state_dir.join(format!(
+            "{}current.json",
+            sidecar_drain_state_file_prefix(&config)
+        )),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "pid": std::process::id(),
+            "in_flight_count": 0,
+            "updated_at": Utc::now().to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut state = WorkerState::default();
+    state.set_executable_installation("ins_current");
+    let mut running =
+        managed_session_record("ses_running", SessionState::Running, false, "ins_current");
+    running.active_turn_id = Some("turn_running".to_string());
+    running.active_turn_buffer = "partial output".to_string();
+    state.upsert_session(running);
+    state.pending_approvals.insert(
+        "apr_running".to_string(),
+        pending_approval("apr_running", "ses_running"),
+    );
+    assert!(state.remember_event("event-current"));
+
+    let response = export_handoff_snapshot(&config, &state).await.unwrap();
+    let payload: super::WebexHandoffPayload =
+        serde_json::from_value(response.snapshot.payload).unwrap();
+
+    assert_eq!(response.snapshot.schema_version, 1);
+    assert_eq!(payload.source_plugin_release_id, "0.1.0");
+    assert_eq!(
+        payload
+            .durable_bridge_snapshot
+            .writer_installation_id
+            .as_deref(),
+        Some("ins_current")
+    );
+    assert_eq!(payload.recent_webex_event_ids, vec!["event-current"]);
+    assert_eq!(payload.in_flight.sessions.len(), 1);
+    assert_eq!(
+        payload.in_flight.sessions[0].active_turn_id.as_deref(),
+        Some("turn_running")
+    );
+    assert_eq!(
+        payload.in_flight.sessions[0].pending_approval_ids,
+        vec!["apr_running"]
+    );
+    assert_eq!(payload.sidecar.deferred_ingress_records.len(), 1);
+    assert_eq!(payload.sidecar.drain_state_records.len(), 1);
+    assert!(
+        tokio::fs::try_exists(plugin_home.join("webex-handoff-state.json"))
+            .await
+            .unwrap()
+    );
+
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn handoff_import_applies_snapshot_cursor_and_deferred_ingress_without_external_io() {
+    let source_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-import-source-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let target_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-import-target-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let source_config = app_config_with_state_dir(&source_dir, true);
+    let mut target_config = app_config_with_state_dir(&target_dir, true);
+    target_config.bridge.cbth_plugin.plugin_release_id = "0.2.0".to_string();
+    let deferred_ingress_dir = source_config
+        .bridge
+        .cbth_plugin
+        .plugin_home
+        .join(SIDECAR_DEFERRED_INGRESS_DIR);
+    tokio::fs::create_dir_all(&deferred_ingress_dir)
+        .await
+        .unwrap();
+    tokio::fs::write(
+        deferred_ingress_dir.join("event-import.json"),
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "event_id": "event-import",
+            "envelope": {
+                "kind": "message_created",
+                "event_id": "event-import"
+            }
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut source_state = WorkerState::default();
+    source_state.set_executable_installation("ins_current");
+    let mut running =
+        managed_session_record("ses_running", SessionState::Running, false, "ins_current");
+    running.active_turn_id = Some("turn_running".to_string());
+    running.active_turn_buffer = "partial output".to_string();
+    source_state.upsert_session(running);
+    source_state.pending_approvals.insert(
+        "apr_running".to_string(),
+        pending_approval("apr_running", "ses_running"),
+    );
+    assert!(source_state.remember_event("event-import"));
+    let snapshot = export_handoff_snapshot(&source_config, &source_state)
+        .await
+        .unwrap()
+        .snapshot;
+
+    let mut target_state = WorkerState::default();
+    target_state.set_executable_installation("ins_current");
+    target_state.upsert_session(managed_session_record(
+        "ses_running",
+        SessionState::Idle,
+        false,
+        "ins_current",
+    ));
+
+    let ack = import_handoff_snapshot(&target_config, &mut target_state, snapshot)
+        .await
+        .unwrap();
+
+    assert!(ack.accepted);
+    let imported = target_state.sessions.get("ses_running").unwrap();
+    assert_eq!(imported.state, SessionState::Running);
+    assert_eq!(imported.active_turn_id.as_deref(), Some("turn_running"));
+    assert_eq!(imported.active_turn_buffer, "partial output");
+    assert!(target_state.recent_event_ids.contains("event-import"));
+    assert!(target_state.pending_approvals.contains_key("apr_running"));
+    let target_deferred_dir = target_config
+        .bridge
+        .cbth_plugin
+        .plugin_home
+        .join(SIDECAR_DEFERRED_INGRESS_DIR);
+    let mut deferred_entries = tokio::fs::read_dir(&target_deferred_dir).await.unwrap();
+    assert!(deferred_entries.next_entry().await.unwrap().is_some());
+    assert!(
+        tokio::fs::try_exists(
+            target_config
+                .bridge
+                .cbth_plugin
+                .plugin_home
+                .join("bridge-state.json")
+        )
+        .await
+        .unwrap()
+    );
+
+    tokio::fs::remove_dir_all(&source_dir).await.unwrap();
+    tokio::fs::remove_dir_all(&target_dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn handoff_import_does_not_claim_unowned_legacy_session() {
+    let source_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-legacy-source-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let target_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-handoff-legacy-target-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let source_config = app_config_with_state_dir(&source_dir, true);
+    let mut target_config = app_config_with_state_dir(&target_dir, true);
+    target_config.bridge.cbth_plugin.plugin_release_id = "0.2.0".to_string();
+
+    let mut source_state = WorkerState::default();
+    source_state.set_executable_installation("ins_current");
+    source_state.upsert_session(session_record("ses_legacy", SessionState::Idle, false));
+    let snapshot = export_handoff_snapshot(&source_config, &source_state)
+        .await
+        .unwrap()
+        .snapshot;
+
+    let mut target_state = WorkerState::default();
+    target_state.set_executable_installation("ins_current");
+
+    let ack = import_handoff_snapshot(&target_config, &mut target_state, snapshot)
+        .await
+        .unwrap();
+
+    assert!(ack.accepted);
+    assert!(!target_state.sessions.contains_key("ses_legacy"));
+    assert!(!target_state.room_to_session.contains_key("room-ses_legacy"));
+    assert!(
+        !target_state
+            .thread_to_session
+            .contains_key("thread-ses_legacy")
+    );
+
+    tokio::fs::remove_dir_all(&source_dir).await.unwrap();
+    tokio::fs::remove_dir_all(&target_dir).await.unwrap();
+}
+
+#[test]
+fn handoff_import_rejects_foreign_plugin_instance() {
+    let mut config = app_config_with_plugin(true);
+    config.bridge.cbth_plugin.plugin_instance_id = "instance-current".to_string();
+    let mut state = WorkerState::default();
+    state.set_executable_installation("ins_current");
+    let snapshot = PluginHandoffSnapshot {
+        schema_version: 1,
+        payload: json!({
+            "plugin_name": "webex-connector",
+            "exported_at": Utc::now(),
+            "source_plugin_instance_id": "instance-other",
+            "source_plugin_release_id": "0.1.0",
+            "durable_bridge_snapshot": {
+                "created_at": Utc::now(),
+                "writer_installation_id": "ins_current",
+                "sessions": [],
+                "pending_approvals": []
+            },
+            "recent_webex_event_ids": [],
+            "in_flight": {
+                "sessions": [],
+                "pending_approval_count": 0
+            },
+            "sidecar": {
+                "deferred_ingress_records": [],
+                "drain_state_records": []
+            }
+        }),
+    };
+
+    let error = super::validate_webex_handoff_payload(
+        &config,
+        &state,
+        &super::decode_webex_handoff_payload(snapshot).unwrap(),
+    )
+    .expect_err("foreign plugin instance should be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not match current `instance-current`"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn handoff_import_requires_pre_active_quiescing_phase() {
+    assert!(lifecycle_accepts_handoff_import(
+        true,
+        LifecycleAdmissionPhase::Quiescing
+    ));
+    assert!(!lifecycle_accepts_handoff_import(
+        false,
+        LifecycleAdmissionPhase::Quiescing
+    ));
+    assert!(!lifecycle_accepts_handoff_import(
+        true,
+        LifecycleAdmissionPhase::Active
+    ));
+    assert!(!lifecycle_accepts_handoff_import(
+        true,
+        LifecycleAdmissionPhase::Activating
+    ));
+    assert!(!lifecycle_accepts_handoff_import(
+        true,
+        LifecycleAdmissionPhase::ShuttingDown
+    ));
 }
 
 #[test]
