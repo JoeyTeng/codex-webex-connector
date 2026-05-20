@@ -77,6 +77,7 @@ const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SO
 const WXCD_CBTH_LIFECYCLE_SOCKET_ENV: &str = "WXCD_CBTH_LIFECYCLE_SOCKET";
 const WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV: &str = "WXCD_SUPERVISOR_SHUTDOWN_MARKER";
 const SIDECAR_DRAIN_STATE_DIR: &str = "webex-sidecar-drain-state";
+const SIDECAR_DRAIN_STATE_STALE_AFTER: Duration = Duration::from_secs(120);
 const WEBEX_DELIVERY_MAX_ATTEMPTS: i64 = 3;
 const WEBEX_DELIVERY_REDELIVERY_WINDOW_SECONDS: i64 = 3600;
 
@@ -3338,6 +3339,16 @@ async fn sidecar_drain_in_flight_count_after(
         if state.plugin_instance_id == config.bridge.cbth_plugin.plugin_instance_id
             && state.plugin_release_id == config.bridge.cbth_plugin.plugin_release_id
         {
+            if !sidecar_drain_state_is_fresh(&state, Utc::now()) {
+                warn!(
+                    "ignoring stale sidecar drain state {} updated_at={} pid={:?}",
+                    path.display(),
+                    state.updated_at,
+                    state.pid
+                );
+                remove_sidecar_drain_state_file(&path).await;
+                continue;
+            }
             if let Some(pid) = state.pid
                 && !process_is_alive(pid)
             {
@@ -3406,12 +3417,20 @@ struct SidecarDrainState {
     in_flight_count: u64,
     #[serde(default)]
     worker_inactive_observed_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
 }
 
 impl SidecarDrainState {
     fn sidecar_observed_inactive_after(&self, cutoff: DateTime<Utc>) -> bool {
         self.worker_inactive_observed_at
             .is_some_and(|observed_at| observed_at.timestamp_millis() > cutoff.timestamp_millis())
+    }
+}
+
+fn sidecar_drain_state_is_fresh(state: &SidecarDrainState, now: DateTime<Utc>) -> bool {
+    match now.signed_duration_since(state.updated_at).to_std() {
+        Ok(age) => age <= SIDECAR_DRAIN_STATE_STALE_AFTER,
+        Err(_) => true,
     }
 }
 

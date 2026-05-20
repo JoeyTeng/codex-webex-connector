@@ -19,9 +19,10 @@ const token = process.env.WEBEX_BOT_TOKEN;
 const socketPath = process.env.WXCD_SOCKET_PATH || "/tmp/wxcd.sock";
 const botEmail = (process.env.WEBEX_BOT_EMAIL || "").toLowerCase();
 const ingressRetryDelayMs = Number.parseInt(process.env.WXCD_INGRESS_RETRY_DELAY_MS || "1000", 10);
-const pluginHome = process.env.CBTH_PLUGIN_HOME || process.env.WXCD_PLUGIN_HOME || "";
+const sidecarDrainStateHeartbeatMs = 30000;
+const pluginHome = process.env.WXCD_PLUGIN_HOME || process.env.CBTH_PLUGIN_HOME || "";
 const pluginInstanceId = process.env.WXCD_PLUGIN_INSTANCE_ID || "standalone";
-const pluginReleaseId = process.env.CBTH_PLUGIN_RELEASE_ID || process.env.WXCD_PLUGIN_RELEASE_ID || "unknown";
+const pluginReleaseId = process.env.WXCD_PLUGIN_RELEASE_ID || process.env.CBTH_PLUGIN_RELEASE_ID || "unknown";
 const deferredIngressDir = pluginHome ? path.join(pluginHome, "webex-sidecar-deferred-ingress") : "";
 const sidecarDrainStatePath = pluginHome
   ? path.join(
@@ -48,6 +49,7 @@ let messagesListenerActive = false;
 let attachmentActionsListenerActive = false;
 let sidecarInFlightCount = 0;
 let sidecarDrainStateWrite = Promise.resolve();
+let sidecarDrainStateHeartbeat = null;
 let replayDeferredIngressTask = null;
 let workerInactiveObservedAt = null;
 const SEND_DEFERRED = "deferred";
@@ -84,6 +86,28 @@ function queueSidecarDrainStateWrite() {
       );
     });
   return sidecarDrainStateWrite;
+}
+
+function startSidecarDrainStateHeartbeat() {
+  if (!sidecarDrainStatePath || sidecarDrainStateHeartbeat) {
+    return;
+  }
+  sidecarDrainStateHeartbeat = setInterval(() => {
+    queueSidecarDrainStateWrite().catch((error) => {
+      console.error("failed to persist sidecar drain state heartbeat", error);
+    });
+  }, sidecarDrainStateHeartbeatMs);
+  if (typeof sidecarDrainStateHeartbeat.unref === "function") {
+    sidecarDrainStateHeartbeat.unref();
+  }
+}
+
+function stopSidecarDrainStateHeartbeat() {
+  if (!sidecarDrainStateHeartbeat) {
+    return;
+  }
+  clearInterval(sidecarDrainStateHeartbeat);
+  sidecarDrainStateHeartbeat = null;
 }
 
 async function clearSidecarDrainState() {
@@ -236,6 +260,13 @@ function replayRecordSortTime(record) {
   return 0;
 }
 
+function deferredIngressRecordMatchesCurrentScope(record) {
+  return (
+    record?.plugin_instance_id === pluginInstanceId &&
+    record?.plugin_release_id === pluginReleaseId
+  );
+}
+
 async function replayDeferredIngress() {
   if (!deferredIngressDir) {
     return;
@@ -264,6 +295,16 @@ async function replayDeferredIngress() {
         console.error("failed to parse deferred Webex ingress; leaving record for inspection", {
           path: recordPath,
           error,
+        });
+        continue;
+      }
+      if (!deferredIngressRecordMatchesCurrentScope(record)) {
+        console.error("skipping deferred Webex ingress from a different plugin scope", {
+          path: recordPath,
+          plugin_instance_id: record?.plugin_instance_id,
+          plugin_release_id: record?.plugin_release_id,
+          current_plugin_instance_id: pluginInstanceId,
+          current_plugin_release_id: pluginReleaseId,
         });
         continue;
       }
@@ -638,6 +679,7 @@ async function forwardAttachmentAction(payload) {
 }
 
 async function main() {
+  startSidecarDrainStateHeartbeat();
   await queueSidecarDrainStateWrite();
   for (;;) {
     await waitForActiveWorker();
@@ -675,6 +717,7 @@ async function main() {
 
 async function shutdown() {
   shuttingDown = true;
+  stopSidecarDrainStateHeartbeat();
   try {
     await stopWebexListeners();
   } catch (error) {

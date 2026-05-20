@@ -1979,6 +1979,20 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
     )
     .await
     .unwrap();
+    let stale_current_pid_path = drain_state_dir.join("instance-1--0.1.0--stale-current-pid.json");
+    tokio::fs::write(
+        &stale_current_pid_path,
+        serde_json::to_vec(&json!({
+            "plugin_instance_id": "instance-1",
+            "plugin_release_id": "0.1.0",
+            "pid": std::process::id(),
+            "in_flight_count": 11,
+            "updated_at": (Utc::now() - Duration::seconds(121)).to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
     tokio::fs::write(
         drain_state_dir.join("instance-1--0.1.0--2147483647.json"),
         serde_json::to_vec(&json!({
@@ -1994,6 +2008,11 @@ async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
     .unwrap();
 
     assert_eq!(sidecar_drain_in_flight_count(&config).await, 2);
+    assert!(
+        !tokio::fs::try_exists(&stale_current_pid_path)
+            .await
+            .unwrap()
+    );
 
     config.bridge.cbth_plugin.enabled = false;
     assert_eq!(sidecar_drain_in_flight_count(&config).await, 0);
