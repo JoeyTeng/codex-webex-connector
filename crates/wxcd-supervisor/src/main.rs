@@ -76,7 +76,15 @@ async fn run_supervisor() -> Result<()> {
     loop {
         let release_dir = current_release_dir(&config)?;
         let shutdown_marker_path = supervisor_shutdown_marker_path(&config.bridge.cbth_plugin);
-        clear_supervisor_shutdown_marker(&shutdown_marker_path).await?;
+        if consume_current_supervisor_shutdown_marker(
+            &config.bridge.cbth_plugin,
+            &shutdown_marker_path,
+        )
+        .await?
+        {
+            info!("honoring existing worker-requested supervisor shutdown marker");
+            return Ok(());
+        }
         let worker_path = release_dir.join("bin").join("wxcd-worker");
         let sidecar_path = release_dir
             .join("sidecars")
@@ -137,6 +145,7 @@ async fn run_supervisor() -> Result<()> {
         let mut sidecar = match Command::new(&node_path)
             .arg(&sidecar_path)
             .env("WXCD_SOCKET_PATH", &config.bridge.socket_path)
+            .env("WXCD_PLUGIN_HOME", &config.bridge.cbth_plugin.plugin_home)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
@@ -255,7 +264,9 @@ async fn run_supervisor() -> Result<()> {
         {
             broker.shutdown().await;
         }
-        if supervisor_shutdown_was_requested(&shutdown_marker_path).await? {
+        if supervisor_shutdown_was_requested(&config.bridge.cbth_plugin, &shutdown_marker_path)
+            .await?
+        {
             info!("worker requested supervisor shutdown for lifecycle transition");
             return Ok(());
         }
@@ -1027,15 +1038,68 @@ async fn clear_supervisor_shutdown_marker(path: &Path) -> Result<()> {
     }
 }
 
-async fn supervisor_shutdown_was_requested(path: &Path) -> Result<bool> {
-    if !tokio::fs::try_exists(path)
-        .await
-        .with_context(|| format!("failed to inspect {}", path.display()))?
-    {
-        return Ok(false);
-    }
+#[derive(Debug)]
+struct SupervisorShutdownMarker {
+    plugin_instance_id: String,
+    plugin_release_id: String,
+}
+
+async fn supervisor_shutdown_was_requested(config: &CbthPluginConfig, path: &Path) -> Result<bool> {
+    consume_current_supervisor_shutdown_marker(config, path).await
+}
+
+async fn consume_current_supervisor_shutdown_marker(
+    config: &CbthPluginConfig,
+    path: &Path,
+) -> Result<bool> {
+    let contents = match tokio::fs::read(path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let marker = match decode_supervisor_shutdown_marker(&contents) {
+        Ok(marker) => marker,
+        Err(error) => {
+            warn!(
+                "clearing unreadable supervisor shutdown marker {}: {error:#}",
+                path.display()
+            );
+            clear_supervisor_shutdown_marker(path).await?;
+            return Ok(false);
+        }
+    };
     clear_supervisor_shutdown_marker(path).await?;
-    Ok(true)
+    if marker.plugin_instance_id == config.plugin_instance_id
+        && marker.plugin_release_id == config.plugin_release_id
+    {
+        return Ok(true);
+    }
+    warn!(
+        "clearing stale supervisor shutdown marker for instance={} release={}",
+        marker.plugin_instance_id, marker.plugin_release_id
+    );
+    Ok(false)
+}
+
+fn decode_supervisor_shutdown_marker(contents: &[u8]) -> Result<SupervisorShutdownMarker> {
+    let value: serde_json::Value =
+        serde_json::from_slice(contents).context("failed to decode marker JSON")?;
+    let plugin_instance_id = value
+        .get("plugin_instance_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("shutdown marker missing plugin_instance_id"))?
+        .to_string();
+    let plugin_release_id = value
+        .get("plugin_release_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("shutdown marker missing plugin_release_id"))?
+        .to_string();
+    Ok(SupervisorShutdownMarker {
+        plugin_instance_id,
+        plugin_release_id,
+    })
 }
 
 async fn activate_release(release_dir: PathBuf) -> Result<()> {
@@ -1362,6 +1426,82 @@ mod tests {
             supervisor_shutdown_marker_path(&config),
             PathBuf::from("/tmp/plugin-home").join(SUPERVISOR_SHUTDOWN_MARKER_FILE)
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_honors_current_shutdown_marker_on_startup() {
+        let plugin_home = std::env::temp_dir().join(format!(
+            "wxcd-supervisor-shutdown-marker-test-{}",
+            current_unix_nanos().unwrap()
+        ));
+        tokio::fs::create_dir_all(&plugin_home).await.unwrap();
+        let config = CbthPluginConfig {
+            enabled: true,
+            socket_path: Some("/tmp/cbth.sock".into()),
+            plugin_home: plugin_home.clone(),
+            plugin_instance_id: "instance-1".to_string(),
+            plugin_release_id: "release-1".to_string(),
+            manifest_path: "/tmp/plugin/manifest.json".into(),
+        };
+        let marker_path = supervisor_shutdown_marker_path(&config);
+        tokio::fs::write(
+            &marker_path,
+            serde_json::json!({
+                "plugin_instance_id": "instance-1",
+                "plugin_release_id": "release-1",
+                "reason": "upgrade",
+                "created_at": "2026-05-20T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            consume_current_supervisor_shutdown_marker(&config, &marker_path)
+                .await
+                .unwrap()
+        );
+        assert!(!tokio::fs::try_exists(&marker_path).await.unwrap());
+        tokio::fs::remove_dir_all(&plugin_home).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervisor_clears_stale_shutdown_marker_on_startup() {
+        let plugin_home = std::env::temp_dir().join(format!(
+            "wxcd-supervisor-stale-shutdown-marker-test-{}",
+            current_unix_nanos().unwrap()
+        ));
+        tokio::fs::create_dir_all(&plugin_home).await.unwrap();
+        let config = CbthPluginConfig {
+            enabled: true,
+            socket_path: Some("/tmp/cbth.sock".into()),
+            plugin_home: plugin_home.clone(),
+            plugin_instance_id: "instance-1".to_string(),
+            plugin_release_id: "release-1".to_string(),
+            manifest_path: "/tmp/plugin/manifest.json".into(),
+        };
+        let marker_path = supervisor_shutdown_marker_path(&config);
+        tokio::fs::write(
+            &marker_path,
+            serde_json::json!({
+                "plugin_instance_id": "instance-1",
+                "plugin_release_id": "old-release",
+                "reason": "upgrade",
+                "created_at": "2026-05-20T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !consume_current_supervisor_shutdown_marker(&config, &marker_path)
+                .await
+                .unwrap()
+        );
+        assert!(!tokio::fs::try_exists(&marker_path).await.unwrap());
+        tokio::fs::remove_dir_all(&plugin_home).await.unwrap();
     }
 
     fn broker_delivery_request(target: PluginDeliveryTarget) -> PluginDeliveryEnqueueRequest {

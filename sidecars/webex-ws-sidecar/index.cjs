@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
+const fs = require("node:fs/promises");
 const net = require("node:net");
+const path = require("node:path");
 const process = require("node:process");
 
 require("@webex/internal-plugin-device");
@@ -16,6 +18,10 @@ const token = process.env.WEBEX_BOT_TOKEN;
 const socketPath = process.env.WXCD_SOCKET_PATH || "/tmp/wxcd.sock";
 const botEmail = (process.env.WEBEX_BOT_EMAIL || "").toLowerCase();
 const ingressRetryDelayMs = Number.parseInt(process.env.WXCD_INGRESS_RETRY_DELAY_MS || "1000", 10);
+const pluginHome = process.env.CBTH_PLUGIN_HOME || process.env.WXCD_PLUGIN_HOME || "";
+const sidecarDrainStatePath = pluginHome
+  ? path.join(pluginHome, "webex-sidecar-drain-state.json")
+  : "";
 
 if (!token) {
   throw new Error("WEBEX_BOT_TOKEN is required");
@@ -30,9 +36,47 @@ const webex = new WebexCore({
 let exitingForRestart = false;
 let shuttingDown = false;
 let listenersActive = false;
+let sidecarInFlightCount = 0;
+let sidecarDrainStateWrite = Promise.resolve();
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function queueSidecarDrainStateWrite() {
+  if (!sidecarDrainStatePath) {
+    return Promise.resolve();
+  }
+  const snapshot = {
+    pid: process.pid,
+    in_flight_count: sidecarInFlightCount,
+    updated_at: new Date().toISOString(),
+  };
+  sidecarDrainStateWrite = sidecarDrainStateWrite
+    .catch(() => {})
+    .then(async () => {
+      await fs.mkdir(path.dirname(sidecarDrainStatePath), { recursive: true });
+      await fs.writeFile(
+        sidecarDrainStatePath,
+        `${JSON.stringify(snapshot, null, 2)}\n`,
+        "utf8"
+      );
+    })
+    .catch((error) => {
+      console.error("failed to persist sidecar drain state", error);
+    });
+  return sidecarDrainStateWrite;
+}
+
+async function withSidecarDrainTracking(callback) {
+  sidecarInFlightCount += 1;
+  await queueSidecarDrainStateWrite();
+  try {
+    return await callback();
+  } finally {
+    sidecarInFlightCount = Math.max(0, sidecarInFlightCount - 1);
+    await queueSidecarDrainStateWrite();
+  }
 }
 
 async function fetchJson(url) {
@@ -146,6 +190,7 @@ async function sendEnvelope(envelope, options = {}) {
         });
         nextLogAt = now + 10000;
       }
+      await queueSidecarDrainStateWrite();
       await sleep(Number.isFinite(ingressRetryDelayMs) ? ingressRetryDelayMs : 1000);
     }
   }
@@ -289,53 +334,58 @@ function installMercuryWatchdog() {
 }
 
 async function forwardMessage(payload) {
-  const message = await fetchJson(`https://webexapis.com/v1/messages/${payload.data.id}`);
-  const personEmail = (message.personEmail || payload.data.personEmail || "").toLowerCase();
-  if (!message.text || personEmail === botEmail) {
-    return;
-  }
-  await sendEnvelope(
-    {
-      kind: "message_created",
-      event_id: ingressEventId(payload),
-      room_id: message.roomId,
-      message_id: message.id,
-      person_email: personEmail,
-      text: message.text,
-      created: message.created || new Date().toISOString(),
-    },
-    {
-      retryLifecycleRejection: true,
-      retryUnavailable: true,
+  await withSidecarDrainTracking(async () => {
+    const message = await fetchJson(`https://webexapis.com/v1/messages/${payload.data.id}`);
+    const personEmail = (message.personEmail || payload.data.personEmail || "").toLowerCase();
+    if (!message.text || personEmail === botEmail) {
+      return;
     }
-  );
+    await sendEnvelope(
+      {
+        kind: "message_created",
+        event_id: ingressEventId(payload),
+        room_id: message.roomId,
+        message_id: message.id,
+        person_email: personEmail,
+        text: message.text,
+        created: message.created || new Date().toISOString(),
+      },
+      {
+        retryLifecycleRejection: true,
+        retryUnavailable: true,
+      }
+    );
+  });
 }
 
 async function forwardAttachmentAction(payload) {
-  const action = await fetchJson(`https://webexapis.com/v1/attachment/actions/${payload.data.id}`);
-  const personEmail = (action.personEmail || payload.data.personEmail || "").toLowerCase();
-  if (personEmail === botEmail) {
-    return;
-  }
-  await sendEnvelope(
-    {
-      kind: "attachment_action_created",
-      event_id: ingressEventId(payload),
-      room_id: action.roomId,
-      attachment_action_id: action.id,
-      person_email: personEmail,
-      message_id: action.messageId || null,
-      inputs: action.inputs || {},
-      created: action.created || new Date().toISOString(),
-    },
-    {
-      retryLifecycleRejection: true,
-      retryUnavailable: true,
+  await withSidecarDrainTracking(async () => {
+    const action = await fetchJson(`https://webexapis.com/v1/attachment/actions/${payload.data.id}`);
+    const personEmail = (action.personEmail || payload.data.personEmail || "").toLowerCase();
+    if (personEmail === botEmail) {
+      return;
     }
-  );
+    await sendEnvelope(
+      {
+        kind: "attachment_action_created",
+        event_id: ingressEventId(payload),
+        room_id: action.roomId,
+        attachment_action_id: action.id,
+        person_email: personEmail,
+        message_id: action.messageId || null,
+        inputs: action.inputs || {},
+        created: action.created || new Date().toISOString(),
+      },
+      {
+        retryLifecycleRejection: true,
+        retryUnavailable: true,
+      }
+    );
+  });
 }
 
 async function main() {
+  await queueSidecarDrainStateWrite();
   await waitForActiveWorker();
   await webex.people.get("me");
   installMercuryWatchdog();

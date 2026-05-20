@@ -3,14 +3,15 @@ use super::{
     CleanupFailedCommand, CodexConnectionConfig, DiagnoseCommand, LifecycleAdmissionPhase,
     LifecycleCommand, LifecycleCommandResponse, LifecycleControl, ListCommand, ListMode,
     LocalMirrorClaimScope, PLUGIN_DELIVERY_BROKER_REQUEST_TIMEOUT, PurgeArchivedCommand,
-    QueuedLifecycleCommand, RECENT_EVENT_ID_LIMIT, ThreadProbe, ThreadProbeKind, WorkerQueueItem,
-    WorkerState, abbreviate, apply_thread_probe, attached_session_for_thread,
-    build_async_notification_delivery_request, durable_local_snapshot_path,
-    ensure_approval_belongs_to_installation, ensure_failed_cleanup_target,
-    ensure_session_id_belongs_to_installation, extract_thread_history_turns,
-    generate_installation_id, handle_lifecycle_command, ingress_requires_processing_ack,
-    ingress_uses_delivery_enqueue, initial_lifecycle_phase_from_env, is_control_list_session,
-    is_default_list_session, is_failed_session_room_command, lifecycle_command_response,
+    QueuedLifecycleCommand, RECENT_EVENT_ID_LIMIT, SIDECAR_DRAIN_STATE_FILE, ThreadProbe,
+    ThreadProbeKind, WorkerQueueItem, WorkerState, abbreviate, apply_thread_probe,
+    attached_session_for_thread, build_async_notification_delivery_request,
+    durable_local_snapshot_path, ensure_approval_belongs_to_installation,
+    ensure_failed_cleanup_target, ensure_session_id_belongs_to_installation,
+    extract_thread_history_turns, generate_installation_id, handle_lifecycle_command,
+    ingress_requires_processing_ack, ingress_uses_delivery_enqueue,
+    initial_lifecycle_phase_from_env, is_control_list_session, is_default_list_session,
+    is_failed_session_room_command, lifecycle_command_response,
     lifecycle_control_socket_path_from_env, lifecycle_runtime_in_flight_total,
     load_durable_local_snapshot_with_metadata, load_local_snapshot_with_metadata,
     load_or_create_installation_identity, normalize_control_command_text,
@@ -19,8 +20,8 @@ use super::{
     parse_resume_local_thread_id, parse_session_history_page, remove_stale_lifecycle_socket,
     repo_name_for_cwd, resolve_codex_connection, resolve_delivery_broker_connection,
     session_belongs_to_installation, session_requires_codex_archive, sessions_for_diagnostics,
-    should_process_async_notification_event, slice_thread_history_page,
-    validate_purge_archived_session, wait_for_lifecycle_response_flush,
+    should_process_async_notification_event, sidecar_drain_in_flight_count,
+    slice_thread_history_page, validate_purge_archived_session, wait_for_lifecycle_response_flush,
     webex_delivery_idempotency_key, worker_active_check_ack, write_supervisor_shutdown_marker_at,
 };
 use chrono::{Duration, Utc};
@@ -1722,7 +1723,35 @@ fn lifecycle_rejects_drainable_sidecar_work_while_quiescing() {
 
 #[test]
 fn lifecycle_runtime_count_includes_drainable_ingress() {
-    assert_eq!(lifecycle_runtime_in_flight_total(2, 3, 5), 10);
+    assert_eq!(lifecycle_runtime_in_flight_total(2, 3, 5, 7), 17);
+}
+
+#[tokio::test]
+async fn lifecycle_runtime_count_includes_sidecar_drain_state() {
+    let state_dir = std::env::temp_dir().join(format!(
+        "wxcd-worker-sidecar-drain-state-test-{}",
+        generate_installation_id(Utc::now())
+    ));
+    let mut config = app_config_with_state_dir(&state_dir, true);
+    let plugin_home = config.bridge.cbth_plugin.plugin_home.clone();
+    tokio::fs::create_dir_all(&plugin_home).await.unwrap();
+    tokio::fs::write(
+        plugin_home.join(SIDECAR_DRAIN_STATE_FILE),
+        serde_json::to_vec(&json!({
+            "pid": 12345,
+            "in_flight_count": 2,
+            "updated_at": Utc::now().to_rfc3339()
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(sidecar_drain_in_flight_count(&config).await, 2);
+
+    config.bridge.cbth_plugin.enabled = false;
+    assert_eq!(sidecar_drain_in_flight_count(&config).await, 0);
+    tokio::fs::remove_dir_all(&state_dir).await.unwrap();
 }
 
 #[tokio::test]

@@ -73,6 +73,7 @@ const WXCD_CODEX_APP_SERVER_URL_ENV: &str = "WXCD_CODEX_APP_SERVER_URL";
 const WXCD_CBTH_DELIVERY_BROKER_SOCKET_ENV: &str = "WXCD_CBTH_DELIVERY_BROKER_SOCKET";
 const WXCD_CBTH_LIFECYCLE_SOCKET_ENV: &str = "WXCD_CBTH_LIFECYCLE_SOCKET";
 const WXCD_SUPERVISOR_SHUTDOWN_MARKER_ENV: &str = "WXCD_SUPERVISOR_SHUTDOWN_MARKER";
+const SIDECAR_DRAIN_STATE_FILE: &str = "webex-sidecar-drain-state.json";
 const WEBEX_DELIVERY_MAX_ATTEMPTS: i64 = 3;
 const WEBEX_DELIVERY_REDELIVERY_WINDOW_SECONDS: i64 = 3600;
 
@@ -2908,7 +2909,7 @@ async fn handle_lifecycle_command_with_runtime_drain(
             let ingress_in_flight_count = ctx.lifecycle.in_flight_count();
             if ingress_in_flight_count > 0 {
                 persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
-                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx);
+                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
                 warn!(
                     "lifecycle drain incomplete: {in_flight_count} Webex ingress, Codex events, or sessions remain in flight"
                 );
@@ -2918,7 +2919,7 @@ async fn handle_lifecycle_command_with_runtime_drain(
                 }));
             }
             let _ = drain_codex_runtime(&mut ctx).await?;
-            let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx);
+            let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
             persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
             if in_flight_count > 0 {
                 warn!(
@@ -2939,7 +2940,7 @@ async fn handle_lifecycle_command_with_runtime_drain(
             let ingress_in_flight_count = ctx.lifecycle.in_flight_count();
             if ingress_in_flight_count > 0 {
                 persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
-                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx);
+                let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
                 warn!(
                     "lifecycle shutdown rejected: {in_flight_count} Webex ingress, Codex events, or sessions remain in flight"
                 );
@@ -2948,7 +2949,7 @@ async fn handle_lifecycle_command_with_runtime_drain(
                 }));
             }
             let _ = drain_codex_runtime(&mut ctx).await?;
-            let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx);
+            let in_flight_count = lifecycle_runtime_in_flight_count(&mut ctx).await;
             persist_durable_lifecycle_mirror(ctx.config, ctx.state).await?;
             if in_flight_count > 0 {
                 warn!(
@@ -3021,11 +3022,12 @@ async fn process_pending_codex_events(ctx: &mut LifecycleCommandContext<'_, '_>)
     }
 }
 
-fn lifecycle_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_, '_>) -> u64 {
+async fn lifecycle_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_, '_>) -> u64 {
     lifecycle_runtime_in_flight_total(
         ctx.lifecycle.in_flight_count(),
         ctx.state.lifecycle_codex_in_flight_count(),
         ctx.codex.events().len(),
+        sidecar_drain_in_flight_count(ctx.config).await,
     )
 }
 
@@ -3034,6 +3036,7 @@ fn lifecycle_codex_runtime_in_flight_count(ctx: &mut LifecycleCommandContext<'_,
         0,
         ctx.state.lifecycle_codex_in_flight_count(),
         ctx.codex.events().len(),
+        0,
     )
 }
 
@@ -3041,8 +3044,51 @@ fn lifecycle_runtime_in_flight_total(
     ingress_in_flight_count: u64,
     codex_in_flight_count: u64,
     queued_codex_event_count: usize,
+    sidecar_in_flight_count: u64,
 ) -> u64 {
-    ingress_in_flight_count + codex_in_flight_count + queued_codex_event_count as u64
+    ingress_in_flight_count
+        + codex_in_flight_count
+        + queued_codex_event_count as u64
+        + sidecar_in_flight_count
+}
+
+async fn sidecar_drain_in_flight_count(config: &AppConfig) -> u64 {
+    if !config.bridge.cbth_plugin.enabled {
+        return 0;
+    }
+    let path = config
+        .bridge
+        .cbth_plugin
+        .plugin_home
+        .join(SIDECAR_DRAIN_STATE_FILE);
+    let contents = match tokio::fs::read(&path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(error) => {
+            warn!(
+                "failed to read sidecar drain state {}; treating sidecar as in flight: {error:#}",
+                path.display()
+            );
+            return 1;
+        }
+    };
+    let state: SidecarDrainState = match serde_json::from_slice(&contents) {
+        Ok(state) => state,
+        Err(error) => {
+            warn!(
+                "failed to parse sidecar drain state {}; treating sidecar as in flight: {error:#}",
+                path.display()
+            );
+            return 1;
+        }
+    };
+    state.in_flight_count
+}
+
+#[derive(Debug, Deserialize)]
+struct SidecarDrainState {
+    #[serde(default)]
+    in_flight_count: u64,
 }
 
 fn lifecycle_runtime_wait_interval(remaining: Duration) -> Duration {

@@ -3,7 +3,7 @@ id: 20260519-w5-lifecycle-hooks-ab986d1
 title: W5 Lifecycle Hooks
 status: completed
 created: 2026-05-19
-updated: 2026-05-19
+updated: 2026-05-20
 branch: codex/w5-lifecycle-hooks
 pr:
 supersedes: []
@@ -14,7 +14,7 @@ superseded_by:
 
 ## Summary
 - W5 为 C7 增加保守的 Webex plugin lifecycle hooks：`plugin.health_check`、`plugin.quiesce`、`plugin.drain`、`plugin.shutdown` 和 `plugin.unquiesce`。
-- Worker 在显式 cbth plugin mode 下提供独立 lifecycle control socket；进入 quiesce/shutdown 后停止接收新的 Webex 外部 ingress，等待已接收 handler 完成后才允许 drain 完成，并在报告 drain/shutdown 完成前把 durable local session mirror 持久化到 cbth plugin home。
+- Worker 在显式 cbth plugin mode 下提供独立 lifecycle control socket；进入 quiesce/shutdown 后停止接收新的 Webex 外部 ingress，等待已接收 handler 与 sidecar callback/retry backlog 完成后才允许 drain 完成，并在报告 drain/shutdown 完成前把 durable local session mirror 持久化到 cbth plugin home。
 - 启动路径仍先 replay Data Space，再合并 durable local mirror 并执行本地 Codex thread reconcile；这些步骤完成后才把 listener health 标记为 ready 并接受 Webex ingress。
 - W4 路由语义保持不变：普通 Webex user messages 仍走 direct cbth-managed app-server path；async/background notifications 仍走 `delivery.enqueue` delivery-owned target mode。
 
@@ -23,8 +23,8 @@ superseded_by:
 - `wxcd-worker` 在 plugin mode 下优先绑定 `WXCD_CBTH_LIFECYCLE_SOCKET`，否则使用 `CBTH_PLUGIN_HOME/lifecycle.sock`。
 - `WXCD_CBTH_PRE_ACTIVE=1` 会让 worker 以 quiesced admission 启动，便于 pre-active health checks 验证外部 Webex work 已被 fence。
 - Plugin-mode durable mirror snapshot 位于 `CBTH_PLUGIN_HOME/bridge-state.json`；如果 plugin-home mirror 还不存在，启动时会 fallback 到 legacy `state_dir/bridge-state.json`。
-- `plugin.shutdown` 成功时会写入 supervisor shutdown marker；supervisor 看到 marker 后正常退出而不是重启 worker，避免 upgrade shutdown 被 supervisor 误判为可恢复 worker crash。
-- Sidecar 现在解析 worker ingress ACK；quiesce/shutdown 等 retryable negative ACK 会被重试，不再把 worker 拒收当作投递成功。
+- `plugin.shutdown` 成功时会写入 supervisor shutdown marker；supervisor 会先校验 marker instance/release，匹配时正常退出而不是重启旧 worker，避免 upgrade shutdown 被 supervisor 误判为可恢复 worker crash。
+- Sidecar 现在解析 worker ingress ACK；quiesce/shutdown 等 retryable negative ACK 会被重试，不再把 worker 拒收当作投递成功。正在执行或重试的 Webex callback 会写入 `CBTH_PLUGIN_HOME/webex-sidecar-drain-state.json`，worker drain/shutdown 会把该 backlog 计入 in-flight。
 
 ## Remaining Dependencies
 - W6 仍负责 optional production handoff export/import，包括 Webex cursor、in-flight handler state 和 sidecar restart metadata。
