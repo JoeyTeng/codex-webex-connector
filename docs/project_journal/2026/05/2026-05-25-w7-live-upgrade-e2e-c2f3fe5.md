@@ -27,7 +27,8 @@ superseded_by:
 - The cbth safe-smoke, cbth service, supervisor, optional upgrade, and sidecar child environments are stripped of parent `WEBEX_*`, `WXCD_*`, and `CBTH_*` variables before task-scoped values are injected.
 - Delivery smoke injects a Webex `async_notification` through the worker ingress socket so the existing supervisor broker forwards W4 `delivery.enqueue`.
 - Optional Webex release A/B upgrade is delegated to `WXCD_E2E_CBTH_UPGRADE_CMD` or `--cbth-upgrade-command`; custom commands must provide `WXCD_E2E_CBTH_UPGRADE_CHECK_CMD` / `--cbth-upgrade-check-command`, and the script expands release/cbth placeholders, resolves repo-relative executables against the configured repo root, runs the external command with closed stdin, private stdout/stderr logging, and a bounded timeout, validates the cbth registry now points to release B's supervisor, release dir, release id, and manifest path, and then verifies old release socket shutdown, the post-upgrade release-scoped worker ingress, a real Webex session turn, and delivery smoke before passing. If omitted, W7 records `webex_release_upgrade.status=skipped` and relies on the mandatory C8 safe harness for generic upgrade ordering.
-- Cleanup records all created rooms/processes in `manifest.json`, deletes only rooms whose titles match the run prefix, uses the bot token for bot-created session room deletion, follows Webex room pagination for session-room lookup and prefix-scanned untracked temporary rooms, stops child processes, archives the dedicated local Codex thread when possible, preserves the test root for failed, blocked, cleanup-error, or explicit `--test-root` runs, preserves a sibling `*-manifest.json` audit artifact before deleting a clean default success root, and rejects repo-internal explicit test roots unless they are under ignored `.codex-tmp/`.
+- Cleanup records all created rooms/processes in `manifest.json`, deletes only rooms whose titles match the run prefix, treats Webex `404 Not Found` deletes as idempotent success, uses the bot token for bot-created session room deletion, follows Webex room pagination for session-room lookup and prefix-scanned untracked temporary rooms, stops child processes, archives the dedicated local Codex thread when possible, preserves the test root for failed, blocked, cleanup-error, or explicit `--test-root` runs, preserves a sibling `*-manifest.json` audit artifact before deleting a clean default success root, and rejects repo-internal explicit test roots unless they are under ignored `.codex-tmp/`.
+- Default GitHub CI now runs the safe W7 Python harness unit tests and dry-run path on both Linux and macOS, without requiring Webex credentials.
 
 ## Next Steps
 - Run the W7 live smoke with real Webex credentials and a `cbth` binary built from or newer than `ee76fdd5937ca57e8156631c32509be12d3cf4c2`.
@@ -44,6 +45,7 @@ superseded_by:
 - Focused validation:
   - `python3 -B -m py_compile scripts/w7_live_upgrade_e2e.py scripts/tests/test_w7_live_upgrade_e2e.py`
   - `python3 -B -m unittest scripts.tests.test_w7_live_upgrade_e2e`
+  - `python3 -B scripts/w7_live_upgrade_e2e.py`
   - `/usr/bin/python3 -B -m unittest scripts.tests.test_w7_live_upgrade_e2e`
   - `env WXCD_LIVE_E2E=1 python3 -B scripts/w7_live_upgrade_e2e.py --live --token-file /tmp/definitely-missing-w7-token --cbth-bin /tmp/definitely-missing-cbth`
 - Local delivery gates:
@@ -56,3 +58,5 @@ superseded_by:
   - `cargo clippy --workspace --all-targets -- -D warnings`
 - Helper-backed offline review:
   - `isolated_review stateful wait --state-dir .codex-tmp/isolated-review-gx7ocgie` produced `LGTM`
+- PR readiness review repair:
+  - Independent review finding addressed by adding W7 Python harness tests/dry-run to default CI and making Python Webex room deletes idempotent on `404`.

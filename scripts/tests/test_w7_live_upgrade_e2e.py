@@ -290,14 +290,42 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             api.calls,
             [
                 ("GET", "/rooms/room%2Fwith%2Bplus%3D", {}),
-                ("DELETE", "/rooms/room%2Fwith%2Bplus%3D", {"allow_empty": True}),
+                (
+                    "DELETE",
+                    "/rooms/room%2Fwith%2Bplus%3D",
+                    {
+                        "allow_empty": True,
+                        "allowed_statuses": harness.WEBEX_DELETE_OK_STATUSES,
+                    },
+                ),
                 (
                     "DELETE",
                     "/memberships/membership%2Fwith%2Bplus%3D",
-                    {"allow_empty": True},
+                    {
+                        "allow_empty": True,
+                        "allowed_statuses": harness.WEBEX_DELETE_OK_STATUSES,
+                    },
                 ),
             ],
         )
+
+    def test_delete_room_treats_not_found_as_success(self) -> None:
+        original_urlopen = harness.urllib.request.urlopen
+
+        def fake_urlopen(request: object, timeout: int) -> object:
+            raise harness.urllib.error.HTTPError(
+                url="https://webexapis.com/v1/rooms/missing-room",
+                code=404,
+                msg="Not Found",
+                hdrs={},
+                fp=BytesIO(b'{"message":"Not Found"}'),
+            )
+
+        harness.urllib.request.urlopen = fake_urlopen
+        try:
+            harness.WebexApi("token").delete_room("missing-room")
+        finally:
+            harness.urllib.request.urlopen = original_urlopen
 
     def test_webex_room_listing_follows_next_link(self) -> None:
         class FakeResponse:
@@ -1722,7 +1750,7 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         args = harness.build_parser().parse_args(
             [
                 "--cbth-upgrade-command",
-                "cbth plugin upgrade {plugin}",
+                "/bin/echo plugin upgrade {plugin}",
                 "--upgrade-timeout-seconds",
                 "7",
             ]
@@ -1792,7 +1820,7 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             )
 
     def test_upgrade_smoke_rejects_registry_that_still_points_to_release_a(self) -> None:
-        args = harness.build_parser().parse_args(["--cbth-upgrade-command", "cbth plugin upgrade {plugin}"])
+        args = harness.build_parser().parse_args(["--cbth-upgrade-command", "/bin/echo plugin upgrade {plugin}"])
         with tempfile.TemporaryDirectory() as tmp:
             test_root = Path(tmp) / "run"
             test_root.mkdir()
@@ -1836,7 +1864,7 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         args = harness.build_parser().parse_args(
             [
                 "--cbth-upgrade-command",
-                "cbth plugin upgrade {plugin}",
+                "/bin/echo plugin upgrade {plugin}",
                 "--upgrade-timeout-seconds",
                 "7",
             ]

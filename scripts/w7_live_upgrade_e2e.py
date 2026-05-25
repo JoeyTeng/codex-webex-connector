@@ -60,6 +60,7 @@ CBTH_C8_PR_URL = "https://github.com/JoeyTeng/codex-background-task-handler/pull
 UPGRADE_CHECK_TIMEOUT_SECONDS = 30
 WEBEX_TRANSIENT_ROOM_RETRY_ATTEMPTS = 5
 WEBEX_TRANSIENT_ROOM_RETRY_BASE_SECONDS = 0.25
+WEBEX_DELETE_OK_STATUSES = set(range(200, 300)) | {404}
 
 
 class HarnessError(RuntimeError):
@@ -168,7 +169,12 @@ class WebexApi:
         return self.request("GET", f"/rooms/{webex_path_segment(room_id)}")
 
     def delete_room(self, room_id: str) -> None:
-        self.request("DELETE", f"/rooms/{webex_path_segment(room_id)}", allow_empty=True)
+        self.request(
+            "DELETE",
+            f"/rooms/{webex_path_segment(room_id)}",
+            allow_empty=True,
+            allowed_statuses=WEBEX_DELETE_OK_STATUSES,
+        )
 
     def list_rooms(self, max_items: int = 100) -> list[dict[str, Any]]:
         return list(self.iter_rooms(max_items))
@@ -202,6 +208,7 @@ class WebexApi:
             "DELETE",
             f"/memberships/{webex_path_segment(membership_id)}",
             allow_empty=True,
+            allowed_statuses=WEBEX_DELETE_OK_STATUSES,
         )
 
     def create_message(self, room_id: str, text: str, markdown: str | None = None) -> dict[str, Any]:
