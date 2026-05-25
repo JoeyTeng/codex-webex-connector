@@ -6,7 +6,7 @@
   "main": "index.cjs",
   "packageManager": "pnpm@10.15.0",
   "scripts": {
-    "check": "node --check index.cjs && node check-runtime-imports.cjs"
+    "check": "node --check index.cjs && node check-runtime-imports.cjs && node path-encoding.test.cjs"
   },
   "license": "MIT",
   "dependencies": {

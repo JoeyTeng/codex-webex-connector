@@ -43,15 +43,21 @@ const sidecarDrainStatePath = pluginHome
     )
   : "";
 
-if (!token) {
-  throw new Error("WEBEX_BOT_TOKEN is required");
-}
+let webex = null;
 
-const webex = new WebexCore({
-  credentials: {
-    access_token: token,
-  },
-});
+function webexClient() {
+  if (!token) {
+    throw new Error("WEBEX_BOT_TOKEN is required");
+  }
+  if (!webex) {
+    webex = new WebexCore({
+      credentials: {
+        access_token: token,
+      },
+    });
+  }
+  return webex;
+}
 
 let exitingForRestart = false;
 let shuttingDown = false;
@@ -89,6 +95,14 @@ function defaultPluginInstanceId(pluginHomePath) {
 
 function finitePositiveDurationMs(value, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function webexPathSegment(value) {
+  return encodeURIComponent(String(value));
+}
+
+function webexResourceUrl(resourcePath, id) {
+  return `https://webexapis.com/v1/${resourcePath}/${webexPathSegment(id)}`;
 }
 
 async function deferredIngressCountForDrainState() {
@@ -690,10 +704,11 @@ async function startWebexListeners() {
   if (listenersActive) {
     return;
   }
+  const client = webexClient();
   try {
-    await webex.messages.listen();
+    await client.messages.listen();
     messagesListenerActive = true;
-    await webex.attachmentActions.listen();
+    await client.attachmentActions.listen();
     attachmentActionsListenerActive = true;
     listenersActive = true;
     console.log("webex-ws-sidecar is listening for Webex events");
@@ -709,13 +724,17 @@ async function startWebexListeners() {
 
 async function stopWebexListeners() {
   const failures = [];
+  const client = webex;
+  if (!client) {
+    return;
+  }
 
   if (messagesListenerActive) {
-    if (typeof webex.messages.stopListening !== "function") {
+    if (typeof client.messages.stopListening !== "function") {
       failures.push(new Error("messages stopListening is unavailable"));
     } else {
       try {
-        await webex.messages.stopListening();
+        await client.messages.stopListening();
         messagesListenerActive = false;
       } catch (error) {
         failures.push(error);
@@ -725,11 +744,11 @@ async function stopWebexListeners() {
   }
 
   if (attachmentActionsListenerActive) {
-    if (typeof webex.attachmentActions.stopListening !== "function") {
+    if (typeof client.attachmentActions.stopListening !== "function") {
       failures.push(new Error("attachment actions stopListening is unavailable"));
     } else {
       try {
-        await webex.attachmentActions.stopListening();
+        await client.attachmentActions.stopListening();
         attachmentActionsListenerActive = false;
       } catch (error) {
         failures.push(error);
@@ -808,7 +827,7 @@ function exitForSupervisorRestart(label, details) {
 }
 
 function installMercuryWatchdog() {
-  const mercury = webex.internal?.mercury;
+  const mercury = webexClient().internal?.mercury;
   if (!mercury || typeof mercury.on !== "function") {
     console.error("mercury watchdog could not attach: mercury plugin unavailable");
     return;
@@ -835,7 +854,7 @@ function installMercuryWatchdog() {
 async function forwardMessage(payload) {
   const sidecarReceivedAt = new Date().toISOString();
   await withSidecarDrainTracking(async () => {
-    const message = await fetchJson(`https://webexapis.com/v1/messages/${payload.data.id}`);
+    const message = await fetchJson(webexResourceUrl("messages", payload.data.id));
     const personEmail = (message.personEmail || payload.data.personEmail || "").toLowerCase();
     if (!message.text || personEmail === botEmail) {
       return;
@@ -863,7 +882,7 @@ async function forwardMessage(payload) {
 async function forwardAttachmentAction(payload) {
   const sidecarReceivedAt = new Date().toISOString();
   await withSidecarDrainTracking(async () => {
-    const action = await fetchJson(`https://webexapis.com/v1/attachment/actions/${payload.data.id}`);
+    const action = await fetchJson(webexResourceUrl("attachment/actions", payload.data.id));
     const personEmail = (action.personEmail || payload.data.personEmail || "").toLowerCase();
     if (personEmail === botEmail) {
       return;
@@ -890,6 +909,7 @@ async function forwardAttachmentAction(payload) {
 }
 
 async function main() {
+  const client = webexClient();
   startSidecarDrainStateHeartbeat();
   await queueSidecarDrainStateWrite();
   for (;;) {
@@ -898,10 +918,10 @@ async function main() {
       break;
     }
   }
-  await webex.people.get("me");
+  await client.people.get("me");
   installMercuryWatchdog();
 
-  webex.messages.on("created", async (payload) => {
+  client.messages.on("created", async (payload) => {
     try {
       await forwardMessage(payload);
     } catch (error) {
@@ -909,7 +929,7 @@ async function main() {
     }
   });
 
-  webex.attachmentActions.on("created", async (payload) => {
+  client.attachmentActions.on("created", async (payload) => {
     try {
       await forwardAttachmentAction(payload);
     } catch (error) {
@@ -936,7 +956,7 @@ async function shutdown() {
   }
 
   try {
-    if (webex.internal?.mercury?.connected) {
+    if (webex?.internal?.mercury?.connected) {
       await webex.internal.mercury.disconnect();
     }
   } catch (error) {
@@ -945,37 +965,44 @@ async function shutdown() {
   await clearSidecarDrainState();
 }
 
-process.on("SIGINT", () => {
-  shutdown()
-    .catch((error) => {
-      console.error(error);
-    })
-    .finally(() => process.exit(0));
-});
-
-process.on("SIGTERM", () => {
-  shutdown()
-    .catch((error) => {
-      console.error(error);
-    })
-    .finally(() => process.exit(0));
-});
-
-process.on("unhandledRejection", (error) => {
-  exitForSupervisorRestart("unhandledRejection", {
-    message: error?.message || String(error),
-    stack: error?.stack,
+if (require.main === module) {
+  process.on("SIGINT", () => {
+    shutdown()
+      .catch((error) => {
+        console.error(error);
+      })
+      .finally(() => process.exit(0));
   });
-});
 
-process.on("uncaughtException", (error) => {
-  exitForSupervisorRestart("uncaughtException", {
-    message: error?.message || String(error),
-    stack: error?.stack,
+  process.on("SIGTERM", () => {
+    shutdown()
+      .catch((error) => {
+        console.error(error);
+      })
+      .finally(() => process.exit(0));
   });
-});
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+  process.on("unhandledRejection", (error) => {
+    exitForSupervisorRestart("unhandledRejection", {
+      message: error?.message || String(error),
+      stack: error?.stack,
+    });
+  });
+
+  process.on("uncaughtException", (error) => {
+    exitForSupervisorRestart("uncaughtException", {
+      message: error?.message || String(error),
+      stack: error?.stack,
+    });
+  });
+
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  webexPathSegment,
+  webexResourceUrl,
+};
