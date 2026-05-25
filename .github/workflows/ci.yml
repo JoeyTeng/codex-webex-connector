@@ -49,6 +49,11 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+      - name: Run W7 harness tests
+        run: |
+          python3 -B -m unittest scripts.tests.test_w7_live_upgrade_e2e
+          python3 -B scripts/w7_live_upgrade_e2e.py >/dev/null
+
   sidecar:
     name: Webex sidecar (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
