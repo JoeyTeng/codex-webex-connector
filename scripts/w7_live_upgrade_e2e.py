@@ -913,14 +913,25 @@ def stop_processes(state: RunState) -> None:
             os.killpg(handle.process.pid, signal.SIGTERM)
         except ProcessLookupError:
             continue
+        except Exception as error:  # noqa: BLE001
+            state.record_cleanup_error(f"cleanup_error_process_{handle.name}", error)
+            continue
         try:
             handle.process.wait(timeout=8)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(handle.process.pid, signal.SIGKILL)
             except ProcessLookupError:
-                pass
-            handle.process.wait(timeout=5)
+                continue
+            except Exception as error:  # noqa: BLE001
+                state.record_cleanup_error(f"cleanup_error_process_{handle.name}", error)
+                continue
+            try:
+                handle.process.wait(timeout=5)
+            except Exception as error:  # noqa: BLE001
+                state.record_cleanup_error(f"cleanup_error_process_{handle.name}", error)
+        except Exception as error:  # noqa: BLE001
+            state.record_cleanup_error(f"cleanup_error_process_{handle.name}", error)
 
 
 def prepare_release_dirs(state: RunState) -> tuple[Path, Path]:
@@ -1594,7 +1605,12 @@ def cleanup_live(
         except Exception as error:  # noqa: BLE001
             state.record_cleanup_error("codex_thread_archive_error", error)
     if state.codex_app_server:
-        state.codex_app_server.close()
+        try:
+            state.codex_app_server.close()
+        except Exception as error:  # noqa: BLE001
+            state.record_cleanup_error("codex_app_server_close_error", error)
+        finally:
+            state.codex_app_server = None
     stop_processes(state)
     developer_token = developer or state.developer_token
     developer_api = WebexApi(developer_token.bearer) if developer_token is not None else None

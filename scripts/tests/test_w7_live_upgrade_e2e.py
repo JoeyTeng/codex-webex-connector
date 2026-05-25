@@ -1103,6 +1103,62 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             self.assertTrue(test_root.exists())
             self.assertIn("cleanup_error_control", state.manifest)
 
+    def test_cleanup_process_stop_error_does_not_skip_room_cleanup(self) -> None:
+        class FakeApi:
+            deleted: list[str] = []
+
+            def __init__(self, bearer: str) -> None:
+                self.bearer = bearer
+
+            def delete_room(self, room_id: str) -> None:
+                self.deleted.append(room_id)
+
+            def list_rooms(self, max_items: int = 100) -> list[dict[str, str]]:
+                return []
+
+        class FakeProcess:
+            pid = 12345
+
+            def poll(self) -> None:
+                return None
+
+        args = harness.build_parser().parse_args([])
+        with tempfile.TemporaryDirectory() as tmp:
+            test_root = Path(tmp) / "run"
+            test_root.mkdir()
+            state = harness.RunState(
+                args=args,
+                repo_root=Path(tmp),
+                test_root=test_root,
+                prefix="WXCD-W7-E2E-20260525-abc123xy",
+                logs_dir=test_root / "logs",
+                manifest_path=test_root / "manifest.json",
+                developer_token=harness.DeveloperToken(
+                    email="dev@example.com",
+                    bearer=harness.SecretText("secret"),
+                    ord_id="ord-123",
+                ),
+            )
+            state.processes.append(harness.ProcessHandle("cbth-service", FakeProcess()))  # type: ignore[arg-type]
+            state.add_room("control", "known", "WXCD-W7-E2E-20260525-abc123xy control")
+            original_api = harness.WebexApi
+            original_killpg = harness.os.killpg
+
+            def fail_killpg(pid: int, sig: int) -> None:
+                raise OSError("kill failed")
+
+            harness.WebexApi = FakeApi
+            harness.os.killpg = fail_killpg
+            try:
+                cleanup_ok = harness.cleanup_live(state)
+            finally:
+                harness.WebexApi = original_api
+                harness.os.killpg = original_killpg
+
+            self.assertFalse(cleanup_ok)
+            self.assertEqual(FakeApi.deleted, ["known"])
+            self.assertIn("cleanup_error_process_cbth-service", state.manifest)
+
     def test_cleanup_skip_for_known_room_keeps_root_for_diagnostics(self) -> None:
         class FakeApi:
             def __init__(self, bearer: str) -> None:
