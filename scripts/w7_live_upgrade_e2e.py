@@ -43,6 +43,18 @@ RUN_MANIFEST = "manifest.json"
 PLUGIN_NAME = "webex-connector"
 CHILD_ENV_REMOVE_PREFIXES = ("WEBEX_", "WXCD_", "CBTH_")
 SAFE_PREFIX_SCAN_RE = re.compile(r"^WXCD-W7-E2E-\d{8}-[a-z0-9]{8}$")
+UPGRADE_COMMAND_PLACEHOLDER_RE = re.compile(r"\{[^{}]+\}")
+UPGRADE_COMMAND_PLACEHOLDERS = frozenset(
+    {
+        "{plugin}",
+        "{release_a}",
+        "{release_b}",
+        "{release_a_id}",
+        "{release_b_id}",
+        "{cbth_home}",
+        "{prefix}",
+    }
+)
 CBTH_C8_MERGE_COMMIT = "ee76fdd5937ca57e8156631c32509be12d3cf4c2"
 CBTH_C8_PR_URL = "https://github.com/JoeyTeng/codex-background-task-handler/pull/99"
 UPGRADE_CHECK_TIMEOUT_SECONDS = 30
@@ -509,6 +521,7 @@ def preflight_upgrade_command(
         raise BlockedError(f"Webex release upgrade command is invalid: {error}") from error
     if not command:
         raise BlockedError("Webex release upgrade command is empty")
+    validate_upgrade_command_placeholders(command)
     if release_a is not None and release_b is not None and cbth_home is not None and prefix is not None:
         command = expand_upgrade_command(
             template,
@@ -1532,6 +1545,7 @@ def expand_upgrade_command(
         "{prefix}": prefix,
     }
     parts = shlex.split(template)
+    validate_upgrade_command_placeholders(parts)
     expanded = []
     for part in parts:
         for placeholder, value in values.items():
@@ -1540,6 +1554,27 @@ def expand_upgrade_command(
     if not expanded:
         raise HarnessError("empty Webex release upgrade command")
     return expanded
+
+
+def validate_upgrade_command_placeholders(parts: Iterable[str]) -> None:
+    unknown = sorted(
+        {
+            placeholder
+            for part in parts
+            for placeholder in UPGRADE_COMMAND_PLACEHOLDER_RE.findall(part)
+            if placeholder not in UPGRADE_COMMAND_PLACEHOLDERS
+        }
+    )
+    if unknown:
+        raise BlockedError(f"unknown Webex release upgrade command placeholder(s): {', '.join(unknown)}")
+    malformed = [
+        part
+        for part in parts
+        if "{" in UPGRADE_COMMAND_PLACEHOLDER_RE.sub("", part)
+        or "}" in UPGRADE_COMMAND_PLACEHOLDER_RE.sub("", part)
+    ]
+    if malformed:
+        raise BlockedError(f"malformed Webex release upgrade command placeholder in: {redact_command(malformed)}")
 
 
 SENSITIVE_COMMAND_TERMS = ("token", "bearer")

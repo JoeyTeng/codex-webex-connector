@@ -640,6 +640,26 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         with self.assertRaises(harness.BlockedError):
             harness.preflight_upgrade_command(args)
 
+    def test_preflight_upgrade_command_rejects_unknown_placeholder_before_release_dirs(self) -> None:
+        args = harness.build_parser().parse_args(
+            ["--live", "--cbth-upgrade-command", "/bin/echo {release_bid}"]
+        )
+
+        with self.assertRaisesRegex(harness.BlockedError, r"\{release_bid\}"):
+            harness.preflight_upgrade_command(args, cwd=Path("/tmp"))
+
+    def test_expand_upgrade_command_rejects_malformed_placeholder(self) -> None:
+        with self.assertRaisesRegex(harness.BlockedError, "malformed"):
+            harness.expand_upgrade_command(
+                "/bin/echo {release_b",
+                Path("/old"),
+                Path("/new"),
+                "w7-a",
+                "w7-b",
+                Path("/tmp/cbth-home"),
+                "WXCD-W7",
+            )
+
     def test_preflight_upgrade_command_rejects_missing_cbth_upgrade_subcommand(self) -> None:
         old_check = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)
         with tempfile.TemporaryDirectory() as tmp:
