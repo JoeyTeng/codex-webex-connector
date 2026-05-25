@@ -127,7 +127,7 @@ mkdir -p "$test_root/logs"
 
 ```bash
 WXCD_CONFIG_PATH="$test_root/wxcd.toml" \
-WXCD_ENV_PATH="$test_root/.env" \
+WXCD_ENV_PATH="$test_root/wxcd.env" \
 "$release/bin/wxcd-worker" >"$test_root/logs/worker.out.log" 2>"$test_root/logs/worker.err.log" &
 
 WEBEX_BOT_TOKEN="<redacted>" \
