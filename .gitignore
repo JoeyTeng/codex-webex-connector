@@ -3,7 +3,11 @@ node_modules/
 dist/
 .codex-tmp/
 .DS_Store
+__pycache__/
+*.pyc
 .env
+token.txt
+wxcd.env
 wxcd.toml
 launchd/*.generated.plist
 docs/project_journal/INDEX.md

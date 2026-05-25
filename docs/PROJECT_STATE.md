@@ -8,8 +8,10 @@
 - W4 delivery enqueue routing 已落地：Webex async/background notifications 通过 supervisor-owned broker 调用 cbth C5 `delivery.enqueue` delivery-owned `codex_app_server` target；普通 Webex user-message forwarding 仍走 W3 direct app-server path。
 - W5 lifecycle hooks 已落地：显式 cbth plugin mode 提供 C7 `plugin.health_check`、`plugin.quiesce`、`plugin.drain`、`plugin.shutdown`、`plugin.unquiesce` 的保守实现；quiesce/shutdown 后拒绝新的 Webex 外部 ingress，drain 等待已接收 handler 与 live sidecar callback/retry backlog 完成并在 cbth plugin home 持久化 local session mirror 后返回。
 - W6 optional handoff 已落地：显式 cbth plugin mode 提供 `plugin.handoff_export` / `plugin.handoff_import`，在 W5 quiesce/drain 之后可交接 durable bridge snapshot、recent Webex event-id cursor、in-flight session/approval summary 和 sidecar deferred/drain metadata；pre-active import 只更新本地 mirror/cursor，不产生 Webex/Codex 外部副作用。
+- W7 opt-in live upgrade E2E harness 已落地：`scripts/w7_live_upgrade_e2e.py` 默认 dry-run，live 模式先执行 cbth C8 `service upgrade-smoke` safe harness，再隔离真实 Webex rooms、task-scoped cbth service/plugin home、session turn、delivery smoke、cleanup/manifest；真实 Webex release A/B upgrade command 是 optional hook。
 - GitHub pull requests run `codex/review-gate` through the repository workflow.
 - 详细历史、验证证据和迁移前 tracker 原文已移入 `docs/project_journal/`：
+  - W7 live upgrade E2E harness：`docs/project_journal/2026/05/2026-05-25-w7-live-upgrade-e2e-c2f3fe5.md`
   - W6 optional handoff：`docs/project_journal/2026/05/2026-05-20-w6-optional-handoff-5181e85.md`
   - W5 lifecycle hooks：`docs/project_journal/2026/05/2026-05-19-w5-lifecycle-hooks-ab986d1.md`
   - W4 delivery enqueue routing：`docs/project_journal/2026/05/2026-05-19-w4-delivery-enqueue-41d6ec5.md`
@@ -24,7 +26,7 @@
 - Summary: 生产 bridge 依赖 bot-owner 1:1 direct room 作为 Data Space；Webex Mercury 断连由 sidecar watchdog 自恢复；session-room slash commands 已支持 Webex mention prefixes；recovery cleanup commands 已部署并记录在 `docs/COMMANDS.md`。
 - Next Steps:
   - 使用 `diagnose sessions` 和 `cleanup failed <session_id>` 处理 degraded / missing-local-thread sessions。
-  - 后续 workstream 再处理 C8/W7 live service/plugin upgrade smoke。
+  - 用支持 C8 PR #99 merge commit `ee76fdd5937ca57e8156631c32509be12d3cf4c2` 的 `cbth` binary 执行 W7 live smoke；harness 会先运行 `cbth service upgrade-smoke`，再进入真实 Webex/cbth plugin-mode delivery smoke。
 - Blockers:
   - 当前 Webex bot token 仍不能 replay group-room Data Space history。
   - Webex overview card refresh 仍可能返回 `Invalid roomId`，目前仅作为 best-effort。
@@ -39,6 +41,7 @@
 - W4 routes async/background notifications through cbth delivery-owned `delivery.enqueue` while preserving normal user-message forwarding on the W3 direct app-server path.
 - W5 adds conservative cbth lifecycle hooks while preserving W3/W4 forwarding and delivery routing semantics.
 - W6 adds optional handoff export/import while preserving W5 conservative lifecycle fallback semantics.
+- W7 adds the opt-in live upgrade E2E harness and keeps cbth generic upgrade orchestration outside this repo.
 - W2 added plugin packaging metadata, explicit cbth plugin config, C1-compatible hello client tests, and doctor diagnostics without requiring Webex credentials.
 - Isolated live Webex E2E passed for `resume local`, `/history`, ordinary session turns, `attach`, recovery cleanup, and cleanup of temporary rooms/processes/root.
 - Top-level trackers were migrated to short entrypoints; complete pre-migration contents are preserved in the legacy snapshot journal.
