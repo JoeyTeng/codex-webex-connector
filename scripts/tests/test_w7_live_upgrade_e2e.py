@@ -159,6 +159,46 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         self.assertEqual(response["id"], "message")
         self.assertEqual(calls, 2)
 
+    def test_webex_path_segment_escapes_complete_resource_id(self) -> None:
+        self.assertEqual(
+            harness.webex_path_segment("room/with+plus="),
+            "room%2Fwith%2Bplus%3D",
+        )
+
+    def test_webex_resource_id_paths_encode_slashes(self) -> None:
+        class CapturingApi(harness.WebexApi):
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, dict[str, object]]] = []
+
+            def request(
+                self,
+                method: str,
+                path: str,
+                body: dict[str, object] | None = None,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                self.calls.append((method, path, kwargs))
+                return {}
+
+        api = CapturingApi()
+
+        api.get_room("room/with+plus=")
+        api.delete_room("room/with+plus=")
+        api.delete_membership("membership/with+plus=")
+
+        self.assertEqual(
+            api.calls,
+            [
+                ("GET", "/rooms/room%2Fwith%2Bplus%3D", {}),
+                ("DELETE", "/rooms/room%2Fwith%2Bplus%3D", {"allow_empty": True}),
+                (
+                    "DELETE",
+                    "/memberships/membership%2Fwith%2Bplus%3D",
+                    {"allow_empty": True},
+                ),
+            ],
+        )
+
     def test_history_page_needles_do_not_match_adjacent_page_navigation(self) -> None:
         page_two_needles = harness.history_page_needles(2, "thread-123")
         page_one_navigation = "Thread `thread-123` history page 1 of 2.\nUse `/history page 2` for older turns."

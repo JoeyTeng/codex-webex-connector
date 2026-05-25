@@ -62,6 +62,10 @@ class SecretText(str):
     """Marker type for values that must not be printed."""
 
 
+def webex_path_segment(value: str) -> str:
+    return urllib.parse.quote(value, safe="")
+
+
 @dataclass(frozen=True)
 class DeveloperToken:
     email: str
@@ -147,10 +151,10 @@ class WebexApi:
         return self.request("POST", "/rooms", {"title": title})
 
     def get_room(self, room_id: str) -> dict[str, Any]:
-        return self.request("GET", f"/rooms/{urllib.parse.quote(room_id)}")
+        return self.request("GET", f"/rooms/{webex_path_segment(room_id)}")
 
     def delete_room(self, room_id: str) -> None:
-        self.request("DELETE", f"/rooms/{urllib.parse.quote(room_id)}", allow_empty=True)
+        self.request("DELETE", f"/rooms/{webex_path_segment(room_id)}", allow_empty=True)
 
     def list_rooms(self, max_items: int = 100) -> list[dict[str, Any]]:
         response = self.request("GET", f"/rooms?max={max_items}")
@@ -176,7 +180,7 @@ class WebexApi:
     def delete_membership(self, membership_id: str) -> None:
         self.request(
             "DELETE",
-            f"/memberships/{urllib.parse.quote(membership_id)}",
+            f"/memberships/{webex_path_segment(membership_id)}",
             allow_empty=True,
         )
 
