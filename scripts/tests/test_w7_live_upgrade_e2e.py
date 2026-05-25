@@ -300,6 +300,49 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         self.assertNotIn("WXCD_CONFIG_PATH", env)
         self.assertEqual(env["CBTH_HOME"], "/tmp/w7-cbth")
 
+    def test_redact_command_covers_split_sensitive_arguments(self) -> None:
+        redacted = harness.redact_command(
+            [
+                "cbth",
+                "plugin",
+                "upgrade",
+                "--token",
+                "secret-token",
+                "--bearer=secret-bearer",
+                "WEBEX_BOT_TOKEN=env-secret",
+                "Authorization: Bearer header-secret",
+                "token",
+                "next-secret",
+                "secret-token-value",
+            ]
+        )
+
+        self.assertEqual(
+            redacted,
+            [
+                "cbth",
+                "plugin",
+                "upgrade",
+                "--token",
+                "<redacted>",
+                "--bearer=<redacted>",
+                "WEBEX_BOT_TOKEN=<redacted>",
+                "<redacted>",
+                "token",
+                "<redacted>",
+                "<redacted>",
+            ],
+        )
+        for secret in [
+            "secret-token",
+            "secret-bearer",
+            "env-secret",
+            "header-secret",
+            "next-secret",
+            "secret-token-value",
+        ]:
+            self.assertNotIn(secret, json.dumps(redacted))
+
     def test_cbth_service_upgrade_smoke_preflight_uses_help_command(self) -> None:
         calls: list[dict[str, object]] = []
         original_run = harness.subprocess.run
@@ -831,6 +874,37 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
 
             self.assertFalse(owned_root.exists())
             self.assertTrue(explicit_root.exists())
+
+    def test_cleanup_root_delete_error_marks_failure_and_preserves_diagnostics(self) -> None:
+        args = harness.build_parser().parse_args([])
+        with tempfile.TemporaryDirectory() as tmp:
+            test_root = Path(tmp) / "owned"
+            test_root.mkdir()
+            state = harness.RunState(
+                args=args,
+                repo_root=Path(tmp),
+                test_root=test_root,
+                prefix="WXCD-W7-E2E-20260525-owned123",
+                logs_dir=test_root / "logs",
+                manifest_path=test_root / "manifest.json",
+                owns_test_root=True,
+            )
+            state.record("result", "passed")
+            original_rmtree = harness.shutil.rmtree
+
+            def fail_rmtree(path: Path) -> None:
+                raise OSError(f"cannot delete {path}")
+
+            harness.shutil.rmtree = fail_rmtree
+            try:
+                cleanup_ok = harness.cleanup_live(state)
+            finally:
+                harness.shutil.rmtree = original_rmtree
+
+            self.assertFalse(cleanup_ok)
+            self.assertTrue(test_root.exists())
+            self.assertTrue(state.cleanup_failed)
+            self.assertIn("cleanup_error_test_root", state.manifest)
 
     def test_cleanup_uses_bot_api_for_session_room(self) -> None:
         class FakeApi:

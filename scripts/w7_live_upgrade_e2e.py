@@ -1510,14 +1510,45 @@ def expand_upgrade_command(
     return expanded
 
 
+SENSITIVE_COMMAND_TERMS = ("token", "bearer")
+BARE_SENSITIVE_COMMAND_KEYS = frozenset(SENSITIVE_COMMAND_TERMS)
+
+
 def redact_command(command: Iterable[str]) -> list[str]:
     redacted = []
+    redact_next = False
     for item in command:
-        if "token" in item.lower() or "bearer" in item.lower():
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+            continue
+        key, separator, _value = item.partition("=")
+        key_lower = key.lower()
+        if separator and any(term in key_lower for term in SENSITIVE_COMMAND_TERMS):
+            redacted.append(f"{key}=<redacted>")
+        elif item.startswith("-") and any(term in item.lower() for term in SENSITIVE_COMMAND_TERMS):
+            redacted.append(item)
+            redact_next = True
+        elif item.lower() in BARE_SENSITIVE_COMMAND_KEYS:
+            redacted.append(item)
+            redact_next = True
+        elif any(term in item.lower() for term in SENSITIVE_COMMAND_TERMS):
             redacted.append("<redacted>")
         else:
             redacted.append(item)
     return redacted
+
+
+def cleanup_owned_test_root(state: RunState) -> None:
+    try:
+        shutil.rmtree(state.test_root)
+    except FileNotFoundError:
+        return
+    except Exception as error:  # noqa: BLE001
+        state.record_cleanup_error("cleanup_error_test_root", error)
+        return
+    if state.test_root.exists():
+        state.record_cleanup_error("cleanup_error_test_root", "test root still exists after cleanup")
 
 
 def cleanup_live(
@@ -1571,7 +1602,7 @@ def cleanup_live(
         and state.manifest.get("result") == "passed"
         and not state.cleanup_failed
     ):
-        shutil.rmtree(state.test_root, ignore_errors=True)
+        cleanup_owned_test_root(state)
     return not state.cleanup_failed
 
 
