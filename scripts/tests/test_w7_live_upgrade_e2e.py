@@ -56,6 +56,39 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             self.assertEqual(token.bearer, "json-secret")
             self.assertEqual(token.ord_id, "ord-json")
 
+    def test_parse_token_file_rejects_json_null_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "token.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "email": "dev@example.com",
+                        "bearer": None,
+                        "ord_id": "ord-json",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(harness.HarnessError, "bearer.*string"):
+                harness.parse_token_file(path)
+
+    def test_parse_bot_env_file_rejects_json_null_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bot.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "WEBEX_BOT_TOKEN": None,
+                        "WEBEX_BOT_EMAIL": "bot@example.com",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(harness.HarnessError, "WEBEX_BOT_TOKEN.*string"):
+                harness.parse_bot_env_file(path)
+
     def test_fnv1a_matches_offset_basis_for_empty_string(self) -> None:
         self.assertEqual(harness.fnv1a_hex(""), "cbf29ce484222325")
 

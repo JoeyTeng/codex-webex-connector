@@ -406,7 +406,12 @@ def parse_json_or_env(content: str) -> dict[str, str]:
         loaded = json.loads(stripped)
         if not isinstance(loaded, dict):
             raise HarnessError("JSON credential file must contain an object")
-        return {str(key): str(value) for key, value in loaded.items()}
+        values: dict[str, str] = {}
+        for key, value in loaded.items():
+            if not isinstance(value, str):
+                raise HarnessError(f"JSON credential value for {key} must be a string")
+            values[str(key)] = value
+        return values
     values: dict[str, str] = {}
     for raw_line in content.splitlines():
         line = raw_line.strip()
