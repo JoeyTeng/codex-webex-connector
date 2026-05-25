@@ -171,8 +171,14 @@ class WebexApi:
         self.request("DELETE", f"/rooms/{webex_path_segment(room_id)}", allow_empty=True)
 
     def list_rooms(self, max_items: int = 100) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/rooms?max={max_items}")
-        return list(response.get("items", []))
+        return list(self.iter_rooms(max_items))
+
+    def iter_rooms(self, max_items: int = 100) -> Iterable[dict[str, Any]]:
+        path: str | None = f"/rooms?{urllib.parse.urlencode({'max': str(max_items)})}"
+        while path is not None:
+            response, headers = self.request("GET", path, return_headers=True)
+            yield from list(response.get("items", []))
+            path = webex_next_page_path(headers.get("Link"))
 
     def create_membership(self, room_id: str, person_email: str) -> dict[str, Any]:
         return self.request(
@@ -218,7 +224,8 @@ class WebexApi:
         allow_empty: bool = False,
         allowed_statuses: set[int] | None = None,
         retry_transient_room: bool = False,
-    ) -> dict[str, Any]:
+        return_headers: bool = False,
+    ) -> Any:
         allowed_statuses = allowed_statuses or set(range(200, 300))
         url = f"{WEBEX_BASE_URL}{path}"
         data = None if body is None else json.dumps(body).encode("utf-8")
@@ -229,6 +236,7 @@ class WebexApi:
             try:
                 with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
                     payload = response.read()
+                    headers = getattr(response, "headers", {})
                     if response.status not in allowed_statuses:
                         raise HarnessError(f"Webex {method} {path} returned HTTP {response.status}")
             except urllib.error.HTTPError as error:
@@ -243,14 +251,56 @@ class WebexApi:
                     delay *= 2
                     continue
                 if error.code in allowed_statuses:
-                    if allow_empty or not payload:
-                        return {}
-                    return json.loads(payload.decode("utf-8"))
+                    result = {} if allow_empty or not payload else json.loads(payload.decode("utf-8"))
+                    if return_headers:
+                        return result, error.headers
+                    return result
                 raise HarnessError(f"Webex {method} {path} returned HTTP {error.code}: {message}") from error
-            if allow_empty or not payload:
-                return {}
-            return json.loads(payload.decode("utf-8"))
+            result = {} if allow_empty or not payload else json.loads(payload.decode("utf-8"))
+            if return_headers:
+                return result, headers
+            return result
         raise HarnessError(f"Webex {method} {path} retry loop exhausted")
+
+
+def webex_next_page_path(link_header: str | None) -> str | None:
+    if not link_header:
+        return None
+    for entry in link_header.split(","):
+        url_match = re.match(r"\s*<([^>]+)>", entry)
+        if not url_match:
+            continue
+        parameters = [part.strip().lower() for part in entry[url_match.end() :].split(";")]
+        if 'rel="next"' in parameters or "rel=next" in parameters:
+            return webex_api_path(url_match.group(1))
+    return None
+
+
+def webex_api_path(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    base = urllib.parse.urlparse(WEBEX_BASE_URL)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme != base.scheme or parsed.netloc != base.netloc:
+            raise HarnessError(f"Webex pagination URL points outside {WEBEX_BASE_URL}: {url}")
+        if parsed.path == base.path:
+            path = "/"
+        elif parsed.path.startswith(f"{base.path}/"):
+            path = parsed.path[len(base.path) :]
+        else:
+            raise HarnessError(f"Webex pagination URL points outside {WEBEX_BASE_URL}: {url}")
+    else:
+        path = parsed.path or "/"
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return f"{path}?{parsed.query}" if parsed.query else path
+
+
+def iter_api_rooms(api: Any, max_items: int = 100) -> Iterable[dict[str, Any]]:
+    iter_rooms = getattr(api, "iter_rooms", None)
+    if callable(iter_rooms):
+        yield from iter_rooms(max_items)
+        return
+    yield from api.list_rooms(max_items)
 
 
 def is_transient_invalid_room_error(status_code: int, response_body: str) -> bool:
@@ -671,6 +721,12 @@ def write_private_text(path: Path, value: str) -> None:
             os.close(fd)
 
 
+def open_private_text_for_write(path: Path) -> Any:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    return os.fdopen(fd, "w", encoding="utf-8")
+
+
 def fnv1a_hex(value: str) -> str:
     hash_value = 0xCBF29CE484222325
     for byte in value.encode("utf-8"):
@@ -1066,7 +1122,7 @@ enabled = true
 plugin_home = "{plugin_home}"
 plugin_instance_id = "{plugin_instance_id}"
 plugin_release_id = "{plugin_release_id}"
-manifest_path = "{release_a / "plugin" / "manifest.json"}"
+manifest_path = "plugin/manifest.json"
 
 [[repos]]
 name = "codex-webex-connector"
@@ -1128,6 +1184,7 @@ def write_cbth_registry(
                     "WXCD_NODE_PATH": state.args.node_bin,
                     "WXCD_CODEX_PATH": state.args.codex_bin,
                     "WXCD_RELEASE_DIR": str(release_a),
+                    "WXCD_PLUGIN_MANIFEST_PATH": str(release_a / "plugin" / "manifest.json"),
                     "WXCD_PLUGIN_HOME": str(cbth_home / "plugins" / PLUGIN_NAME),
                     "WXCD_PLUGIN_INSTANCE_ID": plugin_instance_id,
                     "WXCD_PLUGIN_RELEASE_ID": plugin_release_id,
@@ -1138,6 +1195,46 @@ def write_cbth_registry(
     write_private_json(registry_path, registry)
     state.record("cbth_registry", str(registry_path))
     return registry_path
+
+
+def validate_cbth_registry_release(registry_path: Path, release_dir: Path, release_id: str) -> dict[str, str]:
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise HarnessError(f"failed to read cbth registry after upgrade: {registry_path}") from error
+    except json.JSONDecodeError as error:
+        raise HarnessError(f"cbth registry is not valid JSON after upgrade: {registry_path}") from error
+    plugins = registry.get("plugins")
+    if not isinstance(plugins, list):
+        raise HarnessError("cbth registry missing plugins after upgrade")
+    plugin = next((item for item in plugins if isinstance(item, dict) and item.get("name") == PLUGIN_NAME), None)
+    if plugin is None:
+        raise HarnessError(f"cbth registry missing {PLUGIN_NAME} after upgrade")
+    environment = plugin.get("environment")
+    if not isinstance(environment, dict):
+        raise HarnessError(f"cbth registry entry for {PLUGIN_NAME} missing environment after upgrade")
+
+    expected = {
+        "release_id": release_id,
+        "executable_path": str(release_dir / "bin" / "wxcd-supervisor"),
+        "WXCD_RELEASE_DIR": str(release_dir),
+        "WXCD_PLUGIN_RELEASE_ID": release_id,
+        "WXCD_PLUGIN_MANIFEST_PATH": str(release_dir / "plugin" / "manifest.json"),
+    }
+    actual = {
+        "release_id": str(plugin.get("release_id") or ""),
+        "executable_path": str(plugin.get("executable_path") or ""),
+        "WXCD_RELEASE_DIR": str(environment.get("WXCD_RELEASE_DIR") or ""),
+        "WXCD_PLUGIN_RELEASE_ID": str(environment.get("WXCD_PLUGIN_RELEASE_ID") or ""),
+        "WXCD_PLUGIN_MANIFEST_PATH": str(environment.get("WXCD_PLUGIN_MANIFEST_PATH") or ""),
+    }
+    mismatches = [key for key, expected_value in expected.items() if actual.get(key) != expected_value]
+    if mismatches:
+        details = ", ".join(f"{key}={actual.get(key)!r}" for key in mismatches)
+        raise HarnessError(
+            f"cbth registry did not activate Webex release {release_id} from {release_dir}: {details}"
+        )
+    return actual
 
 
 def run_live(state: RunState) -> None:
@@ -1407,7 +1504,7 @@ def parse_attached_session_reply(message: dict[str, Any]) -> tuple[str, str]:
 
 def wait_for_room_title(api: WebexApi, title: str, timeout_seconds: int) -> str:
     def probe() -> str | None:
-        for room in api.list_rooms(100):
+        for room in iter_api_rooms(api, 100):
             if room.get("title") == title:
                 return str(room["id"])
         return None
@@ -1480,21 +1577,28 @@ def run_upgrade_smoke_or_block(
     )
     command[0] = verify_command_executable(command[0], state.repo_root, "Webex release upgrade executable")
     before = active_check(ingress_socket)
+    registry_path = cbth_home / "plugins" / "registry.json"
+    upgrade_log_path = state.logs_dir / "webex-release-upgrade.log"
     try:
-        subprocess.run(
-            command,
-            cwd=state.repo_root,
-            stdin=subprocess.DEVNULL,
-            check=True,
-            env=upgrade_command_env(cbth_home),
-            timeout=state.args.upgrade_timeout_seconds,
-        )
+        with open_private_text_for_write(upgrade_log_path) as upgrade_log:
+            subprocess.run(
+                command,
+                cwd=state.repo_root,
+                stdin=subprocess.DEVNULL,
+                stdout=upgrade_log,
+                stderr=subprocess.STDOUT,
+                check=True,
+                env=upgrade_command_env(cbth_home),
+                timeout=state.args.upgrade_timeout_seconds,
+            )
     except subprocess.TimeoutExpired as error:
         raise HarnessError(
-            f"Webex release upgrade timed out after {state.args.upgrade_timeout_seconds}s: {redact_command(command)}"
+            "Webex release upgrade timed out after "
+            f"{state.args.upgrade_timeout_seconds}s: {redact_command(command)}; log={upgrade_log_path}"
         ) from error
     except (OSError, subprocess.CalledProcessError) as error:
-        raise HarnessError(f"Webex release upgrade failed: {redact_command(command)}") from error
+        raise HarnessError(f"Webex release upgrade failed: {redact_command(command)}; log={upgrade_log_path}") from error
+    registry_after = validate_cbth_registry_release(registry_path, release_b, state.args.release_b_id)
     wait_until(
         "old worker ingress socket to stop accepting connections",
         state.args.startup_timeout_seconds,
@@ -1521,6 +1625,8 @@ def run_upgrade_smoke_or_block(
             "new_lifecycle_socket": str(new_lifecycle_socket),
             "active_before": before,
             "health_after": after,
+            "log_path": str(upgrade_log_path),
+            "registry_after": registry_after,
         },
     )
     return True
@@ -1709,20 +1815,18 @@ def cleanup_untracked_prefix_rooms(
         known_room_ids.update(additional_known_room_ids)
     deleted: list[dict[str, str]] = []
     try:
-        rooms = api.list_rooms(100)
+        for room in iter_api_rooms(api, 100):
+            room_id = str(room.get("id") or "")
+            title = str(room.get("title") or "")
+            if not room_id or room_id in known_room_ids or not title.startswith(state.prefix):
+                continue
+            try:
+                api.delete_room(room_id)
+                deleted.append({"id": room_id, "title": title})
+            except Exception as error:  # noqa: BLE001
+                state.record_cleanup_error(f"cleanup_error_prefix_scan_{owner_label}_{fnv1a_hex(room_id)}", error)
     except Exception as error:  # noqa: BLE001
         state.record_cleanup_error(f"cleanup_prefix_scan_error_{owner_label}", error)
-        return set()
-    for room in rooms:
-        room_id = str(room.get("id") or "")
-        title = str(room.get("title") or "")
-        if not room_id or room_id in known_room_ids or not title.startswith(state.prefix):
-            continue
-        try:
-            api.delete_room(room_id)
-            deleted.append({"id": room_id, "title": title})
-        except Exception as error:  # noqa: BLE001
-            state.record_cleanup_error(f"cleanup_error_prefix_scan_{owner_label}_{fnv1a_hex(room_id)}", error)
     if deleted:
         state.record(f"cleanup_prefix_scan_deleted_rooms_{owner_label}", deleted)
     return {room["id"] for room in deleted}

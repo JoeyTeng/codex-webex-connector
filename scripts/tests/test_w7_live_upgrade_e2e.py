@@ -12,6 +12,28 @@ from scripts import w7_live_upgrade_e2e as harness
 
 
 class W7LiveUpgradeE2ETest(unittest.TestCase):
+    def write_registry_release(self, cbth_home: Path, release_dir: Path, release_id: str) -> Path:
+        registry_path = cbth_home / "plugins" / "registry.json"
+        harness.write_private_json(
+            registry_path,
+            {
+                "schema_version": 1,
+                "plugins": [
+                    {
+                        "name": harness.PLUGIN_NAME,
+                        "executable_path": str(release_dir / "bin" / "wxcd-supervisor"),
+                        "release_id": release_id,
+                        "environment": {
+                            "WXCD_RELEASE_DIR": str(release_dir),
+                            "WXCD_PLUGIN_RELEASE_ID": release_id,
+                            "WXCD_PLUGIN_MANIFEST_PATH": str(release_dir / "plugin" / "manifest.json"),
+                        },
+                    }
+                ],
+            },
+        )
+        return registry_path
+
     def test_parse_token_file_supports_env_shape_without_leaking_bearer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "token.txt"
@@ -276,6 +298,56 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_webex_room_listing_follows_next_link(self) -> None:
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, payload: dict[str, object], link: str | None = None) -> None:
+                self.payload = payload
+                self.headers = {"Link": link} if link else {}
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode("utf-8")
+
+        calls: list[str] = []
+        original_urlopen = harness.urllib.request.urlopen
+
+        def fake_urlopen(request: object, timeout: int) -> FakeResponse:
+            calls.append(request.full_url)
+            if len(calls) == 1:
+                return FakeResponse(
+                    {"items": [{"id": "room-a"}]},
+                    '<https://webexapis.com/v1/rooms?max=100&before=cursor>; rel="next"',
+                )
+            return FakeResponse({"items": [{"id": "room-b"}]})
+
+        harness.urllib.request.urlopen = fake_urlopen
+        try:
+            rooms = harness.WebexApi("token").list_rooms(100)
+        finally:
+            harness.urllib.request.urlopen = original_urlopen
+
+        self.assertEqual([room["id"] for room in rooms], ["room-a", "room-b"])
+        self.assertEqual(
+            calls,
+            [
+                "https://webexapis.com/v1/rooms?max=100",
+                "https://webexapis.com/v1/rooms?max=100&before=cursor",
+            ],
+        )
+
+    def test_webex_next_page_path_rejects_non_webex_link(self) -> None:
+        with self.assertRaisesRegex(harness.HarnessError, "outside"):
+            harness.webex_next_page_path('<https://example.com/v1/rooms?before=cursor>; rel="next"')
+        with self.assertRaisesRegex(harness.HarnessError, "outside"):
+            harness.webex_next_page_path('<https://webexapis.com/v2/rooms?before=cursor>; rel="next"')
 
     def test_history_page_needles_do_not_match_adjacent_page_navigation(self) -> None:
         page_two_needles = harness.history_page_needles(2, "thread-123")
@@ -951,6 +1023,8 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             environment = registry["plugins"][0]["environment"]
             self.assertEqual(environment["WXCD_PLUGIN_INSTANCE_ID"], "w7-instance")
             self.assertEqual(environment["WXCD_PLUGIN_RELEASE_ID"], "w7-a")
+            self.assertEqual(environment["WXCD_PLUGIN_MANIFEST_PATH"], "/release-a/plugin/manifest.json")
+            self.assertEqual(environment["WXCD_RELEASE_DIR"], "/release-a")
             self.assertEqual(
                 environment["WXCD_PLUGIN_HOME"],
                 str(test_root / "cbth-home" / "plugins" / harness.PLUGIN_NAME),
@@ -1440,6 +1514,16 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             self.assertIn(("dev-secret", "control-room"), FakeApi.deleted)
             self.assertIn(("bot-secret", "session-room"), FakeApi.deleted)
 
+    def test_wait_for_room_title_scans_paginated_rooms(self) -> None:
+        class FakeApi:
+            def iter_rooms(self, max_items: int = 100) -> object:
+                yield {"id": "room-a", "title": "Other room"}
+                yield {"id": "room-b", "title": "Target session"}
+
+        room_id = harness.wait_for_room_title(FakeApi(), "Target session", 1)
+
+        self.assertEqual(room_id, "room-b")
+
     def test_cleanup_prefix_scan_deletes_untracked_prefixed_rooms_with_safe_prefix(self) -> None:
         class FakeApi:
             def __init__(self) -> None:
@@ -1475,6 +1559,36 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 state.manifest["cleanup_prefix_scan_deleted_rooms_developer"],
                 [{"id": "untracked", "title": "WXCD-W7-E2E-20260525-abc123xy session"}],
             )
+
+    def test_cleanup_prefix_scan_deletes_untracked_rooms_from_later_pages(self) -> None:
+        class FakeApi:
+            def __init__(self) -> None:
+                self.deleted: list[str] = []
+
+            def iter_rooms(self, max_items: int = 100) -> object:
+                yield {"id": "known", "title": "WXCD-W7-E2E-20260525-abc123xy control"}
+                yield {"id": "later", "title": "WXCD-W7-E2E-20260525-abc123xy leftover"}
+
+            def delete_room(self, room_id: str) -> None:
+                self.deleted.append(room_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = harness.build_parser().parse_args([])
+            state = harness.RunState(
+                args=args,
+                repo_root=Path(tmp),
+                test_root=Path(tmp) / "run",
+                prefix="WXCD-W7-E2E-20260525-abc123xy",
+                logs_dir=Path(tmp) / "run" / "logs",
+                manifest_path=Path(tmp) / "run" / "manifest.json",
+            )
+            state.add_room("control", "known", "WXCD-W7-E2E-20260525-abc123xy control")
+            api = FakeApi()
+
+            deleted = harness.cleanup_untracked_prefix_rooms(state, api)
+
+            self.assertEqual(deleted, {"later"})
+            self.assertEqual(api.deleted, ["later"])
 
     def test_cleanup_prefix_scan_skips_unsafe_custom_prefix(self) -> None:
         class FakeApi:
@@ -1616,6 +1730,9 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             test_root = Path(tmp) / "run"
             test_root.mkdir()
+            cbth_home = Path(tmp) / "cbth-home"
+            release_a = Path(tmp) / "release-a"
+            release_b = Path(tmp) / "release-b"
             state = harness.RunState(
                 args=args,
                 repo_root=Path(tmp),
@@ -1631,6 +1748,8 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
 
             def fake_run(command: list[str], **kwargs: object) -> harness.subprocess.CompletedProcess[str]:
                 calls.append({"command": command, **kwargs})
+                kwargs["stdout"].write("upgrade output\n")
+                self.write_registry_release(cbth_home, release_b, args.release_b_id)
                 return harness.subprocess.CompletedProcess(command, 0)
 
             def fake_wait_until(name: str, timeout_seconds: int, probe: object) -> object:
@@ -1645,9 +1764,9 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             try:
                 harness.run_upgrade_smoke_or_block(
                     state,
-                    Path(tmp) / "release-a",
-                    Path(tmp) / "release-b",
-                    Path(tmp) / "cbth-home",
+                    release_a,
+                    release_b,
+                    cbth_home,
                     Path(tmp) / "lifecycle-a.sock",
                     Path(tmp) / "ingress-a.sock",
                     Path(tmp) / "lifecycle-b.sock",
@@ -1660,8 +1779,58 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
 
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0]["stdin"], harness.subprocess.DEVNULL)
+            self.assertIsNotNone(calls[0]["stdout"])
+            self.assertEqual(calls[0]["stderr"], harness.subprocess.STDOUT)
             self.assertEqual(calls[0]["timeout"], 7)
             self.assertEqual(state.manifest["webex_release_upgrade"]["status"], "passed")
+            log_path = Path(state.manifest["webex_release_upgrade"]["log_path"])
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "upgrade output\n")
+            self.assertEqual(log_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                state.manifest["webex_release_upgrade"]["registry_after"]["WXCD_RELEASE_DIR"],
+                str(release_b),
+            )
+
+    def test_upgrade_smoke_rejects_registry_that_still_points_to_release_a(self) -> None:
+        args = harness.build_parser().parse_args(["--cbth-upgrade-command", "cbth plugin upgrade {plugin}"])
+        with tempfile.TemporaryDirectory() as tmp:
+            test_root = Path(tmp) / "run"
+            test_root.mkdir()
+            cbth_home = Path(tmp) / "cbth-home"
+            release_a = Path(tmp) / "release-a"
+            release_b = Path(tmp) / "release-b"
+            self.write_registry_release(cbth_home, release_a, args.release_a_id)
+            state = harness.RunState(
+                args=args,
+                repo_root=Path(tmp),
+                test_root=test_root,
+                prefix="WXCD-W7-E2E-20260525-abc123xy",
+                logs_dir=test_root / "logs",
+                manifest_path=test_root / "manifest.json",
+            )
+            original_run = harness.subprocess.run
+            original_active_check = harness.active_check
+
+            def fake_run(command: list[str], **kwargs: object) -> harness.subprocess.CompletedProcess[str]:
+                return harness.subprocess.CompletedProcess(command, 0)
+
+            harness.subprocess.run = fake_run
+            harness.active_check = lambda socket_path: {"healthy": True}
+            try:
+                with self.assertRaisesRegex(harness.HarnessError, "did not activate"):
+                    harness.run_upgrade_smoke_or_block(
+                        state,
+                        release_a,
+                        release_b,
+                        cbth_home,
+                        Path(tmp) / "lifecycle-a.sock",
+                        Path(tmp) / "ingress-a.sock",
+                        Path(tmp) / "lifecycle-b.sock",
+                        Path(tmp) / "ingress-b.sock",
+                    )
+            finally:
+                harness.subprocess.run = original_run
+                harness.active_check = original_active_check
 
     def test_upgrade_smoke_timeout_unwinds_as_harness_error(self) -> None:
         args = harness.build_parser().parse_args(

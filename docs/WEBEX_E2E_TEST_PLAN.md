@@ -43,7 +43,7 @@ WXCD_LIVE_E2E=1 \
 python3 scripts/w7_live_upgrade_e2e.py --live --token-file token.txt --bot-env-file .env
 ```
 
-这个 optional command 只展开 `{plugin}`、`{release_a}`、`{release_b}`、`{release_a_id}`、`{release_b_id}`、`{cbth_home}` 和 `{prefix}`，并以关闭 stdin、有界 timeout 的方式执行；webex-connector 不复制 cbth generic release manager。未提供 optional command 时，W7 会记录 `webex_release_upgrade.status=skipped`，但仍执行 cbth C8 upgrade smoke、真实 Webex session turn 和 delivery smoke。
+这个 optional command 只展开 `{plugin}`、`{release_a}`、`{release_b}`、`{release_a_id}`、`{release_b_id}`、`{cbth_home}` 和 `{prefix}`，并以关闭 stdin、有界 timeout、stdout/stderr 写入私有 `logs/webex-release-upgrade.log` 的方式执行；webex-connector 不复制 cbth generic release manager。未提供 optional command 时，W7 会记录 `webex_release_upgrade.status=skipped`，但仍执行 cbth C8 upgrade smoke、真实 Webex session turn 和 delivery smoke。
 
 W7 harness 覆盖：
 
@@ -56,8 +56,8 @@ W7 harness 覆盖：
 - 使用 task-scoped `CBTH_HOME` 写入 cbth plugin registry，并通过清洗过的子进程环境启动 `cbth service run` / `wxcd-supervisor run`，避免继承生产 `WEBEX_*`、`WXCD_*` 或 `CBTH_*` 配置。
 - 通过真实 Webex 消息验证 `/help`、`list local`、`resume local <thread_id>`、history import、`/history`、`/history page 2` 和普通 session turn。
 - 通过 worker ingress socket 注入 `async_notification`，验证 W4 delivery-owned `delivery.enqueue` broker 路径。
-- 如果显式提供 Webex-specific release upgrade command，调用时关闭 stdin，并用 `--upgrade-timeout-seconds` 设置有界等待；命令成功后先确认旧 release 的 ingress/lifecycle sockets 不再接受连接，再验证新 release-scoped worker ingress health，并通过真实 Webex session turn 和 worker socket delivery smoke 分别验证升级后的 sidecar/Mercury 与 delivery 路径。未提供该 optional command 时，Webex live smoke 在当前 release 上继续跑 post-upgrade-smoke turn 与 delivery smoke，真实 upgrade ordering 由前置 C8 safe harness 覆盖。
-- 写入 task-scoped `manifest.json`；失败、blocked 或 cleanup 失败时默认保留 test root 供诊断，成功且 cleanup 干净时会先保留一份同级 `*-manifest.json` 成功证据，再自动清理 harness 自建的临时 test root，显式传入的 `--test-root` 始终保留；如果显式 test root 位于 repo 内，必须放在 ignored `.codex-tmp/` 下，避免含 secret 的 `wxcd.env` 变成可提交文件。cleanup 会删除 manifest 中的 prefixed rooms，其中 session room 使用 bot token 删除，并且只在 prefix 符合生成的 `WXCD-W7-E2E-YYYYMMDD-<8 chars>` 形状时分别用 developer/bot token 补扫未记录的临时 rooms。
+- 如果显式提供 Webex-specific release upgrade command，调用时关闭 stdin，并用 `--upgrade-timeout-seconds` 设置有界等待；命令成功后会验证 task-scoped cbth registry 已切到 release B 的 `release_id`、supervisor binary、`WXCD_RELEASE_DIR` 和 `WXCD_PLUGIN_MANIFEST_PATH`，再确认旧 release 的 ingress/lifecycle sockets 不再接受连接、验证新 release-scoped worker ingress health，并通过真实 Webex session turn 和 worker socket delivery smoke 分别验证升级后的 sidecar/Mercury 与 delivery 路径。未提供该 optional command 时，Webex live smoke 在当前 release 上继续跑 post-upgrade-smoke turn 与 delivery smoke，真实 upgrade ordering 由前置 C8 safe harness 覆盖。
+- 写入 task-scoped `manifest.json`；失败、blocked 或 cleanup 失败时默认保留 test root 供诊断，成功且 cleanup 干净时会先保留一份同级 `*-manifest.json` 成功证据，再自动清理 harness 自建的临时 test root，显式传入的 `--test-root` 始终保留；如果显式 test root 位于 repo 内，必须放在 ignored `.codex-tmp/` 下，避免含 secret 的 `wxcd.env` 变成可提交文件。cleanup 会删除 manifest 中的 prefixed rooms，其中 session room 使用 bot token 删除，并且只在 prefix 符合生成的 `WXCD-W7-E2E-YYYYMMDD-<8 chars>` 形状时分别用 developer/bot token 按 Webex room pagination 补扫未记录的临时 rooms；session room title lookup 同样会跟随 room pagination。
 
 ## 范围
 
