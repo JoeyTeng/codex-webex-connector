@@ -994,6 +994,25 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 else:
                     os.environ["WXCD_LIVE_E2E"] = old_live
 
+    def test_verify_command_executable_returns_expanded_user_path(self) -> None:
+        old_home = os.environ.get("HOME")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            tool = home / "bin" / "cbth"
+            tool.parent.mkdir(parents=True)
+            tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            tool.chmod(0o755)
+            os.environ["HOME"] = str(home)
+            try:
+                resolved = harness.verify_command_executable("~/bin/cbth", Path(tmp), "cbth")
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+
+            self.assertEqual(resolved, str(tool))
+
     def test_cleanup_does_not_parse_unverified_token_file(self) -> None:
         args = harness.build_parser().parse_args(["--token-file", "/tmp/tracked-token.txt"])
         with tempfile.TemporaryDirectory() as tmp:
@@ -1243,6 +1262,59 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             self.assertFalse(owned_root.exists())
             self.assertNotEqual(manifest_path, owned_root / "manifest.json")
             self.assertTrue(json.loads(manifest_path.read_text(encoding="utf-8"))["success_manifest_preserved"])
+
+    def test_main_cleans_up_after_keyboard_interrupt(self) -> None:
+        original_run_live = harness.run_live
+        original_cleanup_live = harness.cleanup_live
+        old_live = os.environ.get("WXCD_LIVE_E2E")
+        os.environ["WXCD_LIVE_E2E"] = "1"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            test_root = Path(tmp) / "run"
+            repo_root.mkdir()
+            cleanup_calls: list[str] = []
+
+            def fake_run_live(state: harness.RunState) -> None:
+                state.record("created_before_interrupt", True)
+                raise KeyboardInterrupt
+
+            def fake_cleanup_live(state: harness.RunState) -> bool:
+                cleanup_calls.append(str(state.test_root))
+                state.record("cleanup_called_after_interrupt", True)
+                return True
+
+            harness.run_live = fake_run_live
+            harness.cleanup_live = fake_cleanup_live
+            try:
+                output = StringIO()
+                with redirect_stdout(output):
+                    code = harness.main(
+                        [
+                            "--live",
+                            "--repo-root",
+                            str(repo_root),
+                            "--test-root",
+                            str(test_root),
+                            "--cbth-bin",
+                            "/bin/echo",
+                        ]
+                    )
+            finally:
+                harness.run_live = original_run_live
+                harness.cleanup_live = original_cleanup_live
+                if old_live is None:
+                    os.environ.pop("WXCD_LIVE_E2E", None)
+                else:
+                    os.environ["WXCD_LIVE_E2E"] = old_live
+
+            self.assertEqual(code, 130)
+            self.assertEqual(cleanup_calls, [str(test_root.resolve())])
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["status"], "failed")
+            self.assertEqual(payload["reason"], "interrupted")
+            manifest = json.loads(Path(payload["manifest"]).read_text(encoding="utf-8"))
+            self.assertTrue(manifest["cleanup_called_after_interrupt"])
 
     def test_cleanup_uses_bot_api_for_session_room(self) -> None:
         class FakeApi:

@@ -163,7 +163,7 @@ impl WebexClient {
     }
 
     pub async fn get_room(&self, room_id: &str) -> Result<Room> {
-        self.get(&format!("{BASE_URL}/rooms/{room_id}")).await
+        self.get(&resource_url("rooms", room_id)).await
     }
 
     pub async fn list_rooms(&self, max: usize) -> Result<Vec<Room>> {
@@ -181,7 +181,7 @@ impl WebexClient {
 
     pub async fn update_room_title(&self, room_id: &str, title: &str) -> Result<Room> {
         self.put(
-            &format!("{BASE_URL}/rooms/{room_id}"),
+            &resource_url("rooms", room_id),
             &UpdateRoomRequest { title },
         )
         .await
@@ -190,7 +190,7 @@ impl WebexClient {
     pub async fn delete_room(&self, room_id: &str) -> Result<()> {
         let response = self
             .inner
-            .delete(format!("{BASE_URL}/rooms/{room_id}"))
+            .delete(resource_url("rooms", room_id))
             .send()
             .await?;
         decode_empty_response(response).await
@@ -270,7 +270,7 @@ impl WebexClient {
         message_id: &str,
         request: &UpdateMessageRequest,
     ) -> Result<Message> {
-        self.put(&format!("{BASE_URL}/messages/{message_id}"), request)
+        self.put(&resource_url("messages", message_id), request)
             .await
     }
 
@@ -305,10 +305,8 @@ impl WebexClient {
         &self,
         attachment_action_id: &str,
     ) -> Result<AttachmentAction> {
-        self.get(&format!(
-            "{BASE_URL}/attachment/actions/{attachment_action_id}"
-        ))
-        .await
+        self.get(&resource_url("attachment/actions", attachment_action_id))
+            .await
     }
 
     async fn get<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
@@ -333,6 +331,30 @@ impl WebexClient {
         let response = self.inner.put(url).json(body).send().await?;
         decode_response(response).await
     }
+}
+
+fn resource_url(collection_path: &str, resource_id: &str) -> String {
+    let resource_id = encode_path_segment(resource_id);
+    format!("{BASE_URL}/{collection_path}/{resource_id}")
+}
+
+fn encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(char::from(HEX[(byte >> 4) as usize]));
+                encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+            }
+        }
+    }
+    encoded
 }
 
 async fn decode_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
@@ -402,6 +424,18 @@ fn decode_membership_response(status: StatusCode, body: String) -> Result<Ensure
 mod tests {
     use super::{EnsureMembership, decode_empty_response_body, decode_membership_response};
     use reqwest::StatusCode;
+
+    #[test]
+    fn encodes_resource_ids_as_single_path_segments() {
+        assert_eq!(
+            super::resource_url("rooms", "room/with+reserved="),
+            "https://webexapis.com/v1/rooms/room%2Fwith%2Breserved%3D"
+        );
+        assert_eq!(
+            super::resource_url("attachment/actions", "action/with space"),
+            "https://webexapis.com/v1/attachment/actions/action%2Fwith%20space"
+        );
+    }
 
     #[test]
     fn decodes_membership_success() {

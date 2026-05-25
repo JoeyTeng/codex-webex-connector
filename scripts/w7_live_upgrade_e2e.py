@@ -472,8 +472,8 @@ def upgrade_check_command_template(args: argparse.Namespace) -> str | None:
 
 
 def preflight_cbth_service_upgrade_smoke(args: argparse.Namespace, cwd: Path) -> None:
+    args.cbth_bin = verify_command_executable(args.cbth_bin, cwd, "cbth C8 service upgrade-smoke executable")
     command = [args.cbth_bin, "service", "upgrade-smoke", "--help"]
-    verify_command_executable(command[0], cwd, "cbth C8 service upgrade-smoke executable")
     try:
         subprocess.run(
             command,
@@ -519,7 +519,7 @@ def preflight_upgrade_command(
             cbth_home,
             prefix,
         )
-    verify_command_executable(command[0], cwd or Path.cwd(), "Webex release upgrade executable")
+    command[0] = verify_command_executable(command[0], cwd or Path.cwd(), "Webex release upgrade executable")
     if release_a is not None and release_b is not None and cbth_home is not None and prefix is not None:
         verify_upgrade_command_semantics(args, command, release_a, release_b, cbth_home, prefix, cwd or Path.cwd())
 
@@ -528,17 +528,18 @@ def verify_command_executable(
     executable: str,
     cwd: Path | None = None,
     label: str = "executable",
-) -> None:
+) -> str:
     if "{" in executable or "}" in executable:
-        return
+        return executable
     expanded = Path(executable).expanduser()
     if expanded.parent != Path(".") or any(separator in executable for separator in ("/", os.sep)):
         candidate = expanded if expanded.is_absolute() else (cwd or Path.cwd()) / expanded
         if candidate.is_file() and os.access(candidate, os.X_OK):
-            return
+            return str(candidate)
         raise BlockedError(f"{label} is unavailable: {executable}")
     if shutil.which(executable) is None:
         raise BlockedError(f"{label} is unavailable: {executable}")
+    return executable
 
 
 def verify_upgrade_command_semantics(
@@ -565,6 +566,7 @@ def verify_upgrade_command_semantics(
         check_command = inferred_cbth_plugin_upgrade_check(command)
         if check_command is None:
             raise BlockedError("custom Webex release upgrade command requires WXCD_E2E_CBTH_UPGRADE_CHECK_CMD")
+    check_command[0] = verify_command_executable(check_command[0], cwd, "Webex release upgrade check executable")
     try:
         subprocess.run(
             check_command,
@@ -1452,6 +1454,7 @@ def run_upgrade_smoke_or_block(
         cbth_home,
         state.prefix,
     )
+    command[0] = verify_command_executable(command[0], state.repo_root, "Webex release upgrade executable")
     before = active_check(ingress_socket)
     try:
         subprocess.run(
@@ -1783,26 +1786,49 @@ def main(argv: list[str] | None = None) -> int:
             "test_root": str(test_root),
         },
     )
+    exit_code = 1
+    payload: dict[str, Any]
     try:
         run_live(state)
         cleanup_ok = cleanup_live(state)
         if not cleanup_ok:
             state.record("result", "failed")
-            print(json.dumps({"status": "failed", "reason": "cleanup failed", "manifest": str(state.manifest_path)}, sort_keys=True))
-            return 1
-        print(json.dumps({"status": "passed", "manifest": str(state.manifest_path)}, sort_keys=True))
-        return 0
+            payload = {"status": "failed", "reason": "cleanup failed", "manifest": str(state.manifest_path)}
+            exit_code = 1
+        else:
+            payload = {"status": "passed", "manifest": str(state.manifest_path)}
+            exit_code = 0
     except BlockedError as error:
         state.record("result", "blocked")
         cleanup_live(state)
-        print(json.dumps({"status": "blocked", "reason": str(error), "manifest": str(state.manifest_path)}, sort_keys=True))
-        return 78
+        payload = {"status": "blocked", "reason": str(error), "manifest": str(state.manifest_path)}
+        exit_code = 78
+    except KeyboardInterrupt:
+        state.record("result", "failed")
+        state.record("error", "interrupted")
+        cleanup_live(state)
+        payload = {"status": "failed", "reason": "interrupted", "manifest": str(state.manifest_path)}
+        exit_code = 130
+    except SystemExit as error:
+        state.record("result", "failed")
+        state.record("error", f"system exit: {error.code}")
+        cleanup_live(state)
+        payload = {"status": "failed", "reason": f"system exit: {error.code}", "manifest": str(state.manifest_path)}
+        exit_code = system_exit_code(error)
     except Exception as error:  # noqa: BLE001
         state.record("result", "failed")
         state.record("error", str(error))
         cleanup_live(state)
-        print(json.dumps({"status": "failed", "reason": str(error), "manifest": str(state.manifest_path)}, sort_keys=True))
-        return 1
+        payload = {"status": "failed", "reason": str(error), "manifest": str(state.manifest_path)}
+        exit_code = 1
+    print(json.dumps(payload, sort_keys=True))
+    return exit_code
+
+
+def system_exit_code(error: SystemExit) -> int:
+    if isinstance(error.code, int) and error.code != 0:
+        return error.code
+    return 1
 
 
 if __name__ == "__main__":
