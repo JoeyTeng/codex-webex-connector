@@ -466,6 +466,7 @@ def preflight_cbth_service_upgrade_smoke(args: argparse.Namespace, cwd: Path) ->
         subprocess.run(
             command,
             cwd=cwd,
+            env=isolated_child_env(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1540,15 +1541,25 @@ def redact_command(command: Iterable[str]) -> list[str]:
 
 
 def cleanup_owned_test_root(state: RunState) -> None:
+    original_manifest_path = state.manifest_path
+    preserved_manifest_path = state.test_root.with_name(f"{state.test_root.name}-{RUN_MANIFEST}")
     try:
+        write_private_json(preserved_manifest_path, state.manifest)
         shutil.rmtree(state.test_root)
-    except FileNotFoundError:
-        return
     except Exception as error:  # noqa: BLE001
+        preserved_manifest_path.unlink(missing_ok=True)
+        state.manifest_path = original_manifest_path
         state.record_cleanup_error("cleanup_error_test_root", error)
         return
     if state.test_root.exists():
+        preserved_manifest_path.unlink(missing_ok=True)
+        state.manifest_path = original_manifest_path
         state.record_cleanup_error("cleanup_error_test_root", "test root still exists after cleanup")
+        return
+    state.manifest_path = preserved_manifest_path
+    state.manifest["success_manifest_preserved"] = True
+    state.manifest["deleted_test_root"] = str(state.test_root)
+    write_private_json(state.manifest_path, state.manifest)
 
 
 def cleanup_live(

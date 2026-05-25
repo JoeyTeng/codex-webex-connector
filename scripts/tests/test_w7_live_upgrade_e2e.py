@@ -346,6 +346,11 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
     def test_cbth_service_upgrade_smoke_preflight_uses_help_command(self) -> None:
         calls: list[dict[str, object]] = []
         original_run = harness.subprocess.run
+        old_values = {
+            "WEBEX_BOT_TOKEN": os.environ.get("WEBEX_BOT_TOKEN"),
+            "WXCD_CONFIG_PATH": os.environ.get("WXCD_CONFIG_PATH"),
+            "CBTH_HOME": os.environ.get("CBTH_HOME"),
+        }
 
         def fake_run(command: list[str], **kwargs: object) -> harness.subprocess.CompletedProcess[str]:
             calls.append({"command": command, **kwargs})
@@ -353,14 +358,27 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
 
         args = harness.build_parser().parse_args(["--cbth-bin", "/bin/echo"])
         harness.subprocess.run = fake_run
+        os.environ["WEBEX_BOT_TOKEN"] = "prod-token"
+        os.environ["WXCD_CONFIG_PATH"] = "/prod/wxcd.toml"
+        os.environ["CBTH_HOME"] = "/prod/cbth"
         try:
             harness.preflight_cbth_service_upgrade_smoke(args, Path("/tmp"))
         finally:
             harness.subprocess.run = original_run
+            for key, value in old_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
         self.assertEqual(calls[0]["command"], ["/bin/echo", "service", "upgrade-smoke", "--help"])
         self.assertEqual(calls[0]["stdin"], harness.subprocess.DEVNULL)
         self.assertEqual(calls[0]["timeout"], harness.UPGRADE_CHECK_TIMEOUT_SECONDS)
+        env = calls[0]["env"]
+        self.assertIsInstance(env, dict)
+        self.assertNotIn("WEBEX_BOT_TOKEN", env)
+        self.assertNotIn("WXCD_CONFIG_PATH", env)
+        self.assertNotIn("CBTH_HOME", env)
 
     def test_run_cbth_service_upgrade_smoke_records_c8_report(self) -> None:
         args = harness.build_parser().parse_args(["--cbth-bin", "/bin/echo"])
@@ -874,6 +892,11 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
 
             self.assertFalse(owned_root.exists())
             self.assertTrue(explicit_root.exists())
+            self.assertNotEqual(owned_state.manifest_path, owned_root / "manifest.json")
+            self.assertTrue(owned_state.manifest_path.exists())
+            preserved = json.loads(owned_state.manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(preserved["success_manifest_preserved"])
+            self.assertEqual(preserved["deleted_test_root"], str(owned_root))
 
     def test_cleanup_root_delete_error_marks_failure_and_preserves_diagnostics(self) -> None:
         args = harness.build_parser().parse_args([])
@@ -905,6 +928,51 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             self.assertTrue(test_root.exists())
             self.assertTrue(state.cleanup_failed)
             self.assertIn("cleanup_error_test_root", state.manifest)
+
+    def test_main_success_reports_preserved_manifest_for_owned_root(self) -> None:
+        original_run_live = harness.run_live
+        original_cleanup_live = harness.cleanup_live
+        original_mkdtemp = harness.tempfile.mkdtemp
+        old_live = os.environ.get("WXCD_LIVE_E2E")
+        os.environ["WXCD_LIVE_E2E"] = "1"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            owned_root = Path(tmp) / "owned-run"
+
+            def fake_mkdtemp(prefix: str) -> str:
+                owned_root.mkdir()
+                return str(owned_root)
+
+            def fake_run_live(state: harness.RunState) -> None:
+                state.record("result", "passed")
+
+            def fake_cleanup_live(state: harness.RunState) -> bool:
+                harness.cleanup_owned_test_root(state)
+                return not state.cleanup_failed
+
+            harness.tempfile.mkdtemp = fake_mkdtemp
+            harness.run_live = fake_run_live
+            harness.cleanup_live = fake_cleanup_live
+            try:
+                output = StringIO()
+                with redirect_stdout(output):
+                    code = harness.main(["--live", "--repo-root", str(Path(tmp)), "--cbth-bin", "/bin/echo"])
+            finally:
+                harness.tempfile.mkdtemp = original_mkdtemp
+                harness.run_live = original_run_live
+                harness.cleanup_live = original_cleanup_live
+                if old_live is None:
+                    os.environ.pop("WXCD_LIVE_E2E", None)
+                else:
+                    os.environ["WXCD_LIVE_E2E"] = old_live
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            manifest_path = Path(payload["manifest"])
+            self.assertTrue(manifest_path.exists())
+            self.assertFalse(owned_root.exists())
+            self.assertNotEqual(manifest_path, owned_root / "manifest.json")
+            self.assertTrue(json.loads(manifest_path.read_text(encoding="utf-8"))["success_manifest_preserved"])
 
     def test_cleanup_uses_bot_api_for_session_room(self) -> None:
         class FakeApi:
