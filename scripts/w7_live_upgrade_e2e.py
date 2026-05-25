@@ -256,6 +256,7 @@ class CodexAppServer:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
+            env=isolated_child_env(),
             text=True,
             encoding="utf-8",
             bufsize=1,
@@ -595,6 +596,7 @@ def ensure_untracked(path: Path, repo_root: Path) -> None:
         subprocess.run(
             ["git", "ls-files", "--error-unmatch", pathspec],
             cwd=repo_root,
+            env=isolated_child_env(),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True,
@@ -926,14 +928,17 @@ def prepare_release_dirs(state: RunState) -> tuple[Path, Path]:
 
     print("Building release binaries for isolated live smoke.")
     ensure_sidecar_dependencies(state)
+    build_env = isolated_child_env()
     subprocess.run(
         ["cargo", "build", "--release", "--package", "wxcd-worker", "--package", "wxcd-supervisor"],
         cwd=state.repo_root,
+        env=build_env,
         check=True,
     )
     target_dir = subprocess.check_output(
         ["cargo", "metadata", "--format-version", "1", "--no-deps"],
         cwd=state.repo_root,
+        env=build_env,
         text=True,
     )
     target_path = Path(json.loads(target_dir)["target_directory"])
@@ -969,6 +974,7 @@ def ensure_sidecar_dependencies(state: RunState) -> None:
     subprocess.run(
         [pnpm_bin, "--dir", str(sidecar_dir), "install", "--frozen-lockfile"],
         cwd=state.repo_root,
+        env=isolated_child_env(),
         check=True,
     )
     if not sidecar_dependencies_present(sidecar_dir):

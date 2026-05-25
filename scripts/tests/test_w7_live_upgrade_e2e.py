@@ -320,6 +320,44 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         self.assertNotIn("CBTH_HOME", env)
         self.assertEqual(env["WXCD_CONFIG_PATH"], "/tmp/test/wxcd.toml")
 
+    def test_ensure_untracked_scrubs_git_subprocess_env(self) -> None:
+        old_values = {
+            "WEBEX_BOT_TOKEN": os.environ.get("WEBEX_BOT_TOKEN"),
+            "WXCD_CONFIG_PATH": os.environ.get("WXCD_CONFIG_PATH"),
+            "CBTH_HOME": os.environ.get("CBTH_HOME"),
+        }
+        os.environ["WEBEX_BOT_TOKEN"] = "prod-token"
+        os.environ["WXCD_CONFIG_PATH"] = "/prod/wxcd.toml"
+        os.environ["CBTH_HOME"] = "/prod/cbth"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            path = repo_root / "token.txt"
+            path.write_text("secret", encoding="utf-8")
+            calls: list[dict[str, object]] = []
+            original_run = harness.subprocess.run
+
+            def fake_run(command: list[str], **kwargs: object) -> harness.subprocess.CompletedProcess[str]:
+                calls.append({"command": command, **kwargs})
+                raise harness.subprocess.CalledProcessError(1, command)
+
+            harness.subprocess.run = fake_run
+            try:
+                harness.ensure_untracked(path, repo_root)
+            finally:
+                harness.subprocess.run = original_run
+                for key, value in old_values.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+        self.assertEqual(len(calls), 1)
+        env = calls[0]["env"]
+        self.assertIsInstance(env, dict)
+        self.assertNotIn("WEBEX_BOT_TOKEN", env)
+        self.assertNotIn("WXCD_CONFIG_PATH", env)
+        self.assertNotIn("CBTH_HOME", env)
+
     def test_upgrade_command_env_uses_task_scoped_cbth_home(self) -> None:
         old_values = {
             "WEBEX_BOT_TOKEN": os.environ.get("WEBEX_BOT_TOKEN"),
@@ -606,6 +644,120 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             )
             with self.assertRaises(harness.BlockedError):
                 harness.prepare_release_dirs(state)
+
+    def test_prepare_release_dirs_scrubs_build_subprocess_env(self) -> None:
+        args = harness.build_parser().parse_args(["--live"])
+        old_values = {
+            "WEBEX_BOT_TOKEN": os.environ.get("WEBEX_BOT_TOKEN"),
+            "WXCD_CONFIG_PATH": os.environ.get("WXCD_CONFIG_PATH"),
+            "CBTH_HOME": os.environ.get("CBTH_HOME"),
+        }
+        os.environ["WEBEX_BOT_TOKEN"] = "prod-token"
+        os.environ["WXCD_CONFIG_PATH"] = "/prod/wxcd.toml"
+        os.environ["CBTH_HOME"] = "/prod/cbth"
+        with tempfile.TemporaryDirectory() as tmp:
+            state = harness.RunState(
+                args=args,
+                repo_root=Path(tmp),
+                test_root=Path(tmp) / "run",
+                prefix="WXCD-W7-TEST",
+                logs_dir=Path(tmp) / "run" / "logs",
+                manifest_path=Path(tmp) / "run" / "manifest.json",
+            )
+            calls: list[dict[str, object]] = []
+            original_ensure = harness.ensure_sidecar_dependencies
+            original_run = harness.subprocess.run
+            original_check_output = harness.subprocess.check_output
+            original_stage_release = harness.stage_release
+
+            def fake_run(command: list[str], **kwargs: object) -> harness.subprocess.CompletedProcess[str]:
+                calls.append({"command": command, **kwargs})
+                return harness.subprocess.CompletedProcess(command, 0)
+
+            def fake_check_output(command: list[str], **kwargs: object) -> str:
+                calls.append({"command": command, **kwargs})
+                return json.dumps({"target_directory": str(Path(tmp) / "target")})
+
+            def fake_stage_release(
+                state: harness.RunState, target_dir: Path, label: str
+            ) -> Path:
+                return state.test_root / "releases" / label
+
+            harness.ensure_sidecar_dependencies = lambda state: None
+            harness.subprocess.run = fake_run
+            harness.subprocess.check_output = fake_check_output
+            harness.stage_release = fake_stage_release
+            try:
+                harness.prepare_release_dirs(state)
+            finally:
+                harness.ensure_sidecar_dependencies = original_ensure
+                harness.subprocess.run = original_run
+                harness.subprocess.check_output = original_check_output
+                harness.stage_release = original_stage_release
+                for key, value in old_values.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            env = call["env"]
+            self.assertIsInstance(env, dict)
+            self.assertNotIn("WEBEX_BOT_TOKEN", env)
+            self.assertNotIn("WXCD_CONFIG_PATH", env)
+            self.assertNotIn("CBTH_HOME", env)
+
+    def test_ensure_sidecar_dependencies_scrubs_pnpm_install_env(self) -> None:
+        args = harness.build_parser().parse_args(["--live"])
+        old_values = {
+            "WEBEX_BOT_TOKEN": os.environ.get("WEBEX_BOT_TOKEN"),
+            "WXCD_CONFIG_PATH": os.environ.get("WXCD_CONFIG_PATH"),
+            "CBTH_HOME": os.environ.get("CBTH_HOME"),
+        }
+        os.environ["WEBEX_BOT_TOKEN"] = "prod-token"
+        os.environ["WXCD_CONFIG_PATH"] = "/prod/wxcd.toml"
+        os.environ["CBTH_HOME"] = "/prod/cbth"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            sidecar_dir = repo_root / "sidecars" / "webex-ws-sidecar"
+            sidecar_dir.mkdir(parents=True)
+            state = harness.RunState(
+                args=args,
+                repo_root=repo_root,
+                test_root=repo_root / "run",
+                prefix="WXCD-W7-TEST",
+                logs_dir=repo_root / "run" / "logs",
+                manifest_path=repo_root / "run" / "manifest.json",
+            )
+            calls: list[dict[str, object]] = []
+            original_which = harness.shutil.which
+            original_run = harness.subprocess.run
+
+            def fake_run(command: list[str], **kwargs: object) -> harness.subprocess.CompletedProcess[str]:
+                calls.append({"command": command, **kwargs})
+                (sidecar_dir / "node_modules" / "@webex" / "webex-core").mkdir(parents=True)
+                return harness.subprocess.CompletedProcess(command, 0)
+
+            harness.shutil.which = lambda name: "/usr/bin/pnpm" if name == "pnpm" else original_which(name)
+            harness.subprocess.run = fake_run
+            try:
+                harness.ensure_sidecar_dependencies(state)
+            finally:
+                harness.shutil.which = original_which
+                harness.subprocess.run = original_run
+                for key, value in old_values.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+        self.assertEqual(len(calls), 1)
+        env = calls[0]["env"]
+        self.assertIsInstance(env, dict)
+        self.assertNotIn("WEBEX_BOT_TOKEN", env)
+        self.assertNotIn("WXCD_CONFIG_PATH", env)
+        self.assertNotIn("CBTH_HOME", env)
 
     def test_validate_release_dir_requires_sidecar_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
