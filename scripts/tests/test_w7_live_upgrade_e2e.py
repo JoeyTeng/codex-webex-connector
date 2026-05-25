@@ -89,6 +89,49 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             with self.assertRaisesRegex(harness.HarnessError, "WEBEX_BOT_TOKEN.*string"):
                 harness.parse_bot_env_file(path)
 
+    def test_record_writes_developer_summary_as_json_without_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = harness.RunState(
+                args=harness.build_parser().parse_args([]),
+                repo_root=Path(tmp),
+                test_root=Path(tmp) / "run",
+                prefix="WXCD-W7-TEST",
+                logs_dir=Path(tmp) / "run" / "logs",
+                manifest_path=Path(tmp) / "run" / "manifest.json",
+            )
+            developer = harness.DeveloperToken(
+                email="dev@example.com",
+                bearer=harness.SecretText("secret-token"),
+                ord_id="ord-123",
+            )
+
+            state.record("developer_token", developer.redacted_summary)
+
+            manifest_text = state.manifest_path.read_text(encoding="utf-8")
+            self.assertEqual(
+                json.loads(manifest_text)["developer_token"],
+                {"email": "dev@example.com", "bearer_len": 12, "ord_id_len": 7},
+            )
+            self.assertNotIn("secret-token", manifest_text)
+
+    def test_record_does_not_pollute_manifest_after_json_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = harness.RunState(
+                args=harness.build_parser().parse_args([]),
+                repo_root=Path(tmp),
+                test_root=Path(tmp) / "run",
+                prefix="WXCD-W7-TEST",
+                logs_dir=Path(tmp) / "run" / "logs",
+                manifest_path=Path(tmp) / "run" / "manifest.json",
+            )
+            state.record("ok", {"value": True})
+
+            with self.assertRaises(TypeError):
+                state.record("bad", object())
+
+            self.assertNotIn("bad", state.manifest)
+            self.assertNotIn("bad", json.loads(state.manifest_path.read_text(encoding="utf-8")))
+
     def test_fnv1a_matches_offset_basis_for_empty_string(self) -> None:
         self.assertEqual(harness.fnv1a_hex(""), "cbf29ce484222325")
 

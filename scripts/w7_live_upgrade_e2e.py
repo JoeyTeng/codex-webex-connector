@@ -115,8 +115,10 @@ class RunState:
     cleanup_failed: bool = False
 
     def record(self, key: str, value: Any) -> None:
-        self.manifest[key] = value
-        write_private_json(self.manifest_path, self.manifest)
+        candidate = dict(self.manifest)
+        candidate[key] = value
+        write_private_json(self.manifest_path, candidate)
+        self.manifest = candidate
 
     def add_room(self, label: str, room_id: str, title: str) -> None:
         self.created_rooms[label] = room_id
