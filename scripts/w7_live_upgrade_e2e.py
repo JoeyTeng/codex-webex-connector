@@ -1128,8 +1128,18 @@ def copy_explicit_release_dir(state: RunState, source: Path, label: str, *, requ
     return destination
 
 
+def validate_release_manifest_path_scope(release_dir: Path, manifest_path: Path) -> None:
+    try:
+        release_root = release_dir.resolve()
+        manifest_resolved = manifest_path.resolve()
+        manifest_resolved.relative_to(release_root)
+    except (OSError, ValueError) as error:
+        raise BlockedError(f"release plugin manifest resolves outside release dir: {manifest_path}") from error
+
+
 def validate_release_dir(path: Path, *, require_enabled_manifest: bool = True) -> None:
     manifest_path = path / "plugin" / "manifest.json"
+    validate_release_manifest_path_scope(path, manifest_path)
     required = [
         path / "bin" / "wxcd-worker",
         path / "bin" / "wxcd-supervisor",
@@ -1322,6 +1332,7 @@ def write_cbth_upgrade_manifest(
     plugin_release_id: str,
 ) -> Path:
     manifest_path = release_dir / "plugin" / "manifest.json"
+    validate_release_manifest_path_scope(release_dir, manifest_path)
     manifest = read_release_plugin_manifest(manifest_path)
     manifest.update(
         {
@@ -1891,7 +1902,19 @@ def validate_upgrade_command_placeholders(parts: Iterable[str]) -> None:
         raise BlockedError(f"malformed Webex release upgrade command placeholder in: {redact_command(malformed)}")
 
 
-SENSITIVE_COMMAND_TERMS = ("token", "bearer")
+SENSITIVE_COMMAND_TERMS = (
+    "token",
+    "bearer",
+    "authorization",
+    "password",
+    "passwd",
+    "secret",
+    "api-key",
+    "api_key",
+    "apikey",
+    "client-secret",
+    "client_secret",
+)
 BARE_SENSITIVE_COMMAND_KEYS = frozenset(SENSITIVE_COMMAND_TERMS)
 
 

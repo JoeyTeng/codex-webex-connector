@@ -508,9 +508,13 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         old_upgrade = os.environ.get("WXCD_E2E_CBTH_UPGRADE_CMD")
         old_check = os.environ.get("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD")
         os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = (
-            "cbth plugin upgrade {plugin} --token secret-token --bearer=secret-bearer"
+            "cbth plugin upgrade {plugin} --token secret-token --bearer=secret-bearer "
+            "--password secret-password --api-key=secret-api-key client_secret=secret-client"
         )
-        os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = "cbth plugin upgrade --help WEBEX_BOT_TOKEN=secret-bot-token"
+        os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = (
+            "cbth plugin upgrade --help WEBEX_BOT_TOKEN=secret-bot-token "
+            "--client-secret secret-check-secret"
+        )
         output = StringIO()
 
         try:
@@ -531,6 +535,10 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         self.assertNotIn("secret-token", payload_text)
         self.assertNotIn("secret-bearer", payload_text)
         self.assertNotIn("secret-bot-token", payload_text)
+        self.assertNotIn("secret-password", payload_text)
+        self.assertNotIn("secret-api-key", payload_text)
+        self.assertNotIn("secret-client", payload_text)
+        self.assertNotIn("secret-check-secret", payload_text)
         payload = json.loads(payload_text)
         self.assertEqual(payload["webex_release_upgrade_command_source"], "environment")
         self.assertIn("<redacted>", payload["webex_release_upgrade_command_template"])
@@ -642,6 +650,12 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 "--bearer=secret-bearer",
                 "WEBEX_BOT_TOKEN=env-secret",
                 "Authorization: Bearer header-secret",
+                "--password",
+                "secret-password",
+                "--api-key=secret-api-key",
+                "client_secret=secret-client",
+                "--client-secret",
+                "split-client-secret",
                 "token",
                 "next-secret",
                 "secret-token-value",
@@ -659,6 +673,12 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 "--bearer=<redacted>",
                 "WEBEX_BOT_TOKEN=<redacted>",
                 "<redacted>",
+                "--password",
+                "<redacted>",
+                "--api-key=<redacted>",
+                "client_secret=<redacted>",
+                "--client-secret",
+                "<redacted>",
                 "token",
                 "<redacted>",
                 "<redacted>",
@@ -669,6 +689,10 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             "secret-bearer",
             "env-secret",
             "header-secret",
+            "secret-password",
+            "secret-api-key",
+            "secret-client",
+            "split-client-secret",
             "next-secret",
             "secret-token-value",
         ]:
@@ -1173,6 +1197,33 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             self.assertNotIn("executable_path", source_manifest)
             self.assertEqual(copied_manifest["executable_path"], "bin/wxcd-supervisor")
             self.assertEqual(copied_manifest["release_id"], "w7-b")
+
+    def test_explicit_release_copy_rejects_plugin_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source_release_a = Path(tmp) / "source-release-a"
+            source_release_b = Path(tmp) / "source-release-b"
+            external_plugin = Path(tmp) / "external-plugin"
+            self.write_minimal_release_dir(source_release_a, {"name": harness.PLUGIN_NAME})
+            self.write_minimal_release_dir(source_release_b, {"name": harness.PLUGIN_NAME, "enabled": True})
+            (source_release_b / "plugin" / "manifest.json").unlink()
+            (source_release_b / "plugin").rmdir()
+            external_plugin.mkdir()
+            (external_plugin / "manifest.json").write_text(json.dumps({"enabled": True}), encoding="utf-8")
+            os.symlink(external_plugin, source_release_b / "plugin")
+            args = harness.build_parser().parse_args(
+                ["--live", "--release-a", str(source_release_a), "--release-b", str(source_release_b)]
+            )
+            state = harness.RunState(
+                args=args,
+                repo_root=Path(tmp),
+                test_root=Path(tmp) / "run",
+                prefix="WXCD-W7-TEST",
+                logs_dir=Path(tmp) / "run" / "logs",
+                manifest_path=Path(tmp) / "run" / "manifest.json",
+            )
+
+            with self.assertRaisesRegex(harness.BlockedError, "resolves outside release dir"):
+                harness.prepare_release_dirs(state)
 
     def test_prepare_release_dirs_scrubs_build_subprocess_env(self) -> None:
         args = harness.build_parser().parse_args(["--live"])
