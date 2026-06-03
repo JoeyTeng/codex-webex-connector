@@ -462,10 +462,18 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = old_upgrade
 
     def test_dry_run_reports_default_c9_upgrade_template_and_safe_check(self) -> None:
+        old_upgrade = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CMD", None)
+        old_check = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)
         output = StringIO()
 
-        with redirect_stdout(output):
-            code = harness.main(["--cbth-bin", "/opt/cbth-c9/bin/cbth"])
+        try:
+            with redirect_stdout(output):
+                code = harness.main(["--cbth-bin", "/opt/cbth-c9/bin/cbth"])
+        finally:
+            if old_upgrade is not None:
+                os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = old_upgrade
+            if old_check is not None:
+                os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = old_check
 
         self.assertEqual(code, 0)
         payload = json.loads(output.getvalue())
@@ -789,18 +797,26 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             )
 
     def test_default_upgrade_command_expands_c9_template_with_cbth_bin(self) -> None:
+        old_upgrade = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CMD", None)
+        old_check = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)
         args = harness.build_parser().parse_args(["--cbth-bin", "/opt/cbth-c9/bin/cbth"])
 
-        command = harness.expand_upgrade_command(
-            harness.upgrade_command_template(args),
-            Path("/old release"),
-            Path("/new release"),
-            "w7-a",
-            "w7-b",
-            Path("/tmp/cbth-home"),
-            "WXCD-W7",
-            args.cbth_bin,
-        )
+        try:
+            command = harness.expand_upgrade_command(
+                harness.upgrade_command_template(args),
+                Path("/old release"),
+                Path("/new release"),
+                "w7-a",
+                "w7-b",
+                Path("/tmp/cbth-home"),
+                "WXCD-W7",
+                args.cbth_bin,
+            )
+        finally:
+            if old_upgrade is not None:
+                os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = old_upgrade
+            if old_check is not None:
+                os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = old_check
 
         self.assertEqual(
             command,
@@ -850,6 +866,8 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                     os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = old_check
 
     def test_default_c9_upgrade_check_preflight_uses_cbth_bin_help_command(self) -> None:
+        old_upgrade = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CMD", None)
+        old_check = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)
         args = harness.build_parser().parse_args(["--cbth-bin", "/bin/echo"])
         calls: list[dict[str, object]] = []
         original_run = harness.subprocess.run
@@ -884,6 +902,10 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                         os.environ.pop(key, None)
                     else:
                         os.environ[key] = value
+                if old_upgrade is not None:
+                    os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = old_upgrade
+                if old_check is not None:
+                    os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = old_check
 
         self.assertEqual(
             calls[0]["command"],
