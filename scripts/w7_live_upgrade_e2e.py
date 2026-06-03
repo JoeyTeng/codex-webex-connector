@@ -1081,7 +1081,16 @@ def prepare_release_dirs(state: RunState) -> tuple[Path, Path]:
     if release_a and release_b:
         validate_release_dir(release_a, require_enabled_manifest=False)
         validate_release_dir(release_b)
-        return release_a, release_b
+        copied_release_a = copy_explicit_release_dir(state, release_a, "release-a", require_enabled_manifest=False)
+        copied_release_b = copy_explicit_release_dir(state, release_b, "release-b", require_enabled_manifest=True)
+        state.record(
+            "input_release_dirs",
+            {
+                "release_a": str(release_a),
+                "release_b": str(release_b),
+            },
+        )
+        return copied_release_a, copied_release_b
     if state.args.no_build_release:
         raise BlockedError("--release-a and --release-b are required when --no-build-release is set")
 
@@ -1104,6 +1113,19 @@ def prepare_release_dirs(state: RunState) -> tuple[Path, Path]:
     release_a = stage_release(state, target_path, "release-a")
     release_b = stage_release(state, target_path, "release-b")
     return release_a, release_b
+
+
+def copy_explicit_release_dir(state: RunState, source: Path, label: str, *, require_enabled_manifest: bool) -> Path:
+    destination = state.test_root / "releases" / label
+    if source == destination:
+        validate_release_dir(destination, require_enabled_manifest=require_enabled_manifest)
+        return destination
+    if destination.exists():
+        raise BlockedError(f"release staging destination already exists: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, destination, symlinks=True)
+    validate_release_dir(destination, require_enabled_manifest=require_enabled_manifest)
+    return destination
 
 
 def validate_release_dir(path: Path, *, require_enabled_manifest: bool = True) -> None:

@@ -1099,10 +1099,14 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 manifest_path=Path(tmp) / "run" / "manifest.json",
             )
 
+            copied_release_a = Path(tmp) / "run" / "releases" / "release-a"
+            copied_release_b = Path(tmp) / "run" / "releases" / "release-b"
             self.assertEqual(
                 harness.prepare_release_dirs(state),
-                (release_a.resolve(), release_b.resolve()),
+                (copied_release_a, copied_release_b),
             )
+            self.assertTrue((copied_release_a / "plugin" / "manifest.json").exists())
+            self.assertTrue((copied_release_b / "plugin" / "manifest.json").exists())
 
     def test_prepare_release_dirs_requires_enabled_release_b_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1124,6 +1128,51 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
 
             with self.assertRaisesRegex(harness.HarnessError, "enabled=true"):
                 harness.prepare_release_dirs(state)
+
+    def test_explicit_release_copy_is_mutated_without_touching_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source_release_a = Path(tmp) / "source-release-a"
+            source_release_b = Path(tmp) / "source-release-b"
+            self.write_minimal_release_dir(source_release_a, {"name": harness.PLUGIN_NAME})
+            self.write_minimal_release_dir(
+                source_release_b,
+                {
+                    "name": harness.PLUGIN_NAME,
+                    "enabled": True,
+                    "version": "0.1.0",
+                    "entrypoint": {"binary": "../bin/wxcd-supervisor", "args": ["run"]},
+                    "capabilities": [{"name": "plugin-rpc-v1"}],
+                    "config_schema": {"type": "object"},
+                },
+            )
+            args = harness.build_parser().parse_args(
+                ["--live", "--release-a", str(source_release_a), "--release-b", str(source_release_b)]
+            )
+            state = harness.RunState(
+                args=args,
+                repo_root=Path(tmp),
+                test_root=Path(tmp) / "run",
+                prefix="WXCD-W7-TEST",
+                logs_dir=Path(tmp) / "run" / "logs",
+                manifest_path=Path(tmp) / "run" / "manifest.json",
+            )
+
+            _, copied_release_b = harness.prepare_release_dirs(state)
+            harness.write_cbth_upgrade_manifest(
+                state,
+                Path(tmp) / "cbth-home",
+                copied_release_b,
+                Path(tmp) / "wxcd.toml",
+                Path(tmp) / "wxcd.env",
+                "w7-instance",
+                "w7-b",
+            )
+
+            source_manifest = json.loads((source_release_b / "plugin" / "manifest.json").read_text(encoding="utf-8"))
+            copied_manifest = json.loads((copied_release_b / "plugin" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertNotIn("executable_path", source_manifest)
+            self.assertEqual(copied_manifest["executable_path"], "bin/wxcd-supervisor")
+            self.assertEqual(copied_manifest["release_id"], "w7-b")
 
     def test_prepare_release_dirs_scrubs_build_subprocess_env(self) -> None:
         args = harness.build_parser().parse_args(["--live"])

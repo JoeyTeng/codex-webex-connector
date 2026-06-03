@@ -44,7 +44,7 @@ W8 将真实 Webex connector 的 release A/B 切换 hook 接到 cbth C9 已合�
   --json
 ```
 
-`{cbth_bin}` 会绑定到 `--cbth-bin` 解析后的 executable，所以 W9 可以显式传入包含 C8/C9 的 cbth binary，而不依赖 `PATH` 上的 `cbth`。`--manifest-path` 可由 C9 接受为绝对路径或相对 `--release-dir` 的路径；W8 默认使用 release B 下的绝对 manifest 路径。repo 自带 `plugin/manifest.json` 保留 Webex packaging metadata；live run 会在 staged release B 中把同一路径补写为 C9-compatible `PluginManifest` object，包含 `name`、`executable_path`、`args`、`enabled=true`、`release_id`、string-array `capabilities` 和 task-scoped `environment`。不满足 C9 schema 时，W7 harness 会在执行 upgrade 前 fail closed。
+`{cbth_bin}` 会绑定到 `--cbth-bin` 解析后的 executable，所以 W9 可以显式传入包含 C8/C9 的 cbth binary，而不依赖 `PATH` 上的 `cbth`。`--manifest-path` 可由 C9 接受为绝对路径或相对 `--release-dir` 的路径；W8 默认使用 release B 下的绝对 manifest 路径。repo 自带 `plugin/manifest.json` 保留 Webex packaging metadata；live run 会在 staged release B 中把同一路径补写为 C9-compatible `PluginManifest` object，包含 `name`、`executable_path`、`args`、`enabled=true`、`release_id`、string-array `capabilities` 和 task-scoped `environment`。显式传入的 `--release-a` / `--release-b` 会先复制到 `test_root/releases/`，后续 manifest 写入和 cbth 执行只使用该 task-scoped copy，不改写原始 release artifact。不满足 C9 schema 时，W7 harness 会在执行 upgrade 前 fail closed。
 
 初始 live preflight 会先用 scrubbed env、closed stdin 执行一个不需要 release context 的 C9 help check，确保指定 `--cbth-bin` 已包含 C9 operator command：
 
