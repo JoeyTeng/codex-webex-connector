@@ -567,6 +567,21 @@ def upgrade_check_command_template(args: argparse.Namespace) -> str | None:
     return args.cbth_upgrade_check_command or os.environ.get("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD")
 
 
+def upgrade_command_uses_c9_plugin_upgrade(args: argparse.Namespace) -> bool:
+    template = upgrade_command_template(args)
+    if not template:
+        return False
+    try:
+        command = shlex.split(template)
+    except ValueError:
+        return False
+    return inferred_cbth_plugin_upgrade_check(command) is not None
+
+
+def expand_initial_upgrade_command_placeholders(command: list[str], args: argparse.Namespace) -> list[str]:
+    return [part.replace("{cbth_bin}", args.cbth_bin) for part in command]
+
+
 def redact_command_template_for_display(template: str | None) -> str | None:
     if template is None:
         return None
@@ -619,6 +634,11 @@ def preflight_upgrade_command(
     if not has_release_context and upgrade_command_template_source(args) == "cbth-c9-default":
         preflight_default_c9_plugin_upgrade(args, cwd or Path.cwd())
         return
+    if not has_release_context:
+        command = expand_initial_upgrade_command_placeholders(command, args)
+        if upgrade_command_uses_c9_plugin_upgrade(args) and command[0] == args.cbth_bin:
+            preflight_default_c9_plugin_upgrade(args, cwd or Path.cwd())
+            return
     if has_release_context:
         command = expand_upgrade_command(
             template,
@@ -1076,13 +1096,19 @@ def stop_processes(state: RunState) -> None:
 def prepare_release_dirs(state: RunState) -> tuple[Path, Path]:
     release_a = Path(state.args.release_a).expanduser().resolve() if state.args.release_a else None
     release_b = Path(state.args.release_b).expanduser().resolve() if state.args.release_b else None
+    require_c9_manifest = upgrade_command_uses_c9_plugin_upgrade(state.args)
     if (release_a is None) != (release_b is None):
         raise BlockedError("--release-a and --release-b must be provided together")
     if release_a and release_b:
         validate_release_dir(release_a, require_enabled_manifest=False)
-        validate_release_dir(release_b)
+        validate_release_dir(release_b, require_enabled_manifest=require_c9_manifest)
         copied_release_a = copy_explicit_release_dir(state, release_a, "release-a", require_enabled_manifest=False)
-        copied_release_b = copy_explicit_release_dir(state, release_b, "release-b", require_enabled_manifest=True)
+        copied_release_b = copy_explicit_release_dir(
+            state,
+            release_b,
+            "release-b",
+            require_enabled_manifest=require_c9_manifest,
+        )
         state.record(
             "input_release_dirs",
             {
@@ -1365,6 +1391,35 @@ def write_cbth_upgrade_manifest(
     return manifest_path
 
 
+def maybe_write_cbth_upgrade_manifest(
+    state: RunState,
+    cbth_home: Path,
+    release_dir: Path,
+    config_path: Path,
+    env_path: Path,
+    plugin_instance_id: str,
+    plugin_release_id: str,
+) -> Path | None:
+    if not upgrade_command_uses_c9_plugin_upgrade(state.args):
+        state.record(
+            "cbth_upgrade_manifest",
+            {
+                "status": "skipped",
+                "reason": "custom upgrade command is not cbth C9 plugin upgrade",
+            },
+        )
+        return None
+    return write_cbth_upgrade_manifest(
+        state,
+        cbth_home,
+        release_dir,
+        config_path,
+        env_path,
+        plugin_instance_id,
+        plugin_release_id,
+    )
+
+
 def write_cbth_registry(
     state: RunState,
     cbth_home: Path,
@@ -1509,7 +1564,7 @@ def run_live(state: RunState) -> None:
         plugin_instance_id,
         plugin_release_id,
     )
-    write_cbth_upgrade_manifest(
+    maybe_write_cbth_upgrade_manifest(
         state,
         cbth_home,
         release_b,

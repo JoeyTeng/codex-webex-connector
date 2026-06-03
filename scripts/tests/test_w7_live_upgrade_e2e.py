@@ -908,6 +908,33 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             ],
         )
 
+    def test_upgrade_command_uses_c9_manifest_only_for_plugin_upgrade_shape(self) -> None:
+        old_upgrade = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CMD", None)
+        old_check = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)
+        try:
+            default_args = harness.build_parser().parse_args([])
+            custom_c9_args = harness.build_parser().parse_args(
+                [
+                    "--cbth-upgrade-command",
+                    '{cbth_bin} --home "{cbth_home}" plugin upgrade {plugin} --release-id "{release_b_id}"',
+                ]
+            )
+            custom_non_c9_args = harness.build_parser().parse_args(
+                [
+                    "--cbth-upgrade-command",
+                    'tools/w7-upgrade --from "{release_a}" --to "{release_b}"',
+                ]
+            )
+
+            self.assertTrue(harness.upgrade_command_uses_c9_plugin_upgrade(default_args))
+            self.assertTrue(harness.upgrade_command_uses_c9_plugin_upgrade(custom_c9_args))
+            self.assertFalse(harness.upgrade_command_uses_c9_plugin_upgrade(custom_non_c9_args))
+        finally:
+            if old_upgrade is not None:
+                os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = old_upgrade
+            if old_check is not None:
+                os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = old_check
+
     def test_preflight_upgrade_command_rejects_missing_cbth_upgrade_subcommand(self) -> None:
         old_check = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)
         with tempfile.TemporaryDirectory() as tmp:
@@ -979,6 +1006,38 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         self.assertNotIn("WEBEX_BOT_TOKEN", env)
         self.assertNotIn("WXCD_CONFIG_PATH", env)
         self.assertNotIn("CBTH_HOME", env)
+
+    def test_custom_c9_initial_preflight_expands_cbth_bin_help_command(self) -> None:
+        old_upgrade = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CMD", None)
+        old_check = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)
+        args = harness.build_parser().parse_args(
+            [
+                "--cbth-bin",
+                "/bin/echo",
+                "--cbth-upgrade-command",
+                '{cbth_bin} --home "{cbth_home}" plugin upgrade {plugin} --release-id "{release_b_id}"',
+            ]
+        )
+        calls: list[dict[str, object]] = []
+        original_run = harness.subprocess.run
+
+        def fake_run(command: list[str], **kwargs: object) -> harness.subprocess.CompletedProcess[str]:
+            calls.append({"command": command, **kwargs})
+            return harness.subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            harness.subprocess.run = fake_run
+            try:
+                harness.preflight_upgrade_command(args, cwd=Path(tmp))
+            finally:
+                harness.subprocess.run = original_run
+                if old_upgrade is not None:
+                    os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = old_upgrade
+                if old_check is not None:
+                    os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = old_check
+
+        self.assertEqual(calls[0]["command"], ["/bin/echo", "plugin", "upgrade", "--help"])
+        self.assertEqual(calls[0]["stdin"], harness.subprocess.DEVNULL)
 
     def test_default_c9_initial_preflight_rejects_missing_upgrade_subcommand(self) -> None:
         old_upgrade = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CMD", None)
@@ -1153,6 +1212,41 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             with self.assertRaisesRegex(harness.HarnessError, "enabled=true"):
                 harness.prepare_release_dirs(state)
 
+    def test_prepare_release_dirs_allows_non_c9_custom_release_b_manifest_without_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release_a = Path(tmp) / "release-a"
+            release_b = Path(tmp) / "release-b"
+            self.write_minimal_release_dir(release_a, {"name": harness.PLUGIN_NAME})
+            self.write_minimal_release_dir(release_b, {"name": harness.PLUGIN_NAME})
+            args = harness.build_parser().parse_args(
+                [
+                    "--live",
+                    "--release-a",
+                    str(release_a),
+                    "--release-b",
+                    str(release_b),
+                    "--cbth-upgrade-command",
+                    'tools/w7-upgrade --from "{release_a}" --to "{release_b}"',
+                ]
+            )
+            state = harness.RunState(
+                args=args,
+                repo_root=Path(tmp),
+                test_root=Path(tmp) / "run",
+                prefix="WXCD-W7-TEST",
+                logs_dir=Path(tmp) / "run" / "logs",
+                manifest_path=Path(tmp) / "run" / "manifest.json",
+            )
+
+            copied_release_a = Path(tmp) / "run" / "releases" / "release-a"
+            copied_release_b = Path(tmp) / "run" / "releases" / "release-b"
+            self.assertEqual(
+                harness.prepare_release_dirs(state),
+                (copied_release_a, copied_release_b),
+            )
+            copied_manifest = json.loads((copied_release_b / "plugin" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertNotIn("enabled", copied_manifest)
+
     def test_explicit_release_copy_is_mutated_without_touching_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source_release_a = Path(tmp) / "source-release-a"
@@ -1197,6 +1291,46 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             self.assertNotIn("executable_path", source_manifest)
             self.assertEqual(copied_manifest["executable_path"], "bin/wxcd-supervisor")
             self.assertEqual(copied_manifest["release_id"], "w7-b")
+
+    def test_maybe_write_cbth_upgrade_manifest_skips_non_c9_custom_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release_b = Path(tmp) / "release-b"
+            self.write_minimal_release_dir(
+                release_b,
+                {
+                    "name": harness.PLUGIN_NAME,
+                    "entrypoint": {"binary": "../bin/wxcd-supervisor", "args": ["run"]},
+                },
+            )
+            args = harness.build_parser().parse_args(
+                [
+                    "--cbth-upgrade-command",
+                    'tools/w7-upgrade --from "{release_a}" --to "{release_b}"',
+                ]
+            )
+            state = harness.RunState(
+                args=args,
+                repo_root=Path(tmp),
+                test_root=Path(tmp) / "run",
+                prefix="WXCD-W7-TEST",
+                logs_dir=Path(tmp) / "run" / "logs",
+                manifest_path=Path(tmp) / "run" / "manifest.json",
+            )
+
+            self.assertIsNone(
+                harness.maybe_write_cbth_upgrade_manifest(
+                    state,
+                    Path(tmp) / "cbth-home",
+                    release_b,
+                    Path(tmp) / "wxcd.toml",
+                    Path(tmp) / "wxcd.env",
+                    "w7-instance",
+                    "w7-b",
+                )
+            )
+            manifest = json.loads((release_b / "plugin" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertNotIn("executable_path", manifest)
+            self.assertEqual(state.manifest["cbth_upgrade_manifest"]["status"], "skipped")
 
     def test_explicit_release_copy_rejects_plugin_symlink_escape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
