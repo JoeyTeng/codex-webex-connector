@@ -560,6 +560,15 @@ def upgrade_check_command_template(args: argparse.Namespace) -> str | None:
     return args.cbth_upgrade_check_command or os.environ.get("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD")
 
 
+def redact_command_template_for_display(template: str | None) -> str | None:
+    if template is None:
+        return None
+    try:
+        return " ".join(redact_command(shlex.split(template)))
+    except ValueError:
+        return "<invalid>"
+
+
 def preflight_cbth_service_upgrade_smoke(args: argparse.Namespace, cwd: Path) -> None:
     args.cbth_bin = verify_command_executable(args.cbth_bin, cwd, "cbth C8 service upgrade-smoke executable")
     command = [args.cbth_bin, "service", "upgrade-smoke", "--help"]
@@ -1038,7 +1047,7 @@ def prepare_release_dirs(state: RunState) -> tuple[Path, Path]:
     if (release_a is None) != (release_b is None):
         raise BlockedError("--release-a and --release-b must be provided together")
     if release_a and release_b:
-        validate_release_dir(release_a)
+        validate_release_dir(release_a, require_enabled_manifest=False)
         validate_release_dir(release_b)
         return release_a, release_b
     if state.args.no_build_release:
@@ -1065,7 +1074,7 @@ def prepare_release_dirs(state: RunState) -> tuple[Path, Path]:
     return release_a, release_b
 
 
-def validate_release_dir(path: Path) -> None:
+def validate_release_dir(path: Path, *, require_enabled_manifest: bool = True) -> None:
     manifest_path = path / "plugin" / "manifest.json"
     required = [
         path / "bin" / "wxcd-worker",
@@ -1078,10 +1087,10 @@ def validate_release_dir(path: Path) -> None:
     if missing:
         formatted = ", ".join(str(item) for item in missing)
         raise HarnessError(f"release dir is missing required files: {formatted}")
-    validate_release_plugin_manifest(manifest_path)
+    validate_release_plugin_manifest(manifest_path, require_enabled=require_enabled_manifest)
 
 
-def validate_release_plugin_manifest(manifest_path: Path) -> None:
+def validate_release_plugin_manifest(manifest_path: Path, *, require_enabled: bool = True) -> None:
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except OSError as error:
@@ -1090,7 +1099,7 @@ def validate_release_plugin_manifest(manifest_path: Path) -> None:
         raise HarnessError(f"release plugin manifest is not valid JSON: {manifest_path}") from error
     if not isinstance(manifest, dict):
         raise HarnessError("release plugin manifest must be a JSON object")
-    if manifest.get("enabled") is not True:
+    if require_enabled and manifest.get("enabled") is not True:
         raise HarnessError("release plugin manifest must set enabled=true for cbth C9 plugin upgrade")
 
 
@@ -1887,6 +1896,7 @@ def run_dry_run(args: argparse.Namespace, repo_root: Path) -> None:
     bot_env_file = Path(args.bot_env_file).expanduser()
     prefix = args.prefix or default_prefix()
     command_template = upgrade_command_template(args)
+    command_source = upgrade_command_template_source(args)
     check_template = upgrade_check_command_template(args)
     inferred_check_command = None
     if command_template and not check_template:
@@ -1895,7 +1905,12 @@ def run_dry_run(args: argparse.Namespace, repo_root: Path) -> None:
         except ValueError:
             inferred_check = None
         if inferred_check is not None:
-            inferred_check_command = " ".join(inferred_check)
+            inferred_check_command = " ".join(redact_command(inferred_check))
+    command_template_display = (
+        command_template
+        if command_source == "cbth-c9-default"
+        else redact_command_template_for_display(command_template)
+    )
     dry_run = {
         "mode": "dry_run",
         "prefix": prefix,
@@ -1908,10 +1923,10 @@ def run_dry_run(args: argparse.Namespace, repo_root: Path) -> None:
         "cbth_c9_pr": CBTH_C9_PR_URL,
         "cbth_service_upgrade_smoke_required": True,
         "webex_release_upgrade_command_configured": bool(command_template),
-        "webex_release_upgrade_command_source": upgrade_command_template_source(args),
-        "webex_release_upgrade_command_template": command_template,
+        "webex_release_upgrade_command_source": command_source,
+        "webex_release_upgrade_command_template": command_template_display,
         "webex_release_upgrade_check_command_configured": bool(check_template),
-        "webex_release_upgrade_check_command_template": check_template,
+        "webex_release_upgrade_check_command_template": redact_command_template_for_display(check_template),
         "webex_release_upgrade_check_command_inferred": inferred_check_command,
         "live_requires": [
             "WXCD_LIVE_E2E=1",

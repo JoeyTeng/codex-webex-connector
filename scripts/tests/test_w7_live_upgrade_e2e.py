@@ -34,6 +34,21 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         )
         return registry_path
 
+    def write_minimal_release_dir(self, release_dir: Path, manifest: dict[str, object]) -> None:
+        for path in [
+            release_dir / "bin" / "wxcd-worker",
+            release_dir / "bin" / "wxcd-supervisor",
+            release_dir / "sidecars" / "webex-ws-sidecar" / "index.cjs",
+        ]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+        (release_dir / "sidecars" / "webex-ws-sidecar" / "node_modules" / "@webex" / "webex-core").mkdir(
+            parents=True
+        )
+        manifest_path = release_dir / "plugin" / "manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
     def test_parse_token_file_supports_env_shape_without_leaking_bearer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "token.txt"
@@ -488,6 +503,38 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         )
         self.assertEqual(payload["cbth_c9_merge_commit"], harness.CBTH_C9_MERGE_COMMIT)
         self.assertIn("cbth C9 plugin upgrade support", payload["live_requires"])
+
+    def test_dry_run_redacts_custom_upgrade_templates(self) -> None:
+        old_upgrade = os.environ.get("WXCD_E2E_CBTH_UPGRADE_CMD")
+        old_check = os.environ.get("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD")
+        os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = (
+            "cbth plugin upgrade {plugin} --token secret-token --bearer=secret-bearer"
+        )
+        os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = "cbth plugin upgrade --help WEBEX_BOT_TOKEN=secret-bot-token"
+        output = StringIO()
+
+        try:
+            with redirect_stdout(output):
+                code = harness.main([])
+        finally:
+            if old_upgrade is None:
+                os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CMD", None)
+            else:
+                os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = old_upgrade
+            if old_check is None:
+                os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)
+            else:
+                os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = old_check
+
+        self.assertEqual(code, 0)
+        payload_text = output.getvalue()
+        self.assertNotIn("secret-token", payload_text)
+        self.assertNotIn("secret-bearer", payload_text)
+        self.assertNotIn("secret-bot-token", payload_text)
+        payload = json.loads(payload_text)
+        self.assertEqual(payload["webex_release_upgrade_command_source"], "environment")
+        self.assertIn("<redacted>", payload["webex_release_upgrade_command_template"])
+        self.assertIn("<redacted>", payload["webex_release_upgrade_check_command_template"])
 
     def test_validate_test_root_blocks_repo_internal_secret_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -970,6 +1017,50 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 manifest_path=Path(tmp) / "run" / "manifest.json",
             )
             with self.assertRaises(harness.BlockedError):
+                harness.prepare_release_dirs(state)
+
+    def test_prepare_release_dirs_allows_legacy_release_a_manifest_without_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release_a = Path(tmp) / "release-a"
+            release_b = Path(tmp) / "release-b"
+            self.write_minimal_release_dir(release_a, {"name": harness.PLUGIN_NAME})
+            self.write_minimal_release_dir(release_b, {"enabled": True})
+            args = harness.build_parser().parse_args(
+                ["--live", "--release-a", str(release_a), "--release-b", str(release_b)]
+            )
+            state = harness.RunState(
+                args=args,
+                repo_root=Path(tmp),
+                test_root=Path(tmp) / "run",
+                prefix="WXCD-W7-TEST",
+                logs_dir=Path(tmp) / "run" / "logs",
+                manifest_path=Path(tmp) / "run" / "manifest.json",
+            )
+
+            self.assertEqual(
+                harness.prepare_release_dirs(state),
+                (release_a.resolve(), release_b.resolve()),
+            )
+
+    def test_prepare_release_dirs_requires_enabled_release_b_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release_a = Path(tmp) / "release-a"
+            release_b = Path(tmp) / "release-b"
+            self.write_minimal_release_dir(release_a, {"name": harness.PLUGIN_NAME})
+            self.write_minimal_release_dir(release_b, {"name": harness.PLUGIN_NAME})
+            args = harness.build_parser().parse_args(
+                ["--live", "--release-a", str(release_a), "--release-b", str(release_b)]
+            )
+            state = harness.RunState(
+                args=args,
+                repo_root=Path(tmp),
+                test_root=Path(tmp) / "run",
+                prefix="WXCD-W7-TEST",
+                logs_dir=Path(tmp) / "run" / "logs",
+                manifest_path=Path(tmp) / "run" / "manifest.json",
+            )
+
+            with self.assertRaisesRegex(harness.HarnessError, "enabled=true"):
                 harness.prepare_release_dirs(state)
 
     def test_prepare_release_dirs_scrubs_build_subprocess_env(self) -> None:
