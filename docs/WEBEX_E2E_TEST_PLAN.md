@@ -46,7 +46,13 @@ W8 将真实 Webex connector 的 release A/B 切换 hook 接到 cbth C9 已合�
 
 `{cbth_bin}` 会绑定到 `--cbth-bin` 解析后的 executable，所以 W9 可以显式传入包含 C8/C9 的 cbth binary，而不依赖 `PATH` 上的 `cbth`。`--manifest-path` 可由 C9 接受为绝对路径或相对 `--release-dir` 的路径；W8 默认使用 release B 下的绝对 manifest 路径。该 manifest 必须是 JSON object 且 `enabled=true`，否则 W7 harness 会在 live 前 fail closed。
 
-默认 side-effect-free check 由 command shape 推断为：
+初始 live preflight 会先用 scrubbed env、closed stdin 执行一个不需要 release context 的 C9 help check，确保指定 `--cbth-bin` 已包含 C9 operator command：
+
+```bash
+{cbth_bin} plugin upgrade --help
+```
+
+release A/B 目录和 task-scoped `cbth_home` 准备好之后，完整 side-effect-free check 再由 command shape 推断为：
 
 ```bash
 {cbth_bin} --home "{cbth_home}" plugin upgrade --help

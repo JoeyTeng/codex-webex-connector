@@ -912,6 +912,68 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 if old_check is not None:
                     os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = old_check
 
+    def test_default_c9_initial_preflight_uses_cbth_bin_help_command(self) -> None:
+        old_upgrade = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CMD", None)
+        old_check = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)
+        args = harness.build_parser().parse_args(["--cbth-bin", "/bin/echo"])
+        calls: list[dict[str, object]] = []
+        original_run = harness.subprocess.run
+        old_values = {
+            "WEBEX_BOT_TOKEN": os.environ.get("WEBEX_BOT_TOKEN"),
+            "WXCD_CONFIG_PATH": os.environ.get("WXCD_CONFIG_PATH"),
+            "CBTH_HOME": os.environ.get("CBTH_HOME"),
+        }
+
+        def fake_run(command: list[str], **kwargs: object) -> harness.subprocess.CompletedProcess[str]:
+            calls.append({"command": command, **kwargs})
+            return harness.subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            harness.subprocess.run = fake_run
+            os.environ["WEBEX_BOT_TOKEN"] = "prod-token"
+            os.environ["WXCD_CONFIG_PATH"] = "/prod/wxcd.toml"
+            os.environ["CBTH_HOME"] = "/prod/cbth"
+            try:
+                harness.preflight_upgrade_command(args, cwd=Path(tmp))
+            finally:
+                harness.subprocess.run = original_run
+                for key, value in old_values.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                if old_upgrade is not None:
+                    os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = old_upgrade
+                if old_check is not None:
+                    os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = old_check
+
+        self.assertEqual(calls[0]["command"], ["/bin/echo", "plugin", "upgrade", "--help"])
+        self.assertEqual(calls[0]["stdin"], harness.subprocess.DEVNULL)
+        self.assertEqual(calls[0]["timeout"], harness.UPGRADE_CHECK_TIMEOUT_SECONDS)
+        env = calls[0]["env"]
+        self.assertIsInstance(env, dict)
+        self.assertNotIn("WEBEX_BOT_TOKEN", env)
+        self.assertNotIn("WXCD_CONFIG_PATH", env)
+        self.assertNotIn("CBTH_HOME", env)
+
+    def test_default_c9_initial_preflight_rejects_missing_upgrade_subcommand(self) -> None:
+        old_upgrade = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CMD", None)
+        old_check = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                cbth = Path(tmp) / "cbth"
+                cbth.write_text("#!/usr/bin/env sh\nexit 2\n", encoding="utf-8")
+                cbth.chmod(0o700)
+                args = harness.build_parser().parse_args(["--cbth-bin", str(cbth)])
+
+                with self.assertRaisesRegex(harness.BlockedError, "C9 plugin upgrade"):
+                    harness.preflight_upgrade_command(args, cwd=Path(tmp))
+            finally:
+                if old_upgrade is not None:
+                    os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = old_upgrade
+                if old_check is not None:
+                    os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = old_check
+
     def test_default_c9_upgrade_check_preflight_uses_cbth_bin_help_command(self) -> None:
         old_upgrade = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CMD", None)
         old_check = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)

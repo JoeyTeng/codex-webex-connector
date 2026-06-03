@@ -608,7 +608,11 @@ def preflight_upgrade_command(
     if not command:
         raise BlockedError("Webex release upgrade command is empty")
     validate_upgrade_command_placeholders(command)
-    if release_a is not None and release_b is not None and cbth_home is not None and prefix is not None:
+    has_release_context = release_a is not None and release_b is not None and cbth_home is not None and prefix is not None
+    if not has_release_context and upgrade_command_template_source(args) == "cbth-c9-default":
+        preflight_default_c9_plugin_upgrade(args, cwd or Path.cwd())
+        return
+    if has_release_context:
         command = expand_upgrade_command(
             template,
             release_a,
@@ -620,8 +624,29 @@ def preflight_upgrade_command(
             args.cbth_bin,
         )
     command[0] = verify_command_executable(command[0], cwd or Path.cwd(), "Webex release upgrade executable")
-    if release_a is not None and release_b is not None and cbth_home is not None and prefix is not None:
+    if has_release_context:
         verify_upgrade_command_semantics(args, command, release_a, release_b, cbth_home, prefix, cwd or Path.cwd())
+
+
+def preflight_default_c9_plugin_upgrade(args: argparse.Namespace, cwd: Path) -> None:
+    command = [args.cbth_bin, "plugin", "upgrade", "--help"]
+    command[0] = verify_command_executable(command[0], cwd, "cbth C9 plugin upgrade executable")
+    try:
+        subprocess.run(
+            command,
+            cwd=cwd,
+            env=isolated_child_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=UPGRADE_CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise BlockedError(
+            "cbth C9 plugin upgrade command is unavailable; "
+            f"requires cbth PR #103 merged at {CBTH_C9_MERGE_COMMIT}"
+        ) from error
 
 
 def verify_command_executable(
