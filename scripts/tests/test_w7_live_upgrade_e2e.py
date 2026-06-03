@@ -1164,12 +1164,12 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             with self.assertRaises(harness.BlockedError):
                 harness.prepare_release_dirs(state)
 
-    def test_prepare_release_dirs_allows_legacy_release_a_manifest_without_enabled(self) -> None:
+    def test_prepare_release_dirs_allows_legacy_explicit_release_manifests_without_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release_a = Path(tmp) / "release-a"
             release_b = Path(tmp) / "release-b"
             self.write_minimal_release_dir(release_a, {"name": harness.PLUGIN_NAME})
-            self.write_minimal_release_dir(release_b, {"enabled": True})
+            self.write_minimal_release_dir(release_b, {"name": harness.PLUGIN_NAME})
             args = harness.build_parser().parse_args(
                 ["--live", "--release-a", str(release_a), "--release-b", str(release_b)]
             )
@@ -1190,8 +1190,10 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             )
             self.assertTrue((copied_release_a / "plugin" / "manifest.json").exists())
             self.assertTrue((copied_release_b / "plugin" / "manifest.json").exists())
+            copied_manifest = json.loads((copied_release_b / "plugin" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertNotIn("enabled", copied_manifest)
 
-    def test_prepare_release_dirs_requires_enabled_release_b_manifest(self) -> None:
+    def test_staged_release_b_manifest_is_rewritten_for_c9_after_legacy_copy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release_a = Path(tmp) / "release-a"
             release_b = Path(tmp) / "release-b"
@@ -1209,8 +1211,20 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 manifest_path=Path(tmp) / "run" / "manifest.json",
             )
 
-            with self.assertRaisesRegex(harness.HarnessError, "enabled=true"):
-                harness.prepare_release_dirs(state)
+            _, copied_release_b = harness.prepare_release_dirs(state)
+            harness.write_cbth_upgrade_manifest(
+                state,
+                Path(tmp) / "cbth-home",
+                copied_release_b,
+                Path(tmp) / "wxcd.toml",
+                Path(tmp) / "wxcd.env",
+                "w7-instance",
+                "w7-b",
+            )
+
+            copied_manifest = json.loads((copied_release_b / "plugin" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertIs(copied_manifest["enabled"], True)
+            self.assertEqual(copied_manifest["release_id"], "w7-b")
 
     def test_prepare_release_dirs_allows_non_c9_custom_release_b_manifest_without_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1256,7 +1270,6 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 source_release_b,
                 {
                     "name": harness.PLUGIN_NAME,
-                    "enabled": True,
                     "version": "0.1.0",
                     "entrypoint": {"binary": "../bin/wxcd-supervisor", "args": ["run"]},
                     "capabilities": [{"name": "plugin-rpc-v1"}],

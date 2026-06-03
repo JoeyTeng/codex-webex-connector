@@ -1096,18 +1096,17 @@ def stop_processes(state: RunState) -> None:
 def prepare_release_dirs(state: RunState) -> tuple[Path, Path]:
     release_a = Path(state.args.release_a).expanduser().resolve() if state.args.release_a else None
     release_b = Path(state.args.release_b).expanduser().resolve() if state.args.release_b else None
-    require_c9_manifest = upgrade_command_uses_c9_plugin_upgrade(state.args)
     if (release_a is None) != (release_b is None):
         raise BlockedError("--release-a and --release-b must be provided together")
     if release_a and release_b:
         validate_release_dir(release_a, require_enabled_manifest=False)
-        validate_release_dir(release_b, require_enabled_manifest=require_c9_manifest)
+        validate_release_dir(release_b, require_enabled_manifest=False)
         copied_release_a = copy_explicit_release_dir(state, release_a, "release-a", require_enabled_manifest=False)
         copied_release_b = copy_explicit_release_dir(
             state,
             release_b,
             "release-b",
-            require_enabled_manifest=require_c9_manifest,
+            require_enabled_manifest=False,
         )
         state.record(
             "input_release_dirs",
