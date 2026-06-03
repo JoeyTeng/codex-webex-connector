@@ -747,6 +747,12 @@ fn plugin_manifest_validates_packaging_metadata() {
     );
     assert_eq!(
         manifest
+            .pointer("/enabled")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        manifest
             .pointer("/entrypoint/binary")
             .and_then(|value| value.as_str()),
         Some("../bin/wxcd-supervisor")

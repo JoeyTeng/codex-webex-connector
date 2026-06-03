@@ -4,8 +4,8 @@
 The default path is intentionally dry-run only. Live mode requires
 WXCD_LIVE_E2E=1 and local credentials. The harness owns Webex-specific setup,
 assertions, diagnostics, and cleanup. Generic plugin upgrade orchestration must
-come from cbth C8 `service upgrade-smoke` or an explicit operator-provided
-Webex release upgrade command.
+come from cbth C8 `service upgrade-smoke` and cbth C9 `plugin upgrade`, not from
+Webex-specific registry editing.
 """
 
 from __future__ import annotations
@@ -52,11 +52,26 @@ UPGRADE_COMMAND_PLACEHOLDERS = frozenset(
         "{release_a_id}",
         "{release_b_id}",
         "{cbth_home}",
+        "{cbth_bin}",
         "{prefix}",
     }
 )
 CBTH_C8_MERGE_COMMIT = "ee76fdd5937ca57e8156631c32509be12d3cf4c2"
 CBTH_C8_PR_URL = "https://github.com/JoeyTeng/codex-background-task-handler/pull/99"
+CBTH_C9_MERGE_COMMIT = "87ebc8e3a39558daa5441c40d9bd8d7cffb3ca06"
+CBTH_C9_PR_URL = "https://github.com/JoeyTeng/codex-background-task-handler/pull/103"
+CBTH_C9_PLUGIN_UPGRADE_COMMAND_TEMPLATE = (
+    '{cbth_bin} --home "{cbth_home}" plugin upgrade {plugin} '
+    '--release-id "{release_b_id}" --release-dir "{release_b}" '
+    '--manifest-path "{release_b}/plugin/manifest.json" --json'
+)
+CBTH_PLUGIN_CAPABILITIES = [
+    "plugin-rpc-v1",
+    "diagnostics",
+    "standalone-compatible",
+    "plugin-lifecycle-v1",
+    "plugin-handoff-v1",
+]
 UPGRADE_CHECK_TIMEOUT_SECONDS = 30
 WEBEX_TRANSIENT_ROOM_RETRY_ATTEMPTS = 5
 WEBEX_TRANSIENT_ROOM_RETRY_BASE_SECONDS = 0.25
@@ -533,11 +548,47 @@ def ensure_opt_in(live: bool) -> None:
 
 
 def upgrade_command_template(args: argparse.Namespace) -> str | None:
-    return args.cbth_upgrade_command or os.environ.get("WXCD_E2E_CBTH_UPGRADE_CMD")
+    return (
+        args.cbth_upgrade_command
+        or os.environ.get("WXCD_E2E_CBTH_UPGRADE_CMD")
+        or CBTH_C9_PLUGIN_UPGRADE_COMMAND_TEMPLATE
+    )
+
+
+def upgrade_command_template_source(args: argparse.Namespace) -> str:
+    if args.cbth_upgrade_command:
+        return "cli"
+    if os.environ.get("WXCD_E2E_CBTH_UPGRADE_CMD"):
+        return "environment"
+    return "cbth-c9-default"
 
 
 def upgrade_check_command_template(args: argparse.Namespace) -> str | None:
     return args.cbth_upgrade_check_command or os.environ.get("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD")
+
+
+def upgrade_command_uses_c9_plugin_upgrade(args: argparse.Namespace) -> bool:
+    template = upgrade_command_template(args)
+    if not template:
+        return False
+    try:
+        command = shlex.split(template)
+    except ValueError:
+        return False
+    return inferred_cbth_plugin_upgrade_check(command) is not None
+
+
+def expand_initial_upgrade_command_placeholders(command: list[str], args: argparse.Namespace) -> list[str]:
+    return [part.replace("{cbth_bin}", args.cbth_bin) for part in command]
+
+
+def redact_command_template_for_display(template: str | None) -> str | None:
+    if template is None:
+        return None
+    try:
+        return " ".join(redact_command(shlex.split(template)))
+    except ValueError:
+        return "<invalid>"
 
 
 def preflight_cbth_service_upgrade_smoke(args: argparse.Namespace, cwd: Path) -> None:
@@ -579,7 +630,16 @@ def preflight_upgrade_command(
     if not command:
         raise BlockedError("Webex release upgrade command is empty")
     validate_upgrade_command_placeholders(command)
-    if release_a is not None and release_b is not None and cbth_home is not None and prefix is not None:
+    has_release_context = release_a is not None and release_b is not None and cbth_home is not None and prefix is not None
+    if not has_release_context and upgrade_command_template_source(args) == "cbth-c9-default":
+        preflight_default_c9_plugin_upgrade(args, cwd or Path.cwd())
+        return
+    if not has_release_context:
+        command = expand_initial_upgrade_command_placeholders(command, args)
+        if upgrade_command_uses_c9_plugin_upgrade(args) and command[0] == args.cbth_bin:
+            preflight_default_c9_plugin_upgrade(args, cwd or Path.cwd())
+            return
+    if has_release_context:
         command = expand_upgrade_command(
             template,
             release_a,
@@ -588,10 +648,32 @@ def preflight_upgrade_command(
             args.release_b_id,
             cbth_home,
             prefix,
+            args.cbth_bin,
         )
     command[0] = verify_command_executable(command[0], cwd or Path.cwd(), "Webex release upgrade executable")
-    if release_a is not None and release_b is not None and cbth_home is not None and prefix is not None:
+    if has_release_context:
         verify_upgrade_command_semantics(args, command, release_a, release_b, cbth_home, prefix, cwd or Path.cwd())
+
+
+def preflight_default_c9_plugin_upgrade(args: argparse.Namespace, cwd: Path) -> None:
+    command = [args.cbth_bin, "plugin", "upgrade", "--help"]
+    command[0] = verify_command_executable(command[0], cwd, "cbth C9 plugin upgrade executable")
+    try:
+        subprocess.run(
+            command,
+            cwd=cwd,
+            env=isolated_child_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=UPGRADE_CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise BlockedError(
+            "cbth C9 plugin upgrade command is unavailable; "
+            f"requires cbth PR #103 merged at {CBTH_C9_MERGE_COMMIT}"
+        ) from error
 
 
 def verify_command_executable(
@@ -631,6 +713,7 @@ def verify_upgrade_command_semantics(
             args.release_b_id,
             cbth_home,
             prefix,
+            args.cbth_bin,
         )
     else:
         check_command = inferred_cbth_plugin_upgrade_check(command)
@@ -1016,9 +1099,23 @@ def prepare_release_dirs(state: RunState) -> tuple[Path, Path]:
     if (release_a is None) != (release_b is None):
         raise BlockedError("--release-a and --release-b must be provided together")
     if release_a and release_b:
-        validate_release_dir(release_a)
-        validate_release_dir(release_b)
-        return release_a, release_b
+        validate_release_dir(release_a, require_enabled_manifest=False)
+        validate_release_dir(release_b, require_enabled_manifest=False)
+        copied_release_a = copy_explicit_release_dir(state, release_a, "release-a", require_enabled_manifest=False)
+        copied_release_b = copy_explicit_release_dir(
+            state,
+            release_b,
+            "release-b",
+            require_enabled_manifest=False,
+        )
+        state.record(
+            "input_release_dirs",
+            {
+                "release_a": str(release_a),
+                "release_b": str(release_b),
+            },
+        )
+        return copied_release_a, copied_release_b
     if state.args.no_build_release:
         raise BlockedError("--release-a and --release-b are required when --no-build-release is set")
 
@@ -1043,11 +1140,35 @@ def prepare_release_dirs(state: RunState) -> tuple[Path, Path]:
     return release_a, release_b
 
 
-def validate_release_dir(path: Path) -> None:
+def copy_explicit_release_dir(state: RunState, source: Path, label: str, *, require_enabled_manifest: bool) -> Path:
+    destination = state.test_root / "releases" / label
+    if source == destination:
+        validate_release_dir(destination, require_enabled_manifest=require_enabled_manifest)
+        return destination
+    if destination.exists():
+        raise BlockedError(f"release staging destination already exists: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, destination, symlinks=True)
+    validate_release_dir(destination, require_enabled_manifest=require_enabled_manifest)
+    return destination
+
+
+def validate_release_manifest_path_scope(release_dir: Path, manifest_path: Path) -> None:
+    try:
+        release_root = release_dir.resolve()
+        manifest_resolved = manifest_path.resolve()
+        manifest_resolved.relative_to(release_root)
+    except (OSError, ValueError) as error:
+        raise BlockedError(f"release plugin manifest resolves outside release dir: {manifest_path}") from error
+
+
+def validate_release_dir(path: Path, *, require_enabled_manifest: bool = True) -> None:
+    manifest_path = path / "plugin" / "manifest.json"
+    validate_release_manifest_path_scope(path, manifest_path)
     required = [
         path / "bin" / "wxcd-worker",
         path / "bin" / "wxcd-supervisor",
-        path / "plugin" / "manifest.json",
+        manifest_path,
         path / "sidecars" / "webex-ws-sidecar" / "index.cjs",
         path / "sidecars" / "webex-ws-sidecar" / "node_modules" / "@webex" / "webex-core",
     ]
@@ -1055,6 +1176,51 @@ def validate_release_dir(path: Path) -> None:
     if missing:
         formatted = ", ".join(str(item) for item in missing)
         raise HarnessError(f"release dir is missing required files: {formatted}")
+    validate_release_plugin_manifest(manifest_path, require_enabled=require_enabled_manifest)
+
+
+def read_release_plugin_manifest(manifest_path: Path) -> dict[str, Any]:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise HarnessError(f"failed to read release plugin manifest: {manifest_path}") from error
+    except json.JSONDecodeError as error:
+        raise HarnessError(f"release plugin manifest is not valid JSON: {manifest_path}") from error
+    if not isinstance(manifest, dict):
+        raise HarnessError("release plugin manifest must be a JSON object")
+    return manifest
+
+
+def validate_release_plugin_manifest(
+    manifest_path: Path,
+    *,
+    require_enabled: bool = True,
+    require_c9_manifest: bool = False,
+) -> None:
+    manifest = read_release_plugin_manifest(manifest_path)
+    if require_enabled and manifest.get("enabled") is not True:
+        raise HarnessError("release plugin manifest must set enabled=true for cbth C9 plugin upgrade")
+    if not require_c9_manifest:
+        return
+    if manifest.get("name") != PLUGIN_NAME:
+        raise HarnessError("cbth C9 plugin manifest must set name=webex-connector")
+    executable_path = manifest.get("executable_path")
+    if not isinstance(executable_path, str) or not executable_path:
+        raise HarnessError("cbth C9 plugin manifest must set executable_path")
+    args = manifest.get("args")
+    if args is not None and (not isinstance(args, list) or not all(isinstance(item, str) for item in args)):
+        raise HarnessError("cbth C9 plugin manifest args must be a string array")
+    capabilities = manifest.get("capabilities")
+    if capabilities is not None and (
+        not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities)
+    ):
+        raise HarnessError("cbth C9 plugin manifest capabilities must be a string array")
+    environment = manifest.get("environment")
+    if environment is not None and (
+        not isinstance(environment, dict)
+        or not all(isinstance(key, str) and isinstance(value, str) for key, value in environment.items())
+    ):
+        raise HarnessError("cbth C9 plugin manifest environment must be a string map")
 
 
 def ensure_sidecar_dependencies(state: RunState) -> None:
@@ -1159,6 +1325,100 @@ path = "{state.repo_root}"
     return config_path, env_path, ingress_socket, lifecycle_socket
 
 
+def cbth_plugin_environment(
+    state: RunState,
+    cbth_home: Path,
+    release_dir: Path,
+    config_path: Path,
+    env_path: Path,
+    plugin_instance_id: str,
+    plugin_release_id: str,
+) -> dict[str, str]:
+    return {
+        "WXCD_CONFIG_PATH": str(config_path),
+        "WXCD_ENV_PATH": str(env_path),
+        "WXCD_NODE_PATH": state.args.node_bin,
+        "WXCD_CODEX_PATH": state.args.codex_bin,
+        "WXCD_RELEASE_DIR": str(release_dir),
+        "WXCD_PLUGIN_MANIFEST_PATH": str(release_dir / "plugin" / "manifest.json"),
+        "WXCD_PLUGIN_HOME": str(cbth_home / "plugins" / PLUGIN_NAME),
+        "WXCD_PLUGIN_INSTANCE_ID": plugin_instance_id,
+        "WXCD_PLUGIN_RELEASE_ID": plugin_release_id,
+    }
+
+
+def write_cbth_upgrade_manifest(
+    state: RunState,
+    cbth_home: Path,
+    release_dir: Path,
+    config_path: Path,
+    env_path: Path,
+    plugin_instance_id: str,
+    plugin_release_id: str,
+) -> Path:
+    manifest_path = release_dir / "plugin" / "manifest.json"
+    validate_release_manifest_path_scope(release_dir, manifest_path)
+    manifest = read_release_plugin_manifest(manifest_path)
+    manifest.update(
+        {
+            "name": PLUGIN_NAME,
+            "executable_path": "bin/wxcd-supervisor",
+            "args": ["run"],
+            "enabled": True,
+            "release_id": plugin_release_id,
+            "capabilities": CBTH_PLUGIN_CAPABILITIES,
+            "environment": cbth_plugin_environment(
+                state,
+                cbth_home,
+                release_dir,
+                config_path,
+                env_path,
+                plugin_instance_id,
+                plugin_release_id,
+            ),
+        }
+    )
+    write_private_json(manifest_path, manifest)
+    validate_release_plugin_manifest(manifest_path, require_c9_manifest=True)
+    state.record(
+        "cbth_upgrade_manifest",
+        {
+            "release_id": plugin_release_id,
+            "manifest_path": str(manifest_path),
+        },
+    )
+    return manifest_path
+
+
+def maybe_write_cbth_upgrade_manifest(
+    state: RunState,
+    cbth_home: Path,
+    release_dir: Path,
+    config_path: Path,
+    env_path: Path,
+    plugin_instance_id: str,
+    plugin_release_id: str,
+) -> Path | None:
+    if not upgrade_command_uses_c9_plugin_upgrade(state.args):
+        state.record(
+            "cbth_upgrade_manifest",
+            {
+                "status": "skipped",
+                "reason": "custom upgrade command is not cbth C9 plugin upgrade",
+            },
+        )
+        return None
+    return write_cbth_upgrade_manifest(
+        state,
+        cbth_home,
+        release_dir,
+        config_path,
+        env_path,
+        plugin_instance_id,
+        plugin_release_id,
+    )
+
+
 def write_cbth_registry(
     state: RunState,
     cbth_home: Path,
@@ -1178,24 +1438,16 @@ def write_cbth_registry(
                 "args": ["run"],
                 "enabled": True,
                 "release_id": plugin_release_id,
-                "capabilities": [
-                    "plugin-rpc-v1",
-                    "diagnostics",
-                    "standalone-compatible",
-                    "plugin-lifecycle-v1",
-                    "plugin-handoff-v1",
-                ],
-                "environment": {
-                    "WXCD_CONFIG_PATH": str(config_path),
-                    "WXCD_ENV_PATH": str(env_path),
-                    "WXCD_NODE_PATH": state.args.node_bin,
-                    "WXCD_CODEX_PATH": state.args.codex_bin,
-                    "WXCD_RELEASE_DIR": str(release_a),
-                    "WXCD_PLUGIN_MANIFEST_PATH": str(release_a / "plugin" / "manifest.json"),
-                    "WXCD_PLUGIN_HOME": str(cbth_home / "plugins" / PLUGIN_NAME),
-                    "WXCD_PLUGIN_INSTANCE_ID": plugin_instance_id,
-                    "WXCD_PLUGIN_RELEASE_ID": plugin_release_id,
-                },
+                "capabilities": CBTH_PLUGIN_CAPABILITIES,
+                "environment": cbth_plugin_environment(
+                    state,
+                    cbth_home,
+                    release_a,
+                    config_path,
+                    env_path,
+                    plugin_instance_id,
+                    plugin_release_id,
+                ),
             }
         ],
     }
@@ -1310,6 +1562,15 @@ def run_live(state: RunState) -> None:
         release_a,
         plugin_instance_id,
         plugin_release_id,
+    )
+    maybe_write_cbth_upgrade_manifest(
+        state,
+        cbth_home,
+        release_b,
+        config_path,
+        env_path,
+        plugin_instance_id,
+        state.args.release_b_id,
     )
     write_cbth_registry(
         state,
@@ -1581,6 +1842,7 @@ def run_upgrade_smoke_or_block(
         state.args.release_b_id,
         cbth_home,
         state.prefix,
+        state.args.cbth_bin,
     )
     command[0] = verify_command_executable(command[0], state.repo_root, "Webex release upgrade executable")
     before = active_check(ingress_socket)
@@ -1634,6 +1896,8 @@ def run_upgrade_smoke_or_block(
             "health_after": after,
             "log_path": str(upgrade_log_path),
             "registry_after": registry_after,
+            "cbth_plugin_upgrade_pr": CBTH_C9_PR_URL,
+            "cbth_plugin_upgrade_merge_commit": CBTH_C9_MERGE_COMMIT,
         },
     )
     return True
@@ -1647,6 +1911,7 @@ def expand_upgrade_command(
     release_b_id: str,
     cbth_home: Path,
     prefix: str,
+    cbth_bin: str = "cbth",
 ) -> list[str]:
     values = {
         "{plugin}": PLUGIN_NAME,
@@ -1655,6 +1920,7 @@ def expand_upgrade_command(
         "{release_a_id}": release_a_id,
         "{release_b_id}": release_b_id,
         "{cbth_home}": str(cbth_home),
+        "{cbth_bin}": cbth_bin,
         "{prefix}": prefix,
     }
     parts = shlex.split(template)
@@ -1690,8 +1956,24 @@ def validate_upgrade_command_placeholders(parts: Iterable[str]) -> None:
         raise BlockedError(f"malformed Webex release upgrade command placeholder in: {redact_command(malformed)}")
 
 
-SENSITIVE_COMMAND_TERMS = ("token", "bearer")
+SENSITIVE_COMMAND_TERMS = (
+    "token",
+    "bearer",
+    "authorization",
+    "password",
+    "passwd",
+    "secret",
+    "api-key",
+    "api_key",
+    "apikey",
+    "client-secret",
+    "client_secret",
+)
 BARE_SENSITIVE_COMMAND_KEYS = frozenset(SENSITIVE_COMMAND_TERMS)
+
+
+def looks_like_split_sensitive_key(item: str, key_lower: str) -> bool:
+    return item.isupper() or key_lower.rstrip(":") in BARE_SENSITIVE_COMMAND_KEYS or item.endswith(":")
 
 
 def redact_command(command: Iterable[str]) -> list[str]:
@@ -1714,6 +1996,7 @@ def redact_command(command: Iterable[str]) -> list[str]:
             redact_next = True
         elif any(term in item.lower() for term in SENSITIVE_COMMAND_TERMS):
             redacted.append("<redacted>")
+            redact_next = looks_like_split_sensitive_key(item, key_lower)
         else:
             redacted.append(item)
     return redacted
@@ -1844,6 +2127,22 @@ def run_dry_run(args: argparse.Namespace, repo_root: Path) -> None:
     token_file = Path(args.token_file).expanduser()
     bot_env_file = Path(args.bot_env_file).expanduser()
     prefix = args.prefix or default_prefix()
+    command_template = upgrade_command_template(args)
+    command_source = upgrade_command_template_source(args)
+    check_template = upgrade_check_command_template(args)
+    inferred_check_command = None
+    if command_template and not check_template:
+        try:
+            inferred_check = inferred_cbth_plugin_upgrade_check(shlex.split(command_template))
+        except ValueError:
+            inferred_check = None
+        if inferred_check is not None:
+            inferred_check_command = " ".join(redact_command(inferred_check))
+    command_template_display = (
+        command_template
+        if command_source == "cbth-c9-default"
+        else redact_command_template_for_display(command_template)
+    )
     dry_run = {
         "mode": "dry_run",
         "prefix": prefix,
@@ -1852,12 +2151,19 @@ def run_dry_run(args: argparse.Namespace, repo_root: Path) -> None:
         "bot_env_file": str(bot_env_file),
         "cbth_c8_merge_commit": CBTH_C8_MERGE_COMMIT,
         "cbth_c8_pr": CBTH_C8_PR_URL,
+        "cbth_c9_merge_commit": CBTH_C9_MERGE_COMMIT,
+        "cbth_c9_pr": CBTH_C9_PR_URL,
         "cbth_service_upgrade_smoke_required": True,
-        "webex_release_upgrade_command_configured": bool(upgrade_command_template(args)),
-        "webex_release_upgrade_check_command_configured": bool(upgrade_check_command_template(args)),
+        "webex_release_upgrade_command_configured": bool(command_template),
+        "webex_release_upgrade_command_source": command_source,
+        "webex_release_upgrade_command_template": command_template_display,
+        "webex_release_upgrade_check_command_configured": bool(check_template),
+        "webex_release_upgrade_check_command_template": redact_command_template_for_display(check_template),
+        "webex_release_upgrade_check_command_inferred": inferred_check_command,
         "live_requires": [
             "WXCD_LIVE_E2E=1",
             "cbth C8 service upgrade-smoke support",
+            "cbth C9 plugin upgrade support",
             "untracked developer token file",
             "untracked bot env file",
             "real Webex network access",
