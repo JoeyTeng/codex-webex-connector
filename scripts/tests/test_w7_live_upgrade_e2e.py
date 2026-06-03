@@ -509,11 +509,12 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         old_check = os.environ.get("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD")
         os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = (
             "cbth plugin upgrade {plugin} --token secret-token --bearer=secret-bearer "
-            "--password secret-password --api-key=secret-api-key client_secret=secret-client"
+            "--password secret-password --api-key=secret-api-key client_secret=secret-client "
+            "WEBEX_BOT_TOKEN split-bot-token"
         )
         os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = (
             "cbth plugin upgrade --help WEBEX_BOT_TOKEN=secret-bot-token "
-            "--client-secret secret-check-secret"
+            "--client-secret secret-check-secret authorization split-check-token"
         )
         output = StringIO()
 
@@ -538,7 +539,9 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         self.assertNotIn("secret-password", payload_text)
         self.assertNotIn("secret-api-key", payload_text)
         self.assertNotIn("secret-client", payload_text)
+        self.assertNotIn("split-bot-token", payload_text)
         self.assertNotIn("secret-check-secret", payload_text)
+        self.assertNotIn("split-check-token", payload_text)
         payload = json.loads(payload_text)
         self.assertEqual(payload["webex_release_upgrade_command_source"], "environment")
         self.assertIn("<redacted>", payload["webex_release_upgrade_command_template"])
@@ -648,6 +651,8 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 "--token",
                 "secret-token",
                 "--bearer=secret-bearer",
+                "WEBEX_BOT_TOKEN",
+                "split-env-secret",
                 "WEBEX_BOT_TOKEN=env-secret",
                 "Authorization: Bearer header-secret",
                 "--password",
@@ -671,6 +676,8 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 "--token",
                 "<redacted>",
                 "--bearer=<redacted>",
+                "<redacted>",
+                "<redacted>",
                 "WEBEX_BOT_TOKEN=<redacted>",
                 "<redacted>",
                 "--password",
@@ -687,6 +694,7 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         for secret in [
             "secret-token",
             "secret-bearer",
+            "split-env-secret",
             "env-secret",
             "header-secret",
             "secret-password",

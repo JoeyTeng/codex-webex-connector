@@ -1972,6 +1972,10 @@ SENSITIVE_COMMAND_TERMS = (
 BARE_SENSITIVE_COMMAND_KEYS = frozenset(SENSITIVE_COMMAND_TERMS)
 
 
+def looks_like_split_sensitive_key(item: str, key_lower: str) -> bool:
+    return item.isupper() or key_lower.rstrip(":") in BARE_SENSITIVE_COMMAND_KEYS or item.endswith(":")
+
+
 def redact_command(command: Iterable[str]) -> list[str]:
     redacted = []
     redact_next = False
@@ -1992,6 +1996,7 @@ def redact_command(command: Iterable[str]) -> list[str]:
             redact_next = True
         elif any(term in item.lower() for term in SENSITIVE_COMMAND_TERMS):
             redacted.append("<redacted>")
+            redact_next = looks_like_split_sensitive_key(item, key_lower)
         else:
             redacted.append(item)
     return redacted
