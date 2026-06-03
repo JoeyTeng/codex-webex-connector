@@ -8,7 +8,7 @@
 - W4 delivery enqueue routing 已落地：Webex async/background notifications 通过 supervisor-owned broker 调用 cbth C5 `delivery.enqueue` delivery-owned `codex_app_server` target；普通 Webex user-message forwarding 仍走 W3 direct app-server path。
 - W5 lifecycle hooks 已落地：显式 cbth plugin mode 提供 C7 `plugin.health_check`、`plugin.quiesce`、`plugin.drain`、`plugin.shutdown`、`plugin.unquiesce` 的保守实现；quiesce/shutdown 后拒绝新的 Webex 外部 ingress，drain 等待已接收 handler 与 live sidecar callback/retry backlog 完成并在 cbth plugin home 持久化 local session mirror 后返回。
 - W6 optional handoff 已落地：显式 cbth plugin mode 提供 `plugin.handoff_export` / `plugin.handoff_import`，在 W5 quiesce/drain 之后可交接 durable bridge snapshot、recent Webex event-id cursor、in-flight session/approval summary 和 sidecar deferred/drain metadata；pre-active import 只更新本地 mirror/cursor，不产生 Webex/Codex 外部副作用。
-- W7/W8 opt-in live upgrade E2E harness 已落地：`scripts/w7_live_upgrade_e2e.py` 默认 dry-run，live 模式先执行 cbth C8 `service upgrade-smoke` safe harness，再用默认 C9 `plugin upgrade` command template 执行真实 Webex release A/B hook，并隔离真实 Webex rooms、task-scoped cbth service/plugin home、session turn、delivery smoke、pagination-aware/idempotent cleanup/manifest；默认 PR CI 会运行安全的 W7 Python harness 单测和 dry-run。
+- W7/W8 opt-in live upgrade E2E harness 已落地：`scripts/w7_live_upgrade_e2e.py` 默认 dry-run，live 模式先执行 cbth C8 `service upgrade-smoke` safe harness，再生成 release B 的 C9-compatible `PluginManifest` 并用默认 C9 `plugin upgrade` command template 执行真实 Webex release A/B hook，同时隔离真实 Webex rooms、task-scoped cbth service/plugin home、session turn、delivery smoke、pagination-aware/idempotent cleanup/manifest；默认 PR CI 会运行安全的 W7 Python harness 单测和 dry-run。
 - GitHub pull requests run `codex/review-gate` through the repository workflow.
 - 详细历史、验证证据和迁移前 tracker 原文已移入 `docs/project_journal/`：
   - W7 live upgrade E2E harness：`docs/project_journal/2026/05/2026-05-25-w7-live-upgrade-e2e-c2f3fe5.md`
@@ -42,7 +42,7 @@
 - W4 routes async/background notifications through cbth delivery-owned `delivery.enqueue` while preserving normal user-message forwarding on the W3 direct app-server path.
 - W5 adds conservative cbth lifecycle hooks while preserving W3/W4 forwarding and delivery routing semantics.
 - W6 adds optional handoff export/import while preserving W5 conservative lifecycle fallback semantics.
-- W8 connects the W7 live upgrade hook to the merged cbth C9 `plugin upgrade` command while keeping cbth generic upgrade orchestration outside this repo.
+- W8 connects the W7 live upgrade hook to the merged cbth C9 `plugin upgrade` command and writes the release B C9 manifest input while keeping cbth generic upgrade orchestration outside this repo.
 - W2 added plugin packaging metadata, explicit cbth plugin config, C1-compatible hello client tests, and doctor diagnostics without requiring Webex credentials.
 - Isolated live Webex E2E passed for `resume local`, `/history`, ordinary session turns, `attach`, recovery cleanup, and cleanup of temporary rooms/processes/root.
 - Top-level trackers were migrated to short entrypoints; complete pre-migration contents are preserved in the legacy snapshot journal.

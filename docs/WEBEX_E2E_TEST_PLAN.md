@@ -44,7 +44,7 @@ W8 将真实 Webex connector 的 release A/B 切换 hook 接到 cbth C9 已合�
   --json
 ```
 
-`{cbth_bin}` 会绑定到 `--cbth-bin` 解析后的 executable，所以 W9 可以显式传入包含 C8/C9 的 cbth binary，而不依赖 `PATH` 上的 `cbth`。`--manifest-path` 可由 C9 接受为绝对路径或相对 `--release-dir` 的路径；W8 默认使用 release B 下的绝对 manifest 路径。该 manifest 必须是 JSON object 且 `enabled=true`，否则 W7 harness 会在 live 前 fail closed。
+`{cbth_bin}` 会绑定到 `--cbth-bin` 解析后的 executable，所以 W9 可以显式传入包含 C8/C9 的 cbth binary，而不依赖 `PATH` 上的 `cbth`。`--manifest-path` 可由 C9 接受为绝对路径或相对 `--release-dir` 的路径；W8 默认使用 release B 下的绝对 manifest 路径。repo 自带 `plugin/manifest.json` 保留 Webex packaging metadata；live run 会在 staged release B 中把同一路径补写为 C9-compatible `PluginManifest` object，包含 `name`、`executable_path`、`args`、`enabled=true`、`release_id`、string-array `capabilities` 和 task-scoped `environment`。不满足 C9 schema 时，W7 harness 会在执行 upgrade 前 fail closed。
 
 初始 live preflight 会先用 scrubbed env、closed stdin 执行一个不需要 release context 的 C9 help check，确保指定 `--cbth-bin` 已包含 C9 operator command：
 
@@ -66,7 +66,7 @@ WXCD_LIVE_E2E=1 \
 python3 scripts/w7_live_upgrade_e2e.py --live --token-file token.txt --bot-env-file .env --cbth-bin /path/to/cbth-with-c8-c9
 ```
 
-该 command 只展开 `{plugin}`、`{release_a}`、`{release_b}`、`{release_a_id}`、`{release_b_id}`、`{cbth_home}`、`{cbth_bin}` 和 `{prefix}`，并以关闭 stdin、有界 timeout、stdout/stderr 写入私有 `logs/webex-release-upgrade.log` 的方式执行。webex-connector 只模板化调用 C9 operator command 并验证 Webex product behavior，不复制 cbth generic release manager，不直接编辑 cbth registry；registry 只能由 cbth service-side promote 写入。command 成功后，W7 会只读校验 task-scoped cbth registry 已切到 release B。
+该 command 只展开 `{plugin}`、`{release_a}`、`{release_b}`、`{release_a_id}`、`{release_b_id}`、`{cbth_home}`、`{cbth_bin}` 和 `{prefix}`，并以关闭 stdin、有界 timeout、stdout/stderr 写入私有 `logs/webex-release-upgrade.log` 的方式执行。webex-connector 只模板化调用 C9 operator command、生成 Webex release B 所需的 C9 manifest 输入，并验证 Webex product behavior；不复制 cbth generic release manager，不直接编辑 cbth registry；registry 只能由 cbth service-side promote 写入。command 成功后，W7 会只读校验 task-scoped cbth registry 已切到 release B。
 
 W7 harness 覆盖：
 

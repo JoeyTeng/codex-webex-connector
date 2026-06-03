@@ -65,6 +65,13 @@ CBTH_C9_PLUGIN_UPGRADE_COMMAND_TEMPLATE = (
     '--release-id "{release_b_id}" --release-dir "{release_b}" '
     '--manifest-path "{release_b}/plugin/manifest.json" --json'
 )
+CBTH_PLUGIN_CAPABILITIES = [
+    "plugin-rpc-v1",
+    "diagnostics",
+    "standalone-compatible",
+    "plugin-lifecycle-v1",
+    "plugin-handoff-v1",
+]
 UPGRADE_CHECK_TIMEOUT_SECONDS = 30
 WEBEX_TRANSIENT_ROOM_RETRY_ATTEMPTS = 5
 WEBEX_TRANSIENT_ROOM_RETRY_BASE_SECONDS = 0.25
@@ -1115,7 +1122,7 @@ def validate_release_dir(path: Path, *, require_enabled_manifest: bool = True) -
     validate_release_plugin_manifest(manifest_path, require_enabled=require_enabled_manifest)
 
 
-def validate_release_plugin_manifest(manifest_path: Path, *, require_enabled: bool = True) -> None:
+def read_release_plugin_manifest(manifest_path: Path) -> dict[str, Any]:
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except OSError as error:
@@ -1124,8 +1131,39 @@ def validate_release_plugin_manifest(manifest_path: Path, *, require_enabled: bo
         raise HarnessError(f"release plugin manifest is not valid JSON: {manifest_path}") from error
     if not isinstance(manifest, dict):
         raise HarnessError("release plugin manifest must be a JSON object")
+    return manifest
+
+
+def validate_release_plugin_manifest(
+    manifest_path: Path,
+    *,
+    require_enabled: bool = True,
+    require_c9_manifest: bool = False,
+) -> None:
+    manifest = read_release_plugin_manifest(manifest_path)
     if require_enabled and manifest.get("enabled") is not True:
         raise HarnessError("release plugin manifest must set enabled=true for cbth C9 plugin upgrade")
+    if not require_c9_manifest:
+        return
+    if manifest.get("name") != PLUGIN_NAME:
+        raise HarnessError("cbth C9 plugin manifest must set name=webex-connector")
+    executable_path = manifest.get("executable_path")
+    if not isinstance(executable_path, str) or not executable_path:
+        raise HarnessError("cbth C9 plugin manifest must set executable_path")
+    args = manifest.get("args")
+    if args is not None and (not isinstance(args, list) or not all(isinstance(item, str) for item in args)):
+        raise HarnessError("cbth C9 plugin manifest args must be a string array")
+    capabilities = manifest.get("capabilities")
+    if capabilities is not None and (
+        not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities)
+    ):
+        raise HarnessError("cbth C9 plugin manifest capabilities must be a string array")
+    environment = manifest.get("environment")
+    if environment is not None and (
+        not isinstance(environment, dict)
+        or not all(isinstance(key, str) and isinstance(value, str) for key, value in environment.items())
+    ):
+        raise HarnessError("cbth C9 plugin manifest environment must be a string map")
 
 
 def ensure_sidecar_dependencies(state: RunState) -> None:
@@ -1230,6 +1268,70 @@ path = "{state.repo_root}"
     return config_path, env_path, ingress_socket, lifecycle_socket
 
 
+def cbth_plugin_environment(
+    state: RunState,
+    cbth_home: Path,
+    release_dir: Path,
+    config_path: Path,
+    env_path: Path,
+    plugin_instance_id: str,
+    plugin_release_id: str,
+) -> dict[str, str]:
+    return {
+        "WXCD_CONFIG_PATH": str(config_path),
+        "WXCD_ENV_PATH": str(env_path),
+        "WXCD_NODE_PATH": state.args.node_bin,
+        "WXCD_CODEX_PATH": state.args.codex_bin,
+        "WXCD_RELEASE_DIR": str(release_dir),
+        "WXCD_PLUGIN_MANIFEST_PATH": str(release_dir / "plugin" / "manifest.json"),
+        "WXCD_PLUGIN_HOME": str(cbth_home / "plugins" / PLUGIN_NAME),
+        "WXCD_PLUGIN_INSTANCE_ID": plugin_instance_id,
+        "WXCD_PLUGIN_RELEASE_ID": plugin_release_id,
+    }
+
+
+def write_cbth_upgrade_manifest(
+    state: RunState,
+    cbth_home: Path,
+    release_dir: Path,
+    config_path: Path,
+    env_path: Path,
+    plugin_instance_id: str,
+    plugin_release_id: str,
+) -> Path:
+    manifest_path = release_dir / "plugin" / "manifest.json"
+    manifest = read_release_plugin_manifest(manifest_path)
+    manifest.update(
+        {
+            "name": PLUGIN_NAME,
+            "executable_path": "bin/wxcd-supervisor",
+            "args": ["run"],
+            "enabled": True,
+            "release_id": plugin_release_id,
+            "capabilities": CBTH_PLUGIN_CAPABILITIES,
+            "environment": cbth_plugin_environment(
+                state,
+                cbth_home,
+                release_dir,
+                config_path,
+                env_path,
+                plugin_instance_id,
+                plugin_release_id,
+            ),
+        }
+    )
+    write_private_json(manifest_path, manifest)
+    validate_release_plugin_manifest(manifest_path, require_c9_manifest=True)
+    state.record(
+        "cbth_upgrade_manifest",
+        {
+            "release_id": plugin_release_id,
+            "manifest_path": str(manifest_path),
+        },
+    )
+    return manifest_path
+
+
 def write_cbth_registry(
     state: RunState,
     cbth_home: Path,
@@ -1249,24 +1351,16 @@ def write_cbth_registry(
                 "args": ["run"],
                 "enabled": True,
                 "release_id": plugin_release_id,
-                "capabilities": [
-                    "plugin-rpc-v1",
-                    "diagnostics",
-                    "standalone-compatible",
-                    "plugin-lifecycle-v1",
-                    "plugin-handoff-v1",
-                ],
-                "environment": {
-                    "WXCD_CONFIG_PATH": str(config_path),
-                    "WXCD_ENV_PATH": str(env_path),
-                    "WXCD_NODE_PATH": state.args.node_bin,
-                    "WXCD_CODEX_PATH": state.args.codex_bin,
-                    "WXCD_RELEASE_DIR": str(release_a),
-                    "WXCD_PLUGIN_MANIFEST_PATH": str(release_a / "plugin" / "manifest.json"),
-                    "WXCD_PLUGIN_HOME": str(cbth_home / "plugins" / PLUGIN_NAME),
-                    "WXCD_PLUGIN_INSTANCE_ID": plugin_instance_id,
-                    "WXCD_PLUGIN_RELEASE_ID": plugin_release_id,
-                },
+                "capabilities": CBTH_PLUGIN_CAPABILITIES,
+                "environment": cbth_plugin_environment(
+                    state,
+                    cbth_home,
+                    release_a,
+                    config_path,
+                    env_path,
+                    plugin_instance_id,
+                    plugin_release_id,
+                ),
             }
         ],
     }
@@ -1381,6 +1475,15 @@ def run_live(state: RunState) -> None:
         release_a,
         plugin_instance_id,
         plugin_release_id,
+    )
+    write_cbth_upgrade_manifest(
+        state,
+        cbth_home,
+        release_b,
+        config_path,
+        env_path,
+        plugin_instance_id,
+        state.args.release_b_id,
     )
     write_cbth_registry(
         state,

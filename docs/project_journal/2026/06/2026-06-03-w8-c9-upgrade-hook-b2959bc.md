@@ -20,9 +20,9 @@ superseded_by:
 ## Current State
 - `scripts/w7_live_upgrade_e2e.py` now defaults the Webex release upgrade hook to the C9 command template while preserving `--cbth-upgrade-command` / `WXCD_E2E_CBTH_UPGRADE_CMD` as overrides.
 - The harness first preflights default C9 availability with `{cbth_bin} plugin upgrade --help`, then infers the release-context check as `{cbth_bin} --home "{cbth_home}" plugin upgrade --help`; custom non-`plugin upgrade` commands still need an explicit safe check command.
-- Release-dir validation reads `plugin/manifest.json`; legacy release A only needs the file to be a JSON object, while release B fails closed unless it sets `enabled=true`, matching C9 `PluginManifest` requirements for the upgrade target.
+- Release-dir validation reads `plugin/manifest.json`; legacy release A only needs the file to be a JSON object, while release B is rewritten in the staged release as a C9-compatible `PluginManifest` object with `enabled=true`, `executable_path`, string-array capabilities, and task-scoped Webex environment paths before cbth receives it.
 - `plugin/manifest.json` now includes `enabled=true`, and the existing packaging metadata test asserts that field.
-- The harness remains Webex-neutral: it templates and invokes cbth C9, then verifies Webex product behavior and the task-scoped registry state after cbth service-side promote; it does not copy cbth release-manager logic or edit cbth registry directly.
+- The harness remains Webex-neutral: it templates and invokes cbth C9, prepares the Webex release manifest input, then verifies Webex product behavior and the task-scoped registry state after cbth service-side promote; it does not copy cbth release-manager logic or edit cbth registry directly.
 
 ## Next Steps
 - W9 should run the real live smoke with Webex credentials and a `--cbth-bin` built from or newer than C8 `ee76fdd5937ca57e8156631c32509be12d3cf4c2` and C9 `87ebc8e3a39558daa5441c40d9bd8d7cffb3ca06`.

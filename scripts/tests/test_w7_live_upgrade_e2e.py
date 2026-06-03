@@ -1266,8 +1266,91 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             with self.assertRaisesRegex(harness.HarnessError, "enabled=true"):
                 harness.validate_release_plugin_manifest(manifest_path)
 
-            manifest_path.write_text(json.dumps({"enabled": True}), encoding="utf-8")
+            manifest_path.write_text(json.dumps({"name": harness.PLUGIN_NAME, "enabled": True}), encoding="utf-8")
             harness.validate_release_plugin_manifest(manifest_path)
+
+            with self.assertRaisesRegex(harness.HarnessError, "executable_path"):
+                harness.validate_release_plugin_manifest(manifest_path, require_c9_manifest=True)
+
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "name": harness.PLUGIN_NAME,
+                        "enabled": True,
+                        "executable_path": "bin/wxcd-supervisor",
+                        "capabilities": [{"name": "plugin-rpc-v1"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(harness.HarnessError, "capabilities"):
+                harness.validate_release_plugin_manifest(manifest_path, require_c9_manifest=True)
+
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "name": harness.PLUGIN_NAME,
+                        "enabled": True,
+                        "executable_path": "bin/wxcd-supervisor",
+                        "args": ["run"],
+                        "capabilities": harness.CBTH_PLUGIN_CAPABILITIES,
+                        "environment": {"WXCD_CONFIG_PATH": "/tmp/wxcd.toml"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            harness.validate_release_plugin_manifest(manifest_path, require_c9_manifest=True)
+
+    def test_write_cbth_upgrade_manifest_writes_c9_plugin_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release = Path(tmp) / "release-b"
+            self.write_minimal_release_dir(
+                release,
+                {
+                    "name": harness.PLUGIN_NAME,
+                    "enabled": True,
+                    "version": "0.1.0",
+                    "entrypoint": {"binary": "../bin/wxcd-supervisor", "args": ["run"]},
+                    "capabilities": [{"name": "plugin-rpc-v1"}],
+                    "config_schema": {"type": "object"},
+                },
+            )
+            state = harness.RunState(
+                args=harness.build_parser().parse_args(["--codex-bin", "/opt/codex", "--node-bin", "/opt/node"]),
+                repo_root=Path(tmp),
+                test_root=Path(tmp) / "run",
+                prefix="WXCD-W7-TEST",
+                logs_dir=Path(tmp) / "run" / "logs",
+                manifest_path=Path(tmp) / "run" / "manifest.json",
+            )
+
+            manifest_path = harness.write_cbth_upgrade_manifest(
+                state,
+                Path(tmp) / "cbth-home",
+                release,
+                Path(tmp) / "wxcd.toml",
+                Path(tmp) / "wxcd.env",
+                "w7-instance",
+                "w7-b",
+            )
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["name"], harness.PLUGIN_NAME)
+            self.assertEqual(manifest["executable_path"], "bin/wxcd-supervisor")
+            self.assertEqual(manifest["args"], ["run"])
+            self.assertEqual(manifest["enabled"], True)
+            self.assertEqual(manifest["release_id"], "w7-b")
+            self.assertEqual(manifest["capabilities"], harness.CBTH_PLUGIN_CAPABILITIES)
+            self.assertEqual(manifest["entrypoint"]["binary"], "../bin/wxcd-supervisor")
+            environment = manifest["environment"]
+            self.assertEqual(environment["WXCD_CONFIG_PATH"], str(Path(tmp) / "wxcd.toml"))
+            self.assertEqual(environment["WXCD_ENV_PATH"], str(Path(tmp) / "wxcd.env"))
+            self.assertEqual(environment["WXCD_RELEASE_DIR"], str(release))
+            self.assertEqual(environment["WXCD_PLUGIN_RELEASE_ID"], "w7-b")
+            self.assertEqual(environment["WXCD_PLUGIN_MANIFEST_PATH"], str(release / "plugin" / "manifest.json"))
+            self.assertEqual(environment["WXCD_CODEX_PATH"], "/opt/codex")
+            self.assertEqual(environment["WXCD_NODE_PATH"], "/opt/node")
+            harness.validate_release_plugin_manifest(manifest_path, require_c9_manifest=True)
 
     def test_sidecar_dependencies_present_accepts_webex_core_module(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
