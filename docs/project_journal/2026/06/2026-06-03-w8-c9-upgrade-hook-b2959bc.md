@@ -5,7 +5,7 @@ status: completed
 created: 2026-06-03
 updated: 2026-06-03
 branch: codex/w8-c9-upgrade-hook
-pr:
+pr: https://github.com/JoeyTeng/codex-webex-connector/pull/17
 supersedes: []
 superseded_by:
 ---
@@ -32,6 +32,8 @@ superseded_by:
 - C9 dependency:
   - cbth PR #103
   - merge commit `87ebc8e3a39558daa5441c40d9bd8d7cffb3ca06`
+- PR:
+  - https://github.com/JoeyTeng/codex-webex-connector/pull/17
 - Focused validation:
   - `python3 -B -m py_compile scripts/w7_live_upgrade_e2e.py scripts/tests/test_w7_live_upgrade_e2e.py`
   - `python3 -B -m unittest scripts.tests.test_w7_live_upgrade_e2e`
