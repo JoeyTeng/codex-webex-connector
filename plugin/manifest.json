@@ -1,5 +1,6 @@
 {
   "name": "webex-connector",
+  "enabled": true,
   "version": "0.1.0",
   "description": "Webex control-room bridge for Codex sessions.",
   "entrypoint": {

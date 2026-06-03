@@ -18,11 +18,11 @@ python3 scripts/w7_live_upgrade_e2e.py \
   --live \
   --token-file token.txt \
   --bot-env-file .env \
-  --cbth-bin cbth \
+  --cbth-bin /path/to/cbth-with-c8-c9 \
   --cbth-service-upgrade-smoke-timeout-seconds 30
 ```
 
-该路径依赖 cbth C8 已合并能力：PR #99 merge commit `ee76fdd5937ca57e8156631c32509be12d3cf4c2`，命令为 `cbth service upgrade-smoke`。W7 harness 会在读取 credential、创建 Webex room 或启动 Webex connector 前，先运行：
+该路径依赖 cbth C8 已合并能力：PR #99 merge commit `ee76fdd5937ca57e8156631c32509be12d3cf4c2`，命令为 `cbth service upgrade-smoke`。W7 harness 会在读取 credential 内容、创建 Webex room 或启动 Webex connector 前，先运行：
 
 ```bash
 cbth service upgrade-smoke \
@@ -34,20 +34,37 @@ cbth service upgrade-smoke \
 
 该 cbth C8 harness 只使用 fake plugin 和 task-scoped smoke root，并由 W7 通过清洗过的子进程环境启动，用于验证 cbth service 前台 supervisor、LaunchAgent plan 渲染、C7 pre-active health fence、quiesce、drain、handoff、promote 和 shutdown 顺序；它不包含 Webex token、Webex room、Data Space 或 delivery 行为。W7 harness 会校验输出中的 `ok=true`、`system_mutation_performed=false`、`release_upgrade.handoff_performed=true` 和关键 release event 的有序子序列。
 
-如需额外验证真实 Webex connector 的 release A/B 切换，可显式提供 Webex-specific release upgrade command：
+W8 将真实 Webex connector 的 release A/B 切换 hook 接到 cbth C9 已合并能力：PR #103 merge commit `87ebc8e3a39558daa5441c40d9bd8d7cffb3ca06`，operator command 为 `cbth plugin upgrade`。默认 command template 是：
 
 ```bash
-WXCD_E2E_CBTH_UPGRADE_CMD='tools/wxcd-release-upgrade --cbth-home "{cbth_home}" --plugin {plugin} --from {release_a_id} --to {release_b_id} --release-dir "{release_b}"' \
-WXCD_E2E_CBTH_UPGRADE_CHECK_CMD='tools/wxcd-release-upgrade --help' \
-WXCD_LIVE_E2E=1 \
-python3 scripts/w7_live_upgrade_e2e.py --live --token-file token.txt --bot-env-file .env
+{cbth_bin} --home "{cbth_home}" plugin upgrade {plugin} \
+  --release-id "{release_b_id}" \
+  --release-dir "{release_b}" \
+  --manifest-path "{release_b}/plugin/manifest.json" \
+  --json
 ```
 
-这个 optional command 只展开 `{plugin}`、`{release_a}`、`{release_b}`、`{release_a_id}`、`{release_b_id}`、`{cbth_home}` 和 `{prefix}`，并以关闭 stdin、有界 timeout、stdout/stderr 写入私有 `logs/webex-release-upgrade.log` 的方式执行；webex-connector 不复制 cbth generic release manager。未提供 optional command 时，W7 会记录 `webex_release_upgrade.status=skipped`，但仍执行 cbth C8 upgrade smoke、真实 Webex session turn 和 delivery smoke。
+`{cbth_bin}` 会绑定到 `--cbth-bin` 解析后的 executable，所以 W9 可以显式传入包含 C8/C9 的 cbth binary，而不依赖 `PATH` 上的 `cbth`。`--manifest-path` 可由 C9 接受为绝对路径或相对 `--release-dir` 的路径；W8 默认使用 release B 下的绝对 manifest 路径。该 manifest 必须是 JSON object 且 `enabled=true`，否则 W7 harness 会在 live 前 fail closed。
+
+默认 side-effect-free check 由 command shape 推断为：
+
+```bash
+{cbth_bin} --home "{cbth_home}" plugin upgrade --help
+```
+
+只有覆盖为非 `cbth plugin upgrade` 形态的自定义 command 时，才需要同时提供 `WXCD_E2E_CBTH_UPGRADE_CHECK_CMD` 或 `--cbth-upgrade-check-command`，并保证它不产生副作用。可覆盖 command template：
+
+```bash
+WXCD_E2E_CBTH_UPGRADE_CMD='{cbth_bin} --home "{cbth_home}" plugin upgrade {plugin} --release-id "{release_b_id}" --release-dir "{release_b}" --manifest-path "{release_b}/plugin/manifest.json" --json' \
+WXCD_LIVE_E2E=1 \
+python3 scripts/w7_live_upgrade_e2e.py --live --token-file token.txt --bot-env-file .env --cbth-bin /path/to/cbth-with-c8-c9
+```
+
+该 command 只展开 `{plugin}`、`{release_a}`、`{release_b}`、`{release_a_id}`、`{release_b_id}`、`{cbth_home}`、`{cbth_bin}` 和 `{prefix}`，并以关闭 stdin、有界 timeout、stdout/stderr 写入私有 `logs/webex-release-upgrade.log` 的方式执行。webex-connector 只模板化调用 C9 operator command 并验证 Webex product behavior，不复制 cbth generic release manager，不直接编辑 cbth registry；registry 只能由 cbth service-side promote 写入。command 成功后，W7 会只读校验 task-scoped cbth registry 已切到 release B。
 
 W7 harness 覆盖：
 
-- 在读取 credential、创建 Webex room 或启动 cbth 前预检 `WXCD_LIVE_E2E=1` 和 cbth C8 `service upgrade-smoke`；缺失时 fail closed。
+- 在读取 credential 内容、创建 Webex room 或启动 cbth 前预检 `WXCD_LIVE_E2E=1`、cbth C8 `service upgrade-smoke` 和 cbth C9 `plugin upgrade` safe check；缺失时 fail closed。
 - 先通过清洗过的子进程环境运行 cbth C8 `service upgrade-smoke` safe harness，并把 PR #99 / merge commit `ee76fdd5937ca57e8156631c32509be12d3cf4c2`、smoke root、release events 和 system-mutation 结果写入 manifest。
 - 解析未跟踪的 developer token file 和 bot env file，校验 developer/bot `/people/me` email 与 credential 文件一致，只记录字段长度，不打印 bearer。
 - 生成的 private config/env/manifest/registry 文件通过 `0600` 临时文件写入，避免 bot token 在 test root 中短暂暴露。
@@ -56,7 +73,7 @@ W7 harness 覆盖：
 - 使用 task-scoped `CBTH_HOME` 写入 cbth plugin registry，并通过清洗过的子进程环境启动 `cbth service run` / `wxcd-supervisor run`，避免继承生产 `WEBEX_*`、`WXCD_*` 或 `CBTH_*` 配置。
 - 通过真实 Webex 消息验证 `/help`、`list local`、`resume local <thread_id>`、history import、`/history`、`/history page 2` 和普通 session turn。
 - 通过 worker ingress socket 注入 `async_notification`，验证 W4 delivery-owned `delivery.enqueue` broker 路径。
-- 如果显式提供 Webex-specific release upgrade command，调用时关闭 stdin，并用 `--upgrade-timeout-seconds` 设置有界等待；命令成功后会验证 task-scoped cbth registry 已切到 release B 的 `release_id`、supervisor binary、`WXCD_RELEASE_DIR` 和 `WXCD_PLUGIN_MANIFEST_PATH`，再确认旧 release 的 ingress/lifecycle sockets 不再接受连接、验证新 release-scoped worker ingress health，并通过真实 Webex session turn 和 worker socket delivery smoke 分别验证升级后的 sidecar/Mercury 与 delivery 路径。未提供该 optional command 时，Webex live smoke 在当前 release 上继续跑 post-upgrade-smoke turn 与 delivery smoke，真实 upgrade ordering 由前置 C8 safe harness 覆盖。
+- 通过默认 C9 `plugin upgrade` command 执行 Webex release A/B upgrade；调用时关闭 stdin，并用 `--upgrade-timeout-seconds` 设置有界等待。命令成功后会验证 task-scoped cbth registry 已切到 release B 的 `release_id`、supervisor binary、`WXCD_RELEASE_DIR` 和 `WXCD_PLUGIN_MANIFEST_PATH`，再确认旧 release 的 ingress/lifecycle sockets 不再接受连接、验证新 release-scoped worker ingress health，并通过真实 Webex session turn 和 worker socket delivery smoke 分别验证升级后的 sidecar/Mercury 与 delivery 路径。
 - 写入 task-scoped `manifest.json`；失败、blocked 或 cleanup 失败时默认保留 test root 供诊断，成功且 cleanup 干净时会先保留一份同级 `*-manifest.json` 成功证据，再自动清理 harness 自建的临时 test root，显式传入的 `--test-root` 始终保留；如果显式 test root 位于 repo 内，必须放在 ignored `.codex-tmp/` 下，避免含 secret 的 `wxcd.env` 变成可提交文件。cleanup 会删除 manifest 中的 prefixed rooms，其中 session room 使用 bot token 删除，并且只在 prefix 符合生成的 `WXCD-W7-E2E-YYYYMMDD-<8 chars>` 形状时分别用 developer/bot token 按 Webex room pagination 补扫未记录的临时 rooms；session room title lookup 同样会跟随 room pagination。
 
 ## 范围
@@ -85,7 +102,7 @@ ruby -rsocket -e 's=UNIXSocket.new(ARGV[0]); s.puts(%q({"kind":"health_check"}))
 4. 从 `token.txt` 读取 `email`、`bearer`、`ord_id`，只输出字段名和长度，不输出值。
 5. 用 developer bearer 调用 Webex `/v1/people/me`，确认返回 email 与 `token.txt` 中的 `email` 一致。
 6. 从当前部署 config/env 读取 bot token、bot email、bot Codex binary path、node path；不得输出 secret。
-7. W7 live run 还需要可执行的 cbth C8 `service upgrade-smoke` command；缺失时报告 blocked，不手工模拟 release manager。
+7. W7/W8 live run 还需要可执行的 cbth C8 `service upgrade-smoke` command 和 C9 `plugin upgrade` command；缺失时报告 blocked，不手工模拟 release manager，不直接编辑 registry。
 
 ## 隔离环境
 

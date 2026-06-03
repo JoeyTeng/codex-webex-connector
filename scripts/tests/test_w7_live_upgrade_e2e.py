@@ -461,6 +461,26 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             if old_upgrade is not None:
                 os.environ["WXCD_E2E_CBTH_UPGRADE_CMD"] = old_upgrade
 
+    def test_dry_run_reports_default_c9_upgrade_template_and_safe_check(self) -> None:
+        output = StringIO()
+
+        with redirect_stdout(output):
+            code = harness.main(["--cbth-bin", "/opt/cbth-c9/bin/cbth"])
+
+        self.assertEqual(code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["webex_release_upgrade_command_source"], "cbth-c9-default")
+        self.assertEqual(
+            payload["webex_release_upgrade_command_template"],
+            harness.CBTH_C9_PLUGIN_UPGRADE_COMMAND_TEMPLATE,
+        )
+        self.assertEqual(
+            payload["webex_release_upgrade_check_command_inferred"],
+            "{cbth_bin} --home {cbth_home} plugin upgrade --help",
+        )
+        self.assertEqual(payload["cbth_c9_merge_commit"], harness.CBTH_C9_MERGE_COMMIT)
+        self.assertIn("cbth C9 plugin upgrade support", payload["live_requires"])
+
     def test_validate_test_root_blocks_repo_internal_secret_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -748,6 +768,14 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
         with self.assertRaisesRegex(harness.BlockedError, r"\{release_bid\}"):
             harness.preflight_upgrade_command(args, cwd=Path("/tmp"))
 
+    def test_preflight_upgrade_command_rejects_unknown_cbth_bin_placeholder_typo(self) -> None:
+        args = harness.build_parser().parse_args(
+            ["--live", "--cbth-upgrade-command", "/bin/echo {cbth_binary} plugin upgrade {plugin}"]
+        )
+
+        with self.assertRaisesRegex(harness.BlockedError, r"\{cbth_binary\}"):
+            harness.preflight_upgrade_command(args, cwd=Path("/tmp"))
+
     def test_expand_upgrade_command_rejects_malformed_placeholder(self) -> None:
         with self.assertRaisesRegex(harness.BlockedError, "malformed"):
             harness.expand_upgrade_command(
@@ -759,6 +787,39 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
                 Path("/tmp/cbth-home"),
                 "WXCD-W7",
             )
+
+    def test_default_upgrade_command_expands_c9_template_with_cbth_bin(self) -> None:
+        args = harness.build_parser().parse_args(["--cbth-bin", "/opt/cbth-c9/bin/cbth"])
+
+        command = harness.expand_upgrade_command(
+            harness.upgrade_command_template(args),
+            Path("/old release"),
+            Path("/new release"),
+            "w7-a",
+            "w7-b",
+            Path("/tmp/cbth-home"),
+            "WXCD-W7",
+            args.cbth_bin,
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "/opt/cbth-c9/bin/cbth",
+                "--home",
+                "/tmp/cbth-home",
+                "plugin",
+                "upgrade",
+                "webex-connector",
+                "--release-id",
+                "w7-b",
+                "--release-dir",
+                "/new release",
+                "--manifest-path",
+                "/new release/plugin/manifest.json",
+                "--json",
+            ],
+        )
 
     def test_preflight_upgrade_command_rejects_missing_cbth_upgrade_subcommand(self) -> None:
         old_check = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)
@@ -787,6 +848,54 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
             finally:
                 if old_check is not None:
                     os.environ["WXCD_E2E_CBTH_UPGRADE_CHECK_CMD"] = old_check
+
+    def test_default_c9_upgrade_check_preflight_uses_cbth_bin_help_command(self) -> None:
+        args = harness.build_parser().parse_args(["--cbth-bin", "/bin/echo"])
+        calls: list[dict[str, object]] = []
+        original_run = harness.subprocess.run
+        old_values = {
+            "WEBEX_BOT_TOKEN": os.environ.get("WEBEX_BOT_TOKEN"),
+            "WXCD_CONFIG_PATH": os.environ.get("WXCD_CONFIG_PATH"),
+            "CBTH_HOME": os.environ.get("CBTH_HOME"),
+        }
+
+        def fake_run(command: list[str], **kwargs: object) -> harness.subprocess.CompletedProcess[str]:
+            calls.append({"command": command, **kwargs})
+            return harness.subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            harness.subprocess.run = fake_run
+            os.environ["WEBEX_BOT_TOKEN"] = "prod-token"
+            os.environ["WXCD_CONFIG_PATH"] = "/prod/wxcd.toml"
+            os.environ["CBTH_HOME"] = "/prod/cbth"
+            try:
+                harness.preflight_upgrade_command(
+                    args,
+                    Path(tmp) / "release-a",
+                    Path(tmp) / "release-b",
+                    Path(tmp) / "cbth-home",
+                    "WXCD-W7-E2E-20260525-abc123xy",
+                    Path(tmp),
+                )
+            finally:
+                harness.subprocess.run = original_run
+                for key, value in old_values.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+        self.assertEqual(
+            calls[0]["command"],
+            ["/bin/echo", "--home", str(Path(tmp) / "cbth-home"), "plugin", "upgrade", "--help"],
+        )
+        self.assertEqual(calls[0]["stdin"], harness.subprocess.DEVNULL)
+        self.assertEqual(calls[0]["timeout"], harness.UPGRADE_CHECK_TIMEOUT_SECONDS)
+        env = calls[0]["env"]
+        self.assertIsInstance(env, dict)
+        self.assertEqual(env["CBTH_HOME"], str(Path(tmp) / "cbth-home"))
+        self.assertNotIn("WEBEX_BOT_TOKEN", env)
+        self.assertNotIn("WXCD_CONFIG_PATH", env)
 
     def test_preflight_upgrade_command_resolves_repo_relative_executable_with_cwd(self) -> None:
         old_check = os.environ.pop("WXCD_E2E_CBTH_UPGRADE_CHECK_CMD", None)
@@ -969,6 +1078,21 @@ class W7LiveUpgradeE2ETest(unittest.TestCase):
 
             with self.assertRaises(harness.HarnessError):
                 harness.validate_release_dir(release)
+
+    def test_validate_release_plugin_manifest_requires_enabled_object(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "manifest.json"
+
+            manifest_path.write_text("[]", encoding="utf-8")
+            with self.assertRaisesRegex(harness.HarnessError, "JSON object"):
+                harness.validate_release_plugin_manifest(manifest_path)
+
+            manifest_path.write_text(json.dumps({"enabled": False}), encoding="utf-8")
+            with self.assertRaisesRegex(harness.HarnessError, "enabled=true"):
+                harness.validate_release_plugin_manifest(manifest_path)
+
+            manifest_path.write_text(json.dumps({"enabled": True}), encoding="utf-8")
+            harness.validate_release_plugin_manifest(manifest_path)
 
     def test_sidecar_dependencies_present_accepts_webex_core_module(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
