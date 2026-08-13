@@ -68,7 +68,7 @@ jobs:
     steps:
       - name: Run Codex Review Gate
         # v1.2.0 release
-        uses: JoeyTeng/codex-review-gate@a05749dae2a487354718eb6da903c2ee756cbd6e
+        uses: JoeyTeng/codex-review-gate-action@b7ef6e78ca49351007ca385c36969cb57ce64f4f
         with:
           github-token: ${{ github.token }}
           pull-request: ${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pull_request }}
